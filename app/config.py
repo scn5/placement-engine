@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Debounce window (seconds); reduce to 0.1 in test suites
     DEBOUNCE_DELAY_SECONDS: float = 90.0
 
+    # LLM inference (OpenAI-compatible endpoint)
+    LLM_API_KEY: str = ""
+    LLM_BASE_URL: Optional[str] = None  # e.g. "https://openrouter.ai/api/v1"
+    LLM_MODEL: str = "openai/gpt-oss-20b"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

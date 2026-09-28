@@ -1,24 +1,23 @@
 """
 app/main.py
-FastAPI application entry-point — Phase 3 update.
+FastAPI application entry-point — Phase 4 update.
 
-Lifespan:
+Lifespan sequence:
   1. Bootstrap PostgreSQL schema (create_all).
-  2. If TELEGRAM_API_ID is configured, start the Telethon ingestion service
-     and schedule client.run_until_disconnected() as a background task.
-  3. On shutdown: flush debounce buffers, cancel the background task,
-     and disconnect the Telegram client cleanly.
+  2. Optionally start Telethon ingestion engine (requires TELEGRAM_API_ID).
+  3. Wire telegram_service.set_payload_handler → dispatcher.process_and_dispatch.
+  4. On shutdown: flush debounce buffers, cancel background task, disconnect client.
 """
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, List, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import engine
+from app.database import AsyncSessionLocal, engine
 from app.models import Base  # noqa: F401 — registers all ORM models
 from app.routers import companies, events
 
@@ -27,19 +26,18 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # ── 1. Database schema bootstrap ──────────────────────────────────
+    # ── 1. Database schema bootstrap ──────────────────────────────────────
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database schema ready.")
 
-    # ── 2. Telegram ingestion engine (optional — requires credentials) ─
+    # ── 2. Telegram ingestion engine (optional) ────────────────────────────
     tg_client = None
     tg_service = None
     tg_task: Optional[asyncio.Task] = None
 
     if settings.TELEGRAM_API_ID:
         try:
-            # Deferred import so the app starts without Telegram creds in CI
             from app.telegram.client import create_telegram_client
             from app.telegram.listener import TelegramIngestionService
 
@@ -49,25 +47,49 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             tg_service = TelegramIngestionService(tg_client)
             tg_service.register_handlers()
 
-            # Run the Telethon event loop as a background asyncio task
+            # ── 3. Wire dispatcher as payload handler ──────────────────────
+            from app.ai import dispatcher as _dispatcher
+
+            async def _payload_handler(
+                chat_id: int, context_header: str, messages: List[dict]
+            ) -> None:
+                """Bridge between the Telethon listener and the AI dispatcher.
+                Each invocation opens its own DB session for isolation.
+                """
+                db = AsyncSessionLocal()
+                try:
+                    await _dispatcher.process_and_dispatch(
+                        chat_id=chat_id,
+                        context_header=context_header,
+                        messages=messages,
+                        db=db,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Dispatcher raised for chat_id=%s context=%s",
+                        chat_id, context_header,
+                    )
+                finally:
+                    await db.close()
+
+            await tg_service.set_payload_handler(_payload_handler)
+
             tg_task = asyncio.create_task(
                 tg_client.run_until_disconnected(),
                 name="telegram-listener",
             )
-            logger.info("Telegram ingestion engine started.")
+            logger.info("Telegram ingestion engine started and wired to AI dispatcher.")
         except Exception:
             logger.exception(
                 "Failed to start Telegram client — running without ingestion."
             )
     else:
-        logger.info(
-            "TELEGRAM_API_ID not set — Telegram ingestion engine disabled."
-        )
+        logger.info("TELEGRAM_API_ID not set — Telegram ingestion engine disabled.")
 
-    # ── Hand control back to FastAPI ──────────────────────────────────
+    # ── Hand control back to FastAPI ──────────────────────────────────────
     yield
 
-    # ── 3. Graceful shutdown ──────────────────────────────────────────
+    # ── 4. Graceful shutdown ──────────────────────────────────────────────
     if tg_service:
         await tg_service.shutdown()
 
@@ -86,7 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="Automated Placement Tracking Engine",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Single source of truth for NITK placement tracking — "
         "no Sheets, no Calendar, no manual coordination."
