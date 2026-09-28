@@ -127,8 +127,14 @@ class TimelineEvent(Base):
     @property
     def display_state(self) -> str:
         now = datetime.now(timezone.utc)
+        # SQLite (via aiosqlite) may return tz-naive datetimes; normalise to UTC.
+        end = (
+            self.end_time
+            if self.end_time.tzinfo is not None
+            else self.end_time.replace(tzinfo=timezone.utc)
+        )
         if self.user_status == "COMPLETED":
-            return "COMPLETED_ACTIVE" if now <= self.end_time else "COMPLETED_EXPIRED"
-        if now > self.end_time:
+            return "COMPLETED_ACTIVE" if now <= end else "COMPLETED_EXPIRED"
+        if now > end:
             return "MISSED"
         return "PENDING"
