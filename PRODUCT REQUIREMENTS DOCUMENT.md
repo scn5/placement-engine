@@ -1,5 +1,5 @@
 # PRODUCT REQUIREMENTS DOCUMENT (PRD)
-**Product Name:** Anti-Tele / Placement Command Center
+**Product Name:** Placement Command Center
 **Document Purpose:** Define product vision, user workflows, and business logic for AI coding assistants and human developers.
 
 ## 1. Product Vision & Problem Statement
@@ -57,6 +57,10 @@ A strictly personal, Human-In-The-Loop (HITL) automated command center.
 * **Context:** A message drops: *"The following 50 students entered the wrong email: [List of Names/Roll Numbers]"*.
 * **Expected Result:** The LLM cross-references the message text against the user's personal details (`system_configs`). Because the user's roll number is NOT in the list, the system drops the message as irrelevant. The user's phone never buzzes.
 
+### Workflow 7: Criteria Relaxation & Re-Triage
+* **Context:** The user previously put a Software Engineer role into `SILENT_TRACK` because the CGPA cutoff was 8.0 and they did not qualify. The role has been silently logging updates. The coordinator posts: *"The company has reduced the CGPA cutoff to 7.0."*
+* **Action:** The LLM detects the criteria shift. Because the role is in `SILENT_TRACK`, the backend sets `is_triaged` back to `false` and fires a high-priority push notification: *"Criteria Update: [Company Name]"*. (If the role was already `ELIGIBLE`, the system would silently log the note without alerting the user).
+* **Expected Result:** The role reappears in the user's **Triage Hub** with an amber `⚡ CRITERIA UPDATE` badge and the note about the CGPA change. If the user now qualifies, they tap "Eligible" to activate the timeline. If they still don't qualify, they tap "Silent Track" to send it back to the waiting room.
 ---
 
 ## 4. Functional Requirements (FR)

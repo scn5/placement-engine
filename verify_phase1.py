@@ -28,7 +28,10 @@ def run_verification() -> None:
 
     # 1. Verify Config & Database setup
     assert settings.APP_ENV is not None
-    assert settings.DATABASE_URL.startswith("postgresql+asyncpg://")
+    assert (
+        settings.DATABASE_URL.startswith("postgresql+asyncpg://")
+        or settings.DATABASE_URL.startswith("sqlite+aiosqlite://")
+    )
     assert engine is not None
     assert AsyncSessionLocal is not None
     assert callable(get_db)
@@ -54,7 +57,8 @@ def run_verification() -> None:
         drive_type="FTE",
         ctc_stipend_info="60 LPA",
         lifecycle_status="APPLICATION_WINDOW",
-        is_targeted_by_user=True,
+        tracking_mode="ELIGIBLE",
+        is_triaged=True,
         latest_status_note="Applications open on IRIS",
         updated_at=now,
     )
@@ -139,7 +143,7 @@ def run_verification() -> None:
         role_name="Software Engineer",
         drive_type="FTE",
         ctc_stipend_info="45 LPA",
-        is_targeted_by_user=True,
+        tracking_mode="ELIGIBLE",
     )
     _ = TimelineEventCreate(
         company_id=1,

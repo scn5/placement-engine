@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import AsyncSessionLocal, engine
 from app.models import Base  # noqa: F401 — registers all ORM models
-from app.routers import companies, events
+from app.routers import companies, events, triage
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,7 @@ app.add_middleware(
 
 app.include_router(companies.router)
 app.include_router(events.router)
+app.include_router(triage.router)
 
 
 @app.get("/health", tags=["Meta"])

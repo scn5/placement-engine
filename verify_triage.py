@@ -1,0 +1,261 @@
+"""
+verify_triage.py
+Comprehensive verification test suite for Triage Hub backend logic and role-level tracking filters.
+
+Tests:
+  1. RoleTrack schema defaults (tracking_mode="SILENT_TRACK", is_triaged=False, created_at set).
+  2. GET /triage/pending query returns untriaged role tracks joined with Company.name.
+  3. POST /triage/{role_track_id} accepts TriageActionPayload, mutates tracking_mode, and sets is_triaged=True.
+  4. GET /events/timeline strictly requires RoleTrack.tracking_mode == 'ELIGIBLE'.
+  5. Re-triage logic: flag_for_retriage resets is_triaged=False ONLY if tracking_mode == 'SILENT_TRACK'.
+  6. Endpoint verification via FastAPI test client (HTTP 200, 404).
+
+Run: python verify_triage.py
+"""
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+# Override database engine for tests
+import app.database as _db_module
+
+_test_engine = create_async_engine(
+    "sqlite+aiosqlite:///:memory:",
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
+_TestSession = async_sessionmaker(
+    bind=_test_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+)
+_db_module.engine = _test_engine
+_db_module.AsyncSessionLocal = _TestSession
+
+from app import crud, models, schemas
+from app.models import Base
+from app.routers.triage import flag_for_retriage
+
+
+def utc(offset_days: float = 0.0) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=offset_days)
+
+
+async def test_triage_flow() -> None:
+    async with _test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with _TestSession() as db:
+        # ── 1. Create Company and newly discovered RoleTracks (default: SILENT_TRACK, is_triaged=False)
+        company = await crud.create_company(
+            db,
+            schemas.CompanyCreate(name="Stripe", tracking_mode="ELIGIBLE", is_custom=False),
+        )
+
+        role_swe = await crud.create_role_track(
+            db,
+            schemas.RoleTrackCreate(
+                company_id=company.id,
+                role_name="Software Engineer",
+                drive_type="FTE",
+                ctc_stipend_info="55 LPA",
+            ),
+        )
+        assert role_swe.tracking_mode == "SILENT_TRACK", f"Expected SILENT_TRACK, got {role_swe.tracking_mode}"
+        assert role_swe.is_triaged is False, f"Expected is_triaged=False, got {role_swe.is_triaged}"
+        assert role_swe.created_at is not None, "Expected created_at to be populated"
+
+        role_intern = await crud.create_role_track(
+            db,
+            schemas.RoleTrackCreate(
+                company_id=company.id,
+                role_name="Software Engineering Intern",
+                drive_type="INTERNSHIP",
+                ctc_stipend_info="1.25L/month",
+            ),
+        )
+        assert role_intern.tracking_mode == "SILENT_TRACK"
+        assert role_intern.is_triaged is False
+
+        role_pm = await crud.create_role_track(
+            db,
+            schemas.RoleTrackCreate(
+                company_id=company.id,
+                role_name="Product Manager",
+                drive_type="FTE",
+                ctc_stipend_info="40 LPA",
+            ),
+        )
+        assert role_pm.tracking_mode == "SILENT_TRACK"
+        assert role_pm.is_triaged is False
+
+        print("  [1] ✓ RoleTrack defaults (SILENT_TRACK, is_triaged=False, created_at) verified")
+
+        # ── 2. GET /triage/pending: returns untriaged role tracks joined with company
+        pending = await crud.get_pending_triage_items(db)
+        pending_ids = [p.id for p in pending]
+        assert role_swe.id in pending_ids
+        assert role_intern.id in pending_ids
+        assert role_pm.id in pending_ids
+        assert len(pending) == 3
+
+        # Validate schema serialisation
+        item_schema = schemas.TriageItemResponse(
+            id=role_swe.id,
+            company_name=role_swe.company.name,
+            role_name=role_swe.role_name,
+            drive_type=role_swe.drive_type,
+            ctc_stipend_info=role_swe.ctc_stipend_info,
+            latest_status_note=role_swe.latest_status_note,
+            created_at=role_swe.created_at,
+        )
+        assert item_schema.company_name == "Stripe"
+        assert item_schema.drive_type == "FTE"
+        print("  [2] ✓ Pending triage query & TriageItemResponse schema verified")
+
+        # ── 3. Attach timeline events to roles before triage
+        ev_swe = await crud.create_custom_event(
+            db,
+            schemas.TimelineEventCreate(
+                company_id=company.id,
+                role_track_id=role_swe.id,
+                event_type="OA_WINDOW",
+                title="Stripe SWE Coding Round",
+                end_time=utc(+2),
+            ),
+        )
+        ev_pm = await crud.create_custom_event(
+            db,
+            schemas.TimelineEventCreate(
+                company_id=company.id,
+                role_track_id=role_pm.id,
+                event_type="INTERVIEW",
+                title="Stripe PM Case Round",
+                end_time=utc(+3),
+            ),
+        )
+
+        # Before triage, neither role is ELIGIBLE, so timeline feed must be EMPTY
+        feed_before = await crud.get_timeline_events(db, drive_type="FTE")
+        assert len(feed_before) == 0, f"Expected 0 events in timeline before triage, got {len(feed_before)}"
+        print("  [3] ✓ Untriaged (SILENT_TRACK) events excluded from timeline feed")
+
+        # ── 4. Triage actions: Accept SWE into ELIGIBLE, Discard PM into IGNORED
+        triaged_swe = await crud.triage_role_track(db, role_swe.id, action="ELIGIBLE")
+        assert triaged_swe.tracking_mode == "ELIGIBLE"
+        assert triaged_swe.is_triaged is True
+
+        triaged_pm = await crud.triage_role_track(db, role_pm.id, action="IGNORED")
+        assert triaged_pm.tracking_mode == "IGNORED"
+        assert triaged_pm.is_triaged is True
+
+        # Triage intern explicitly as SILENT_TRACK (user reviewed and opted for silent tracking)
+        triaged_intern = await crud.triage_role_track(db, role_intern.id, action="SILENT_TRACK")
+        assert triaged_intern.tracking_mode == "SILENT_TRACK"
+        assert triaged_intern.is_triaged is True
+
+        # Pending queue should now be empty
+        pending_after = await crud.get_pending_triage_items(db)
+        assert len(pending_after) == 0, f"Expected 0 pending items, got {len(pending_after)}"
+
+        # Timeline feed must now contain ONLY the ELIGIBLE SWE event
+        feed_after = await crud.get_timeline_events(db, drive_type="FTE")
+        feed_ids = [e.id for e in feed_after]
+        assert ev_swe.id in feed_ids, "ELIGIBLE event must appear in timeline feed"
+        assert ev_pm.id not in feed_ids, "IGNORED event must NOT appear in timeline feed"
+        print("  [4] ✓ Triage mutations & ELIGIBLE timeline filtering verified")
+
+        # ── 5. Re-triage Logic: flag_for_retriage
+        # Test Case A: Role in SILENT_TRACK -> flag_for_retriage resets is_triaged=False
+        updated_intern = await flag_for_retriage(db, role_intern.id, "Criteria relaxed: 6.5 CGPA allowed")
+        assert updated_intern is not None
+        assert updated_intern.latest_status_note == "Criteria relaxed: 6.5 CGPA allowed"
+        assert updated_intern.is_triaged is False, "SILENT_TRACK role MUST be reset to is_triaged=False on re-triage"
+
+        # It must now re-appear in pending queue!
+        pending_reopened = await crud.get_pending_triage_items(db)
+        assert len(pending_reopened) == 1
+        assert pending_reopened[0].id == role_intern.id
+        assert pending_reopened[0].latest_status_note == "Criteria relaxed: 6.5 CGPA allowed"
+
+        # Test Case B: Role in ELIGIBLE -> flag_for_retriage updates note but keeps is_triaged=True
+        updated_swe = await flag_for_retriage(db, role_swe.id, "OA platform changed to HackerRank")
+        assert updated_swe is not None
+        assert updated_swe.latest_status_note == "OA platform changed to HackerRank"
+        assert updated_swe.is_triaged is True, "ELIGIBLE role MUST stay is_triaged=True"
+
+        # Test Case C: Role in IGNORED -> flag_for_retriage updates note but keeps is_triaged=True
+        updated_pm = await flag_for_retriage(db, role_pm.id, "PM role open for all branches")
+        assert updated_pm is not None
+        assert updated_pm.latest_status_note == "PM role open for all branches"
+        assert updated_pm.is_triaged is True, "IGNORED role MUST stay is_triaged=True"
+
+        # Test Case D: Non-existent role track returns None
+        not_found = await flag_for_retriage(db, 999999, "Note")
+        assert not_found is None
+
+        print("  [5] ✓ Re-triage conditional criteria relaxation logic (SILENT_TRACK vs ELIGIBLE/IGNORED) verified")
+
+
+async def test_fastapi_endpoints() -> None:
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+    from app.database import get_db
+
+    async def override_get_db():
+        async with _TestSession() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. GET /triage/pending
+        res = await client.get("/triage/pending")
+        assert res.status_code == 200
+        items = res.json()
+        assert isinstance(items, list)
+        assert len(items) == 1  # role_intern from previous test
+
+        # 2. GET /triage (alias)
+        res_alias = await client.get("/triage")
+        assert res_alias.status_code == 200
+        assert len(res_alias.json()) == 1
+
+        # 3. POST /triage/{id}/accept
+        track_id = items[0]["id"]
+        res_accept = await client.post(f"/triage/{track_id}/accept")
+        assert res_accept.status_code == 200
+        assert res_accept.json()["id"] == track_id
+
+        # After accepting, queue is empty
+        res_empty = await client.get("/triage/pending")
+        assert len(res_empty.json()) == 0
+
+        # 4. POST /triage/999999 -> 404
+        res_404 = await client.post("/triage/999999", json={"action": "ELIGIBLE"})
+        assert res_404.status_code == 404
+
+    app.dependency_overrides.clear()
+    print("  [6] ✓ FastAPI REST HTTP endpoints (/triage/pending, /triage/{id}/accept, 404) verified")
+
+
+async def main() -> None:
+    print("\nRunning Triage Hub & Role Tracking Verification Suite…\n")
+    try:
+        await test_triage_flow()
+        await test_fastapi_endpoints()
+        print("\n✅ Triage Hub Backend Logic & Role-Level Tracking Verified Successfully!")
+    finally:
+        await _test_engine.dispose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -92,7 +92,8 @@ async def _setup_role_track(db: AsyncSession, company_id: int, drive_type: str =
         role_name="Software Engineer",
         drive_type=drive_type,
         lifecycle_status="APPLICATION_WINDOW",
-        is_targeted_by_user=True,
+        tracking_mode="ELIGIBLE",
+        is_triaged=True,
         updated_at=_utc(),
     )
     db.add(track)

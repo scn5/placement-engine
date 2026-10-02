@@ -57,13 +57,17 @@ class RoleTrack(Base):
     role_name: Mapped[str] = mapped_column(String(255), nullable=False)
     drive_type: Mapped[str] = mapped_column(String(32), default="FTE", nullable=False)
     ctc_stipend_info: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tracking_mode: Mapped[str] = mapped_column(
+        String(32), default="SILENT_TRACK", nullable=False
+    )
+    is_triaged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     lifecycle_status: Mapped[str] = mapped_column(
         String(64), default="APPLICATION_WINDOW", nullable=False
     )
-    is_targeted_by_user: Mapped[bool] = mapped_column(
-        Boolean, default=True, nullable=False
-    )
     latest_status_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
@@ -74,9 +78,12 @@ class RoleTrack(Base):
     )
 
     def __init__(self, **kwargs):
+        kwargs.pop("is_targeted_by_user", None)
         kwargs.setdefault("drive_type", "FTE")
+        kwargs.setdefault("tracking_mode", "SILENT_TRACK")
+        kwargs.setdefault("is_triaged", False)
         kwargs.setdefault("lifecycle_status", "APPLICATION_WINDOW")
-        kwargs.setdefault("is_targeted_by_user", True)
+        kwargs.setdefault("created_at", datetime.now(timezone.utc))
         kwargs.setdefault("updated_at", datetime.now(timezone.utc))
         super().__init__(**kwargs)
 

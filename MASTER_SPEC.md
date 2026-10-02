@@ -30,6 +30,7 @@
 
 When payloads pass pre-filters (dropping SPOC greetings/chatter), the backend fetches a snapshot of the **Current Database State** (active events) and **Personal Profile Config**, injecting them into the Groq LLM prompt.
 
+* **Criteria Relaxation (Re-Triage Trigger):** If a message mentions changes to eligibility criteria (e.g., "CGPA cutoff lowered to 6.0", "Mechanical now eligible"), the LLM extracts this as a `STATUS_NOTE`. The backend must check the role's current status. **Only if** the `RoleTrack` is currently in `SILENT_TRACK`, the backend sets `is_triaged = false`, updates the `latest_status_note`, and dispatches a push notification to prompt the user to re-evaluate the role in the Triage Hub. If the role is already `ELIGIBLE` or `IGNORED`, the system silently updates the note but does not trigger re-triage.
 * **Profile Defaulter Filter:** The LLM checks names/roll numbers against the user's `system_configs`. If the message lists defaulters and the user's details are **not** present, the LLM outputs `is_actionable = false`, dropping the payload.
 * **Shortlist Tracking:** If a shortlist drops as text, the LLM checks for the user's details. If found, it updates the role track's `lifecycle_status` (e.g., `INTERVIEWS`); it **does not** create a timeline event.
 * **Strict Event Categories:** `event_category` must be one of: `['RESUME', 'IRIS', 'FORM', 'APPLICATION', 'PPT', 'OA', 'GD', 'INTERVIEW', 'CUSTOM']`.
@@ -131,7 +132,8 @@ CREATE TABLE role_tracks (
     role_name VARCHAR(255) NOT NULL,              
     drive_type VARCHAR(32) DEFAULT 'FTE',         
     ctc_stipend_info TEXT,
-    tracking_mode VARCHAR(32) DEFAULT 'SILENT_TRACK', -- Defaults to SILENT for UI Triage
+    tracking_mode VARCHAR(32) DEFAULT 'SILENT_TRACK',
+    is_triaged BOOLEAN DEFAULT FALSE,             -- False means it shows up in Triage Hub
     lifecycle_status VARCHAR(64) DEFAULT 'APPLICATION_WINDOW',
     latest_status_note TEXT,                      
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()

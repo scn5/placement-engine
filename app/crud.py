@@ -71,7 +71,8 @@ async def create_role_track(
         role_name=track_in.role_name,
         drive_type=track_in.drive_type,
         ctc_stipend_info=track_in.ctc_stipend_info,
-        is_targeted_by_user=track_in.is_targeted_by_user,
+        tracking_mode=track_in.tracking_mode,
+        is_triaged=track_in.is_triaged,
     )
     db.add(db_track)
     await db.commit()
@@ -90,27 +91,27 @@ async def get_timeline_events(
     """Return active timeline events ordered by end_time ASC.
 
     Filters:
-    - Company must be active and not IGNORED.
-    - Event matches drive_type via its RoleTrack, OR drive_type is 'COMBINED',
-      OR the event has no associated RoleTrack (company-level events).
+    - Company must be active.
+    - RoleTrack.tracking_mode must be 'ELIGIBLE'.
+    - Event matches drive_type via its RoleTrack (or drive_type == 'COMBINED').
     """
     stmt = (
         select(models.TimelineEvent)
         .join(models.Company, models.TimelineEvent.company_id == models.Company.id)
-        .outerjoin(
+        .join(
             models.RoleTrack,
             models.TimelineEvent.role_track_id == models.RoleTrack.id,
         )
         .where(
             models.Company.is_active == True,  # noqa: E712
-            models.Company.tracking_mode != "IGNORED",
+            models.RoleTrack.tracking_mode == "ELIGIBLE",
         )
         .where(
             or_(
                 # COMBINED viewport: accept every drive type
                 true() if drive_type == "COMBINED" else false(),
-                # Company-level events (no role track) always appear
-                models.TimelineEvent.role_track_id == None,  # noqa: E711
+                # COMBINED role tracks apply to all viewports
+                models.RoleTrack.drive_type == "COMBINED",
                 # Role-specific events matching the requested drive type
                 models.RoleTrack.drive_type == drive_type,
             )
@@ -224,3 +225,72 @@ async def replace_form_event(
     await db.commit()
     await db.refresh(new_event)
     return new_event
+
+
+# ---------------------------------------------------------------------------
+# Triage Operations
+# ---------------------------------------------------------------------------
+
+
+async def get_pending_triage_items(
+    db: AsyncSession,
+) -> List[models.RoleTrack]:
+    """Query RoleTracks joined with Company where is_triaged == False,
+    eagerly loading company, ordered by created_at DESC."""
+    stmt = (
+        select(models.RoleTrack)
+        .join(models.Company, models.RoleTrack.company_id == models.Company.id)
+        .where(models.RoleTrack.is_triaged == False)  # noqa: E712
+        .options(selectinload(models.RoleTrack.company))
+        .order_by(models.RoleTrack.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def triage_role_track(
+    db: AsyncSession, role_track_id: int, action: str
+) -> Optional[models.RoleTrack]:
+    """Update RoleTrack.tracking_mode = action and strictly set is_triaged = True."""
+    stmt = (
+        select(models.RoleTrack)
+        .options(selectinload(models.RoleTrack.company))
+        .where(models.RoleTrack.id == role_track_id)
+    )
+    result = await db.execute(stmt)
+    track = result.scalars().first()
+    if track is None:
+        return None
+
+    track.tracking_mode = action
+    track.is_triaged = True
+    track.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(track)
+    return track
+
+
+async def flag_for_retriage(
+    db: AsyncSession, role_track_id: int, note: str
+) -> Optional[models.RoleTrack]:
+    """Update latest_status_note on a RoleTrack.
+    Only if tracking_mode == 'SILENT_TRACK', also set is_triaged = False
+    so it reappears in the pending triage queue."""
+    stmt = (
+        select(models.RoleTrack)
+        .options(selectinload(models.RoleTrack.company))
+        .where(models.RoleTrack.id == role_track_id)
+    )
+    result = await db.execute(stmt)
+    track = result.scalars().first()
+    if track is None:
+        return None
+
+    track.latest_status_note = note
+    track.updated_at = datetime.now(timezone.utc)
+    if track.tracking_mode == "SILENT_TRACK":
+        track.is_triaged = False
+
+    await db.commit()
+    await db.refresh(track)
+    return track

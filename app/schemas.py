@@ -42,7 +42,8 @@ class RoleTrackBase(BaseModel):
     role_name: str
     drive_type: str = "FTE"
     ctc_stipend_info: Optional[str] = None
-    is_targeted_by_user: bool = True
+    tracking_mode: str = "SILENT_TRACK"
+    is_triaged: bool = False
 
 
 class RoleTrackCreate(RoleTrackBase):
@@ -54,6 +55,7 @@ class RoleTrackResponse(RoleTrackBase):
     company_id: int
     lifecycle_status: str
     latest_status_note: Optional[str] = None
+    created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -99,3 +101,22 @@ class ReplaceFormPayload(BaseModel):
     new_form_link: str
     new_end_time: datetime
     title: Optional[str] = "Google Form Submission"
+
+
+# ---------------------------------------------------------------------------
+# Triage Schemas
+# ---------------------------------------------------------------------------
+class TriageItemResponse(BaseModel):
+    id: int
+    company_name: str
+    role_name: str
+    drive_type: str
+    ctc_stipend_info: Optional[str] = None
+    latest_status_note: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TriageActionPayload(BaseModel):
+    action: Literal["ELIGIBLE", "SILENT_TRACK", "IGNORED"]

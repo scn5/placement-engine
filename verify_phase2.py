@@ -72,6 +72,8 @@ async def test_create_company_and_role_tracks(db: AsyncSession) -> tuple:
             role_name="Member Technical",
             drive_type="FTE",
             ctc_stipend_info="60 LPA",
+            tracking_mode="ELIGIBLE",
+            is_triaged=True,
         ),
     )
     assert fte_track.drive_type == "FTE"
@@ -83,6 +85,8 @@ async def test_create_company_and_role_tracks(db: AsyncSession) -> tuple:
             role_name="Software Intern",
             drive_type="INTERNSHIP",
             ctc_stipend_info="80k/month",
+            tracking_mode="ELIGIBLE",
+            is_triaged=True,
         ),
     )
     assert intern_track.drive_type == "INTERNSHIP"
@@ -119,12 +123,23 @@ async def test_timeline_viewport_filtering(
         ),
     )
 
-    # Company-level event (no role_track) — must appear in all viewports
+    combined_track = await crud.create_role_track(
+        db,
+        schemas.RoleTrackCreate(
+            company_id=company.id,
+            role_name="Combined Track",
+            drive_type="COMBINED",
+            tracking_mode="ELIGIBLE",
+            is_triaged=True,
+        ),
+    )
+
+    # Combined role event — appears in all viewports
     common_event = await crud.create_custom_event(
         db,
         schemas.TimelineEventCreate(
             company_id=company.id,
-            role_track_id=None,
+            role_track_id=combined_track.id,
             event_type="PPT",
             title="Pre-Placement Talk",
             end_time=future,
