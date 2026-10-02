@@ -145,3 +145,22 @@ class TimelineEvent(Base):
         if now > end:
             return "MISSED"
         return "PENDING"
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    roll_number: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    personal_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    college_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    main_feed_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    test_feed_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("updated_at", datetime.now(timezone.utc))
+        super().__init__(**kwargs)

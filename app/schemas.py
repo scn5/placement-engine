@@ -120,3 +120,28 @@ class TriageItemResponse(BaseModel):
 
 class TriageActionPayload(BaseModel):
     action: Literal["ELIGIBLE", "SILENT_TRACK", "IGNORED"]
+
+
+# ---------------------------------------------------------------------------
+# SystemConfig Schemas
+# ---------------------------------------------------------------------------
+class SystemConfigResponse(BaseModel):
+    id: int
+    student_name: Optional[str] = None
+    roll_number: Optional[str] = None
+    personal_email: Optional[str] = None
+    college_email: Optional[str] = None
+    main_feed_id: Optional[int] = None
+    test_feed_id: Optional[int] = None
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SystemConfigUpdate(BaseModel):
+    student_name: Optional[str] = None
+    roll_number: Optional[str] = None
+    personal_email: Optional[str] = None
+    college_email: Optional[str] = None
+    main_feed_id: Optional[int] = None
+    test_feed_id: Optional[int] = None
