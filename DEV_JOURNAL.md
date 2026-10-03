@@ -24,3 +24,26 @@ The Decision/Fix: Registered the `events.MessageEdited` handler in Telethon. The
 The Problem: The mobile application threw a `Not Found` error when attempting to load the Triage Hub staging queue.
 The Context/Why it failed: The frontend API contract expected a `/triage` endpoint to fetch the manual-review queue, but `main.py` lacked this router in FastAPI.
 The Decision/Fix: A temporary fallback was added to the frontend to catch the 404. Rule established: The backend must formally implement `@app.get("/triage")` and `@app.post("/triage/{id}/accept")` in FastAPI to resolve the API mismatch.
+
+[October 2026]: Triage Hub Implementation & Conditional Criteria Relaxation
+The Problem: Inbound role announcements needed a dedicated staging and manual review workflow before promotion to the active timeline feed, plus an automated mechanism to resurface drives when criteria change.
+The Context/Why it failed: The application previously stored tracking state only at the company level. When placement teams relaxed CGPA or branch criteria, previously discarded/ignored roles remained hidden indefinitely without alerting the student.
+The Decision/Fix: Implemented `app/routers/triage.py` exposing `GET /triage/pending`, `POST /triage/{id}`, and shortcut routes `/accept` and `/ignore`. Built `crud.flag_for_retriage()`, which updates `latest_status_note` on role tracks and conditionally resets `is_triaged = False` strictly when `tracking_mode == "SILENT_TRACK"`, ensuring criteria relaxation triggers a re-review banner in the mobile hub without disrupting accepted or ignored tracks.
+
+[October 2026]: Role-Level Tracking Schema Migration
+The Problem: Multi-role companies (e.g. hiring both SDE Full-Time and Analyst Intern) could not be tracked independently with different eligibility statuses.
+The Context/Why it failed: The legacy schema bound `tracking_mode` directly to `Company`. Rejecting or accepting one role inadvertently altered all other roles from the same company.
+The Decision/Fix: Migrated `tracking_mode`, `is_triaged`, `drive_type`, `ctc_stipend_info`, `lifecycle_status`, and `latest_status_note` to the `RoleTrack` model. Updated timeline query filters in `crud.get_timeline_events()` to join `RoleTrack` and strictly enforce `RoleTrack.tracking_mode == "ELIGIBLE"` with support for `COMBINED` viewport roles.
+
+[October 2026]: System Configuration & Settings API
+The Problem: Student identity metadata (name, roll number, college email) and Telegram channel feed IDs were unconfigurable at runtime, preventing customized LLM defaulter filtering and multi-environment feed subscription.
+The Context/Why it failed: Hardcoding settings in `.env` prevented the mobile client from persisting user profile data dynamically.
+The Decision/Fix: Introduced the `SystemConfig` ORM model (`system_config` table) and implemented `app/routers/settings.py` providing `GET /settings` and `PUT /settings` with `exclude_unset=True` partial updates. Verified behavior across uninitialized states and validated feed IDs as BigInteger storage.
+
+[October 2026]: P0 Contract Alignment — Atomic Company Creation, Timeline Enrichment & Company Events Route
+The Problem: Mobile client encountered HTTP 422 Unprocessable Entity when creating companies (`company_name` vs `name` and missing default `RoleTrack`), stage progression StepperView threw HTTP 404 on `GET /companies/{id}/events`, and timeline cards could not render status badges or company tags due to schema field discrepancies.
+The Context/Why it failed: The frontend sent flat company objects containing role metadata (`role_name`, `drive_type`, `ctc_stipend_info`), while `POST /companies/` only accepted `CompanyBase` without role tracks. Furthermore, `TimelineEventResponse` omitted joined metadata (`company_name`, `drive_type`, `status`).
+The Decision/Fix: 
+1. Updated `CompanyCreate` schema to accept optional `role_name`, `drive_type`, and `ctc_stipend_info`. Updated `crud.create_company()` to atomically persist a child `RoleTrack` (`is_triaged=True` by default) in the same transaction.
+2. Implemented `GET /companies/{company_id}/events` in `app/routers/companies.py` returning chronological events scoped to a specific company.
+3. Added async-safe properties (`company_name`, `drive_type`, `status`) to `TimelineEvent` and enriched `TimelineEventResponse` schema with fallback defaults, eliminating runtime null dereferences on the frontend.

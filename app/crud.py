@@ -16,7 +16,10 @@ from app import models, schemas
 async def create_company(
     db: AsyncSession, company_in: schemas.CompanyCreate
 ) -> models.Company:
-    """Create a new company, normalizing its name to lowercase + stripped."""
+    """Create a new company, normalizing its name to lowercase + stripped.
+
+    Atomically persists a default child RoleTrack from the supplied role
+    metadata. Manually created companies are pre-triaged (is_triaged=True)."""
     normalized = company_in.name.strip().lower()
     db_company = models.Company(
         name=company_in.name.strip(),
@@ -25,8 +28,21 @@ async def create_company(
         is_custom=company_in.is_custom,
     )
     db.add(db_company)
+    await db.flush()  # assign db_company.id within the same transaction
+
+    db_track = models.RoleTrack(
+        company_id=db_company.id,
+        role_name=(company_in.role_name or "").strip() or "Default Role",
+        drive_type=company_in.drive_type or "FTE",
+        ctc_stipend_info=company_in.ctc_stipend_info,
+        tracking_mode=company_in.tracking_mode,
+        # Placeholder default track: never a triage candidate (manual or not).
+        is_triaged=True,
+    )
+    db.add(db_track)
     await db.commit()
     await db.refresh(db_company)
+    await db.refresh(db_company, attribute_names=["role_tracks"])
     return db_company
 
 
@@ -126,13 +142,55 @@ async def get_timeline_events(
     return list(result.scalars().all())
 
 
+async def _load_event(
+    db: AsyncSession, event_id: int
+) -> Optional[models.TimelineEvent]:
+    """Reload an event with company/role_track eagerly loaded (response enrichment)."""
+    result = await db.execute(
+        select(models.TimelineEvent)
+        .where(models.TimelineEvent.id == event_id)
+        .options(
+            selectinload(models.TimelineEvent.company),
+            selectinload(models.TimelineEvent.role_track),
+        )
+        .execution_options(populate_existing=True)
+    )
+    return result.scalars().first()
+
+
+async def get_company_events(
+    db: AsyncSession, company_id: int
+) -> List[models.TimelineEvent]:
+    """Return every timeline event for a company, ordered chronologically."""
+    stmt = (
+        select(models.TimelineEvent)
+        .where(models.TimelineEvent.company_id == company_id)
+        .options(
+            selectinload(models.TimelineEvent.company),
+            selectinload(models.TimelineEvent.role_track),
+        )
+        .order_by(models.TimelineEvent.end_time.asc(), models.TimelineEvent.id.asc())
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
 async def create_custom_event(
     db: AsyncSession, event_in: schemas.TimelineEventCreate
 ) -> models.TimelineEvent:
     """Create a new custom timeline event."""
+    role_track_id = event_in.role_track_id
+    if role_track_id is None:
+        track_result = await db.execute(
+            select(models.RoleTrack.id)
+            .where(models.RoleTrack.company_id == event_in.company_id)
+            .order_by(models.RoleTrack.id.asc())
+            .limit(1)
+        )
+        role_track_id = track_result.scalar()
     db_event = models.TimelineEvent(
         company_id=event_in.company_id,
-        role_track_id=event_in.role_track_id,
+        role_track_id=role_track_id,
         event_type=event_in.event_type,
         title=event_in.title,
         action_link=event_in.action_link,
@@ -143,8 +201,7 @@ async def create_custom_event(
     )
     db.add(db_event)
     await db.commit()
-    await db.refresh(db_event)
-    return db_event
+    return await _load_event(db, db_event.id)
 
 
 async def set_event_completion(
@@ -169,7 +226,8 @@ async def set_event_completion(
     )
     result = await db.execute(stmt)
     await db.commit()
-    return result.scalars().first()
+    row = result.scalars().first()
+    return await _load_event(db, row.id) if row is not None else None
 
 
 async def extend_event_deadline(
@@ -185,7 +243,8 @@ async def extend_event_deadline(
     )
     result = await db.execute(stmt)
     await db.commit()
-    return result.scalars().first()
+    row = result.scalars().first()
+    return await _load_event(db, row.id) if row is not None else None
 
 
 async def replace_form_event(
@@ -223,8 +282,7 @@ async def replace_form_event(
     )
     db.add(new_event)
     await db.commit()
-    await db.refresh(new_event)
-    return new_event
+    return await _load_event(db, new_event.id)
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,20 @@ async def toggle_tracking(
     return schemas.CompanyResponse.model_validate(company)
 
 
+@router.get(
+    "/{company_id}/events",
+    response_model=List[schemas.TimelineEventResponse],
+    summary="List all timeline events for a company",
+)
+async def list_company_events(
+    company_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> List[schemas.TimelineEventResponse]:
+    """Return every timeline event scoped to one company, ordered chronologically."""
+    events = await crud.get_company_events(db, company_id)
+    return [schemas.TimelineEventResponse.model_validate(e) for e in events]
+
+
 @router.post(
     "/{company_id}/tracks",
     response_model=schemas.RoleTrackResponse,

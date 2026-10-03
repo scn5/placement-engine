@@ -27,6 +27,9 @@ class TimelineEventResponse(TimelineEventBase):
     role_track_id: Optional[int] = None
     user_status: str
     display_state: str
+    company_name: str = ""
+    drive_type: str = "FTE"
+    status: str = "PENDING"
     completed_at: Optional[datetime] = None
     is_custom: bool
     version: int
@@ -71,6 +74,9 @@ class CompanyBase(BaseModel):
 
 class CompanyCreate(CompanyBase):
     is_custom: bool = False
+    role_name: Optional[str] = "Default Role"
+    drive_type: Optional[str] = "FTE"
+    ctc_stipend_info: Optional[str] = None
 
 
 class CompanyResponse(CompanyBase):

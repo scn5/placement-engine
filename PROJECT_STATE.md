@@ -189,32 +189,41 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 #### Companies — `/companies`
 | Method | Path | Request Body | Response |
 |---|---|---|---|
-| `POST` | `/companies/` | `CompanyCreate` | `CompanyResponse` (201) |
+| `POST` | `/companies/` | `CompanyCreate` | `CompanyResponse` (201) — atomically creates default `RoleTrack` |
 | `GET` | `/companies/` | `?tracking_mode=` | `List[CompanyResponse]` |
+| `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological) |
 | `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` |
 | `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201) |
 
 #### Timeline Events — `/events`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/events/timeline` | `?drive_type=FTE` | `List[TimelineEventResponse]` |
+| `GET` | `/events/timeline` | `?drive_type=FTE` | `List[TimelineEventResponse]` (enriched with `company_name`, `drive_type`, `status`) |
 | `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201) |
 | `PATCH` | `/events/{id}/complete` | `?completed=true` | `TimelineEventResponse` |
 | `PATCH` | `/events/{id}/extend` | `ExtendDeadlinePayload` | `TimelineEventResponse` |
 | `POST` | `/events/companies/{id}/replace-form` | `ReplaceFormPayload` | `TimelineEventResponse` (201) |
 
-### 6.2 Missing Routes (Immediate Backlog)
+#### Triage Hub — `/triage`
+| Method | Path | Request Body | Response |
+|---|---|---|---|
+| `GET` | `/triage/pending` | — | `List[TriageItemResponse]` (`is_triaged == False`, newest first) |
+| `GET` | `/triage` | — | Alias to `/triage/pending` |
+| `POST` | `/triage/{id}` | `TriageActionPayload` | `TriageItemResponse` (sets `tracking_mode` & `is_triaged=True`) |
+| `POST` | `/triage/{id}/accept` | — | `TriageItemResponse` (convenience shortcut for `ELIGIBLE`) |
+| `POST` | `/triage/{id}/ignore` | — | `TriageItemResponse` (convenience shortcut for `IGNORED`) |
 
-> **🚨 Known 404 — Triage Hub:** The mobile `command-center` app calls `GET /triage` and `POST /triage/{id}/accept`. Neither route is registered. The app currently uses a client-side fallback (`[]`) but this must be resolved before triage functionality is live.
+#### System Settings — `/settings`
+| Method | Path | Request Body | Response |
+|---|---|---|---|
+| `GET` | `/settings` | — | `SystemConfigResponse` (404 if uninitialized) |
+| `PUT` | `/settings` | `SystemConfigUpdate` | `SystemConfigResponse` (partial upsert) |
+
+### 6.2 Missing Routes (Remaining Backlog)
 
 | Method | Path | Status | Priority |
 |---|---|---|---|
-| `GET` | `/triage` | ❌ Not implemented | **P0 — Mobile 404** |
-| `POST` | `/triage/{id}/accept` | ❌ Not implemented | **P0 — Mobile 404** |
-| `POST` | `/triage/{id}/ignore` | ❌ Not implemented | P1 |
 | `GET` | `/companies/{id}` | ❌ Not implemented | P1 |
-| `GET` | `/system-config` | ❌ Not implemented | P1 |
-| `PUT` | `/system-config` | ❌ Not implemented | P1 |
 | `POST` | `/notify/test` | ❌ Not implemented | P2 |
 
 ---
@@ -411,11 +420,13 @@ python verify_phase4.py
 
 ## 12. Immediate Backlog (Spec Conformance Gaps)
 
-### P0 — Blocking Mobile Client
+### P0 — Blocking Mobile Client (All Resolved)
 
-| # | Item | File(s) | Detail |
+| # | Item | File(s) | Status / Detail |
 |---|---|---|---|
-| 1 | **Implement `/triage` router** | `app/routers/triage.py` | `GET /triage` returns `[]` or `List[CompanyResponse]` where `tracking_mode=SILENT_TRACK`. `POST /triage/{id}/accept` calls `update_company_tracking(ELIGIBLE)`. Eliminates current HTTP 404. |
+| 1 | **Implement `/triage` router** | `app/routers/triage.py` | ✅ **Resolved** — `GET /triage/pending`, `POST /triage/{id}`, `/accept`, `/ignore`, and conditional re-triage. |
+| — | **Atomic Company Creation** | `app/crud.py`, `app/schemas.py` | ✅ **Resolved** — `POST /companies/` creates default `RoleTrack` atomically with role metadata. |
+| — | **Enriched Timeline & Events** | `app/schemas.py`, `app/routers/companies.py` | ✅ **Resolved** — `TimelineEventResponse` enriched with `company_name`, `drive_type`, `status`; `GET /companies/{id}/events` implemented. |
 
 ### P1 — Schema Conformance
 
@@ -426,7 +437,7 @@ python verify_phase4.py
 | 4 | **Add `has_attachments` to `TimelineEvent`** | `models.py`, migration | `BOOLEAN DEFAULT FALSE` — paperclip indicator in mobile UI |
 | 5 | **Migrate `main_feed_msg_id` → array** | `models.py` | `BIGINT[]` in PostgreSQL; thread stitching requires tracking multiple message IDs |
 | 6 | **Unify `event_type` enum** | `models.py`, `ai/schemas.py` | Align `IRIS_DEADLINE/OA_WINDOW` naming with spec's `IRIS/OA/FORM/GD/RESUME` |
-| 7 | **Per-role `tracking_mode` on `RoleTrack`** | `models.py`, `crud.py` | Spec places tracking state at role level, not company level |
+| 7 | **Per-role `tracking_mode` on `RoleTrack`** | `models.py`, `crud.py` | ✅ **Resolved** — Migrated to `RoleTrack` with `is_triaged` & timeline query alignment. |
 | 8 | **Full LLM schema migration** | `ai/schemas.py`, `ai/prompts.py`, `ai/dispatcher.py` | Adopt `PlacementExtractionPayload` (§4 of MASTER_SPEC): `is_actionable`, `roles[]`, `events[].is_form_replacement`, `events[].round_number` |
 
 ### P2 — Pipeline Completeness
@@ -436,7 +447,7 @@ python verify_phase4.py
 | 9 | **Recursive reply stitching (depth ≤ 6)** | `telegram/listener.py` | Current impl fetches only 1 level of `reply_to_msg_id` |
 | 10 | **Auto-join private channels** | `telegram/listener.py` | `_reconcile_and_backfill` needs `ImportChatInviteRequest` for `t.me/+` private links |
 | 11 | **60s TCP heartbeat** | `app/main.py` | Background task pinging Telegram DC to reset half-open connections |
-| 12 | **`system_configs` table & profile API** | `models.py`, new router | `GET/PUT /system-config` — student name, roll number, feed IDs for LLM defaulter filter |
+| 12 | **`system_config` table & profile API** | `models.py`, `app/routers/settings.py` | ✅ **Resolved** — `GET /settings` and `PUT /settings` implemented with student profile and feed IDs. |
 | 13 | **FCM push notification worker** | `app/workers/notifier.py` | 60s polling: `PENDING` events ±2h or ±30min from `start_time` → FCM dispatch |
 | 14 | **Defaulter list LLM filter** | `ai/prompts.py`, `ai/extractor.py` | Inject `system_configs.roll_number` into prompt; drop if user not in defaulter list |
 

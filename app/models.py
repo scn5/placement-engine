@@ -146,6 +146,22 @@ class TimelineEvent(Base):
             return "MISSED"
         return "PENDING"
 
+    # -- Response enrichment (async-safe: never triggers a lazy load) ---------
+    @property
+    def status(self) -> str:
+        """Alias of display_state for the mobile client contract."""
+        return self.display_state
+
+    @property
+    def company_name(self) -> str:
+        company = self.__dict__.get("company")
+        return company.name if company is not None else ""
+
+    @property
+    def drive_type(self) -> str:
+        track = self.__dict__.get("role_track")
+        return track.drive_type if track is not None else "FTE"
+
 
 class SystemConfig(Base):
     __tablename__ = "system_config"
