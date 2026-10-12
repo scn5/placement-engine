@@ -55,10 +55,11 @@ async def get_companies(
     tracking_mode: Optional[str] = None,
     env: Optional[str] = None,
 ) -> List[models.Company]:
-    """Retrieve companies ordered by name, eagerly loading role_tracks.
+    """Retrieve active companies ordered by name, eagerly loading role_tracks.
     Optionally filter by tracking_mode and/or environment_type (MAIN | TEST)."""
     stmt = (
         select(models.Company)
+        .where(models.Company.is_active == True)  # noqa: E712
         .options(selectinload(models.Company.role_tracks))
         .order_by(models.Company.name)
     )
@@ -68,6 +69,31 @@ async def get_companies(
         stmt = stmt.where(models.Company.environment_type == env.strip().upper())
     result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+async def soft_delete_company(
+    db: AsyncSession, company_id: int
+) -> bool:
+    """Soft-delete a company by setting Company.is_active = False and marking
+    all its TimelineEvent records with is_deleted = True.
+    Returns True if the company was found and soft-deleted, False otherwise."""
+    check_stmt = select(models.Company).where(models.Company.id == company_id)
+    res = await db.execute(check_stmt)
+    if res.scalars().first() is None:
+        return False
+
+    await db.execute(
+        update(models.Company)
+        .where(models.Company.id == company_id)
+        .values(is_active=False)
+    )
+    await db.execute(
+        update(models.TimelineEvent)
+        .where(models.TimelineEvent.company_id == company_id)
+        .values(is_deleted=True)
+    )
+    await db.commit()
+    return True
 
 
 async def update_company_tracking(
@@ -114,6 +140,25 @@ async def reopen_timeline_event(
     return await set_event_completion(db, event_id, is_completed=False)
 
 
+async def soft_delete_timeline_event(
+    db: AsyncSession, event_id: int
+) -> bool:
+    """Soft-delete a timeline event by setting TimelineEvent.is_deleted = True.
+    Returns True if the event was found and soft-deleted, False otherwise."""
+    check_stmt = select(models.TimelineEvent).where(models.TimelineEvent.id == event_id)
+    res = await db.execute(check_stmt)
+    if res.scalars().first() is None:
+        return False
+
+    await db.execute(
+        update(models.TimelineEvent)
+        .where(models.TimelineEvent.id == event_id)
+        .values(is_deleted=True)
+    )
+    await db.commit()
+    return True
+
+
 async def create_role_track(
     db: AsyncSession, track_in: schemas.RoleTrackCreate
 ) -> models.RoleTrack:
@@ -145,7 +190,8 @@ async def get_timeline_events(
     """Return active timeline events ordered by end_time ASC.
 
     Filters:
-    - Company must be active.
+    - Company must be active (Company.is_active == True).
+    - TimelineEvent must not be soft-deleted (TimelineEvent.is_deleted == False).
     - RoleTrack.tracking_mode must be 'ELIGIBLE'.
     - Event matches drive_type via its RoleTrack (or drive_type == 'COMBINED').
     - Optionally filter by Company.environment_type (MAIN | TEST).
@@ -159,6 +205,7 @@ async def get_timeline_events(
         )
         .where(
             models.Company.is_active == True,  # noqa: E712
+            models.TimelineEvent.is_deleted == False,  # noqa: E712
             models.RoleTrack.tracking_mode == "ELIGIBLE",
         )
         .where(
@@ -202,10 +249,13 @@ async def _load_event(
 async def get_company_events(
     db: AsyncSession, company_id: int
 ) -> List[models.TimelineEvent]:
-    """Return every timeline event for a company, ordered chronologically."""
+    """Return every active timeline event for a company, ordered chronologically."""
     stmt = (
         select(models.TimelineEvent)
-        .where(models.TimelineEvent.company_id == company_id)
+        .where(
+            models.TimelineEvent.company_id == company_id,
+            models.TimelineEvent.is_deleted == False,  # noqa: E712
+        )
         .options(
             selectinload(models.TimelineEvent.company),
             selectinload(models.TimelineEvent.role_track),
@@ -335,13 +385,16 @@ async def get_pending_triage_items(
     db: AsyncSession,
     env: Optional[str] = None,
 ) -> List[models.RoleTrack]:
-    """Query RoleTracks joined with Company where is_triaged == False,
+    """Query RoleTracks joined with Company where is_triaged == False and Company.is_active == True,
     eagerly loading company, ordered by created_at DESC.
     Optionally filter by Company.environment_type (MAIN | TEST)."""
     stmt = (
         select(models.RoleTrack)
         .join(models.Company, models.RoleTrack.company_id == models.Company.id)
-        .where(models.RoleTrack.is_triaged == False)  # noqa: E712
+        .where(
+            models.Company.is_active == True,  # noqa: E712
+            models.RoleTrack.is_triaged == False,  # noqa: E712
+        )
         .options(selectinload(models.RoleTrack.company))
         .order_by(models.RoleTrack.created_at.desc())
     )

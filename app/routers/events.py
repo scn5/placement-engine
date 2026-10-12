@@ -129,3 +129,21 @@ async def replace_form(
         db, company_id=company_id, role_track_id=role_track_id, payload=payload
     )
     return schemas.TimelineEventResponse.model_validate(new_event)
+
+
+@router.delete(
+    "/{event_id}",
+    summary="Soft-delete a timeline event",
+)
+async def delete_event(
+    event_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Soft-delete a timeline event by setting is_deleted = True."""
+    deleted = await crud.soft_delete_timeline_event(db, event_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Event {event_id} not found.",
+        )
+    return {"status": "deleted", "id": event_id}

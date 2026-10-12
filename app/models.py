@@ -116,6 +116,7 @@ class TimelineEvent(Base):
         DateTime(timezone=True), nullable=True
     )
     is_custom: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -131,6 +132,7 @@ class TimelineEvent(Base):
     def __init__(self, **kwargs):
         kwargs.setdefault("user_status", "PENDING")
         kwargs.setdefault("is_custom", False)
+        kwargs.setdefault("is_deleted", False)
         kwargs.setdefault("version", 1)
         kwargs.setdefault("created_at", datetime.now(timezone.utc))
         super().__init__(**kwargs)

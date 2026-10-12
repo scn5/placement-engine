@@ -57,3 +57,12 @@ The Decision/Fix:
 1. Updated `crud.update_company_tracking` to cascade `tracking_mode` updates to all child `RoleTrack` records and reload `Company` with `.options(selectinload(models.Company.role_tracks))`.
 2. Added `crud.reopen_timeline_event` and `POST /events/{event_id}/uncomplete` (with `/reopen` alias) to reset `user_status = 'PENDING'` and `completed_at = None`.
 3. Added `environment_type: Mapped[str] = mapped_column(String(16), default="MAIN", nullable=False)` to `models.Company` (with a startup SQLite `ALTER TABLE` guard in `app/main.py`), exposed `environment_type` on `CompanyCreate`, `CompanyResponse`, `TimelineEventResponse`, and `TriageItemResponse`, and added optional `?env=MAIN|TEST` filtering to `GET /companies/`, `GET /events/timeline`, and `GET /triage/pending`.
+
+[October 2026]: Soft-Deletion Architecture for Companies & Timeline Events
+The Problem: Users needed the ability to delete unwanted or erroneously created companies and timeline events/stages from the mobile client without breaking database foreign keys or allowing the Telegram ingestion pipeline to re-create deleted records on message edits/backfills.
+The Context/Why it failed: Hard `DELETE` statements destroy relational history and `subchannel_id`/`main_feed_msg_id` mappings, which would cause Telethon backfill or edit handlers to re-ingest previously deleted companies or stages. Additionally, `TimelineEvent` lacked a dedicated soft-delete boolean column.
+The Decision/Fix:
+1. Added `is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)` to `models.TimelineEvent` with a safe `ALTER TABLE timeline_events ADD COLUMN is_deleted BOOLEAN DEFAULT 0` migration check in `app/main.py` (`lifespan`).
+2. Implemented `crud.soft_delete_company(db, company_id)` (sets `Company.is_active = False` and cascades `TimelineEvent.is_deleted = True` across all associated events) and `crud.soft_delete_timeline_event(db, event_id)` (sets `TimelineEvent.is_deleted = True`).
+3. Updated `crud.get_companies`, `crud.get_timeline_events`, `crud.get_company_events`, and `crud.get_pending_triage_items` to strictly filter `Company.is_active == True` and `TimelineEvent.is_deleted == False`.
+4. Exposed `DELETE /companies/{company_id}` in `app/routers/companies.py` and `DELETE /events/{event_id}` in `app/routers/events.py`, returning `{"status": "deleted", "id": ...}`.

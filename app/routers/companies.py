@@ -98,3 +98,21 @@ async def add_role_track(
         )
     db_track = await crud.create_role_track(db, track_in)
     return schemas.RoleTrackResponse.model_validate(db_track)
+
+
+@router.delete(
+    "/{company_id}",
+    summary="Soft-delete a company and its timeline events",
+)
+async def delete_company(
+    company_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Soft-delete a company (is_active=False) and mark all its events as is_deleted=True."""
+    deleted = await crud.soft_delete_company(db, company_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company {company_id} not found.",
+        )
+    return {"status": "deleted", "id": company_id}

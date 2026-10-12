@@ -34,6 +34,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await conn.exec_driver_sql(
                 "ALTER TABLE companies ADD COLUMN environment_type VARCHAR(16) NOT NULL DEFAULT 'MAIN'"
             )
+        with suppress(Exception):
+            await conn.exec_driver_sql(
+                "ALTER TABLE timeline_events ADD COLUMN is_deleted BOOLEAN DEFAULT 0"
+            )
     logger.info("Database schema ready.")
 
     # ── 2. Telegram ingestion engine (optional) ────────────────────────────

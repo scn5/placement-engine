@@ -158,6 +158,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `user_status` | String(32) | `PENDING` \| `COMPLETED` |
 | `completed_at` | DateTime(tz) | Timestamp of user completion |
 | `is_custom` | Boolean | Manual vs auto-ingested |
+| `is_deleted` | Boolean | Soft-delete flag (`default=False`) |
 | `version` | Integer | Form replacement counter |
 | `created_at` | DateTime(tz) | |
 
@@ -189,20 +190,22 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
 | `POST` | `/companies/` | `CompanyCreate` (includes optional `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates default `RoleTrack` |
-| `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` |
-| `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological) |
+| `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` (filters `is_active == True`) |
+| `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological, filters `is_deleted == False`) |
 | `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` to child `RoleTrack`s) |
 | `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201) |
+| `DELETE` | `/companies/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes company `is_active=False` & cascades `is_deleted=True` to events) |
 
 #### Timeline Events — `/events`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (enriched with `company_name`, `drive_type`, `environment_type`, `status`) |
+| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (filters `Company.is_active == True` and `TimelineEvent.is_deleted == False`) |
 | `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201) |
 | `PATCH` | `/events/{id}/complete` | `?completed=true` | `TimelineEventResponse` |
 | `POST` | `/events/{id}/uncomplete` | — (alias `/reopen`) | `TimelineEventResponse` (resets `user_status=PENDING`, `completed_at=None`) |
 | `PATCH` | `/events/{id}/extend` | `ExtendDeadlinePayload` | `TimelineEventResponse` |
 | `POST` | `/events/companies/{id}/replace-form` | `ReplaceFormPayload` | `TimelineEventResponse` (201) |
+| `DELETE` | `/events/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes event `is_deleted=True`) |
 
 #### Triage Hub — `/triage`
 | Method | Path | Request Body / Params | Response |
