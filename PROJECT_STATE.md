@@ -117,6 +117,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `id` | Integer PK | Auto-increment |
 | `name` | String(255) | Display name |
 | `normalized_name` | String(255) UNIQUE | Lowercase stripped; lookup key |
+| `environment_type` | String(16) | `MAIN` \| `TEST` (default `MAIN`) |
 | `main_feed_msg_id` | BigInteger | Single-ID current impl (spec calls for array) |
 | `subchannel_id` | BigInteger UNIQUE | Telegram channel ID for routing |
 | `tracking_mode` | String(32) | `ELIGIBLE` \| `SILENT_TRACK` \| `IGNORED` |
@@ -127,8 +128,6 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 **Relationships:** `role_tracks` (cascade delete), `timeline_events` (cascade delete)
 
 > **⚠ Schema Gap vs MASTER_SPEC:** `main_feed_msg_id` is a single `BigInteger`. The spec defines `main_feed_msg_ids BIGINT[]` (array) for multi-message thread stitching. Needs migration when switching to PostgreSQL.
-> **⚠ Schema Gap:** `environment_type` column (`MAIN`/`TEST`) is absent — required for FR1 env isolation.
-> **⚠ Schema Gap:** `tracking_mode` lives on `Company`, but spec places it on `role_tracks` (per-role triage state). Current location serves the Phase 2 API but will need reconciliation.
 
 ### 5.2 `RoleTrack`
 | Column | Type | Notes |
@@ -138,12 +137,12 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `role_name` | String(255) | e.g. `DAA`, `BTSA`, `Software Engineer` |
 | `drive_type` | String(32) | `FTE` \| `INTERNSHIP` \| `COMBINED` |
 | `ctc_stipend_info` | Text | Package string |
+| `tracking_mode` | String(32) | `ELIGIBLE` \| `SILENT_TRACK` \| `IGNORED` |
+| `is_triaged` | Boolean | `False` = pending in Triage Hub |
 | `lifecycle_status` | String(64) | `APPLICATION_WINDOW` \| `INTERVIEWS` \| … |
-| `is_targeted_by_user` | Boolean | HITL tracking flag |
 | `latest_status_note` | Text | Non-temporal status (e.g. "Shortlists delayed") |
+| `created_at` | DateTime(tz) | UTC default |
 | `updated_at` | DateTime(tz) | Auto-updated on write |
-
-> **⚠ Schema Gap:** `tracking_mode` per role (spec §5 `role_tracks.tracking_mode`) is absent here; currently on `Company`.
 
 ### 5.3 `TimelineEvent`
 | Column | Type | Notes |
@@ -187,28 +186,29 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 | `GET` | `/health` | Preflight check; returns `{"status": "healthy"}` |
 
 #### Companies — `/companies`
-| Method | Path | Request Body | Response |
+| Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `POST` | `/companies/` | `CompanyCreate` | `CompanyResponse` (201) — atomically creates default `RoleTrack` |
-| `GET` | `/companies/` | `?tracking_mode=` | `List[CompanyResponse]` |
+| `POST` | `/companies/` | `CompanyCreate` (includes optional `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates default `RoleTrack` |
+| `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` |
 | `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological) |
-| `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` |
+| `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` to child `RoleTrack`s) |
 | `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201) |
 
 #### Timeline Events — `/events`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/events/timeline` | `?drive_type=FTE` | `List[TimelineEventResponse]` (enriched with `company_name`, `drive_type`, `status`) |
+| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (enriched with `company_name`, `drive_type`, `environment_type`, `status`) |
 | `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201) |
 | `PATCH` | `/events/{id}/complete` | `?completed=true` | `TimelineEventResponse` |
+| `POST` | `/events/{id}/uncomplete` | — (alias `/reopen`) | `TimelineEventResponse` (resets `user_status=PENDING`, `completed_at=None`) |
 | `PATCH` | `/events/{id}/extend` | `ExtendDeadlinePayload` | `TimelineEventResponse` |
 | `POST` | `/events/companies/{id}/replace-form` | `ReplaceFormPayload` | `TimelineEventResponse` (201) |
 
 #### Triage Hub — `/triage`
-| Method | Path | Request Body | Response |
+| Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/triage/pending` | — | `List[TriageItemResponse]` (`is_triaged == False`, newest first) |
-| `GET` | `/triage` | — | Alias to `/triage/pending` |
+| `GET` | `/triage/pending` | `?env=MAIN\|TEST` | `List[TriageItemResponse]` (`is_triaged == False`, newest first, includes `environment_type`) |
+| `GET` | `/triage` | `?env=MAIN\|TEST` | Alias to `/triage/pending` |
 | `POST` | `/triage/{id}` | `TriageActionPayload` | `TriageItemResponse` (sets `tracking_mode` & `is_triaged=True`) |
 | `POST` | `/triage/{id}/accept` | — | `TriageItemResponse` (convenience shortcut for `ELIGIBLE`) |
 | `POST` | `/triage/{id}/ignore` | — | `TriageItemResponse` (convenience shortcut for `IGNORED`) |
@@ -432,7 +432,7 @@ python verify_phase4.py
 
 | # | Item | File(s) | Detail |
 |---|---|---|---|
-| 2 | **Add `environment_type` to `Company`** | `models.py`, migration | `VARCHAR(10) DEFAULT 'MAIN'` — enables `?env=MAIN/TEST` filter (FR1) |
+| 2 | **Add `environment_type` to `Company`** | `models.py`, `schemas.py`, `crud.py` | ✅ **Resolved** — `VARCHAR(16) DEFAULT 'MAIN'` added to `Company` with `?env=MAIN/TEST` filtering across `/companies/`, `/events/timeline`, and `/triage/pending`. |
 | 3 | **Add `round_number` to `TimelineEvent`** | `models.py`, migration | `INTEGER DEFAULT 1` — required for OA/Interview round state machine |
 | 4 | **Add `has_attachments` to `TimelineEvent`** | `models.py`, migration | `BOOLEAN DEFAULT FALSE` — paperclip indicator in mobile UI |
 | 5 | **Migrate `main_feed_msg_id` → array** | `models.py` | `BIGINT[]` in PostgreSQL; thread stitching requires tracking multiple message IDs |

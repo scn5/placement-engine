@@ -1,6 +1,6 @@
 from typing import List, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import crud, models, schemas
@@ -10,11 +10,17 @@ router = APIRouter(prefix="/triage", tags=["Triage"])
 
 
 def _to_triage_item(track: models.RoleTrack) -> schemas.TriageItemResponse:
+    env_type = (
+        track.company.environment_type
+        if track.company and getattr(track.company, "environment_type", None)
+        else "MAIN"
+    )
     return schemas.TriageItemResponse(
         id=track.id,
         company_name=track.company.name if track.company else "",
         role_name=track.role_name,
         drive_type=track.drive_type,
+        environment_type=env_type,
         ctc_stipend_info=track.ctc_stipend_info,
         latest_status_note=track.latest_status_note,
         created_at=track.created_at,
@@ -33,11 +39,15 @@ def _to_triage_item(track: models.RoleTrack) -> schemas.TriageItemResponse:
     include_in_schema=False,
 )
 async def get_pending_triage(
+    env: Optional[str] = Query(
+        default=None,
+        description="Filter by feed environment: MAIN | TEST",
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> List[schemas.TriageItemResponse]:
     """Retrieve all role tracks awaiting triage (is_triaged == False),
     ordered by created_at DESC."""
-    tracks = await crud.get_pending_triage_items(db)
+    tracks = await crud.get_pending_triage_items(db, env=env)
     return [_to_triage_item(t) for t in tracks]
 
 

@@ -19,10 +19,14 @@ async def get_timeline(
         default="FTE",
         description="Drive type viewport: FTE | INTERNSHIP | COMBINED",
     ),
+    env: Optional[str] = Query(
+        default=None,
+        description="Filter by feed environment: MAIN | TEST",
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> List[schemas.TimelineEventResponse]:
-    """Return the active timeline feed filtered by drive_type, ordered by deadline."""
-    events = await crud.get_timeline_events(db, drive_type=drive_type)
+    """Return the active timeline feed filtered by drive_type and optional env, ordered by deadline."""
+    events = await crud.get_timeline_events(db, drive_type=drive_type, env=env)
     return [schemas.TimelineEventResponse.model_validate(e) for e in events]
 
 
@@ -53,6 +57,31 @@ async def complete_event(
 ) -> schemas.TimelineEventResponse:
     """Mark an event as COMPLETED or revert it to PENDING."""
     event = await crud.set_event_completion(db, event_id, is_completed=completed)
+    if event is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Event {event_id} not found.",
+        )
+    return schemas.TimelineEventResponse.model_validate(event)
+
+
+@router.post(
+    "/{event_id}/uncomplete",
+    response_model=schemas.TimelineEventResponse,
+    summary="Reopen / uncomplete an event",
+)
+@router.post(
+    "/{event_id}/reopen",
+    response_model=schemas.TimelineEventResponse,
+    summary="Reopen / uncomplete an event (alias)",
+    include_in_schema=False,
+)
+async def uncomplete_event(
+    event_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> schemas.TimelineEventResponse:
+    """Reopen an event by reverting user_status to PENDING and completed_at to None."""
+    event = await crud.reopen_timeline_event(db, event_id)
     if event is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

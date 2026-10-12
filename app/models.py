@@ -26,6 +26,9 @@ class Company(Base):
     tracking_mode: Mapped[str] = mapped_column(
         String(32), default="ELIGIBLE", nullable=False
     )
+    environment_type: Mapped[str] = mapped_column(
+        String(16), default="MAIN", nullable=False
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_custom: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -41,6 +44,7 @@ class Company(Base):
 
     def __init__(self, **kwargs):
         kwargs.setdefault("tracking_mode", "ELIGIBLE")
+        kwargs.setdefault("environment_type", "MAIN")
         kwargs.setdefault("is_active", True)
         kwargs.setdefault("is_custom", False)
         kwargs.setdefault("created_at", datetime.now(timezone.utc))
@@ -161,6 +165,15 @@ class TimelineEvent(Base):
     def drive_type(self) -> str:
         track = self.__dict__.get("role_track")
         return track.drive_type if track is not None else "FTE"
+
+    @property
+    def environment_type(self) -> str:
+        company = self.__dict__.get("company")
+        return (
+            company.environment_type
+            if company is not None and getattr(company, "environment_type", None)
+            else "MAIN"
+        )
 
 
 class SystemConfig(Base):

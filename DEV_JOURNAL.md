@@ -47,3 +47,13 @@ The Decision/Fix:
 1. Updated `CompanyCreate` schema to accept optional `role_name`, `drive_type`, and `ctc_stipend_info`. Updated `crud.create_company()` to atomically persist a child `RoleTrack` (`is_triaged=True` by default) in the same transaction.
 2. Implemented `GET /companies/{company_id}/events` in `app/routers/companies.py` returning chronological events scoped to a specific company.
 3. Added async-safe properties (`company_name`, `drive_type`, `status`) to `TimelineEvent` and enriched `TimelineEventResponse` schema with fallback defaults, eliminating runtime null dereferences on the frontend.
+
+[October 2026]: Tracking Mode Cascade, Event Reopen Endpoint & Environment Type Isolation (`MAIN` vs `TEST`)
+The Problem:
+1. Updating a company's `tracking_mode` via `PATCH /companies/{id}/tracking` risked `MissingGreenlet` during Pydantic response serialization if `role_tracks` was not eagerly loaded, and did not cascade `tracking_mode` to child `RoleTrack` rows (leaving events visible in `GET /events/timeline` when a company was moved to `SILENT_TRACK` or `IGNORED`).
+2. Completed events could not be reopened via a dedicated uncomplete endpoint (`POST /events/{id}/uncomplete`).
+3. `Company` lacked an explicit `environment_type` (`MAIN` vs `TEST`) column and query filter across `/companies/`, `/events/timeline`, and `/triage/pending` to isolate Main Feed vs Test Feed data.
+The Decision/Fix:
+1. Updated `crud.update_company_tracking` to cascade `tracking_mode` updates to all child `RoleTrack` records and reload `Company` with `.options(selectinload(models.Company.role_tracks))`.
+2. Added `crud.reopen_timeline_event` and `POST /events/{event_id}/uncomplete` (with `/reopen` alias) to reset `user_status = 'PENDING'` and `completed_at = None`.
+3. Added `environment_type: Mapped[str] = mapped_column(String(16), default="MAIN", nullable=False)` to `models.Company` (with a startup SQLite `ALTER TABLE` guard in `app/main.py`), exposed `environment_type` on `CompanyCreate`, `CompanyResponse`, `TimelineEventResponse`, and `TriageItemResponse`, and added optional `?env=MAIN|TEST` filtering to `GET /companies/`, `GET /events/timeline`, and `GET /triage/pending`.

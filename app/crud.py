@@ -21,10 +21,14 @@ async def create_company(
     Atomically persists a default child RoleTrack from the supplied role
     metadata. Manually created companies are pre-triaged (is_triaged=True)."""
     normalized = company_in.name.strip().lower()
+    env_type = (company_in.environment_type or "MAIN").strip().upper()
+    if env_type not in ("MAIN", "TEST"):
+        env_type = "MAIN"
     db_company = models.Company(
         name=company_in.name.strip(),
         normalized_name=normalized,
         tracking_mode=company_in.tracking_mode,
+        environment_type=env_type,
         is_custom=company_in.is_custom,
     )
     db.add(db_company)
@@ -47,10 +51,12 @@ async def create_company(
 
 
 async def get_companies(
-    db: AsyncSession, tracking_mode: Optional[str] = None
+    db: AsyncSession,
+    tracking_mode: Optional[str] = None,
+    env: Optional[str] = None,
 ) -> List[models.Company]:
     """Retrieve companies ordered by name, eagerly loading role_tracks.
-    Optionally filter by tracking_mode."""
+    Optionally filter by tracking_mode and/or environment_type (MAIN | TEST)."""
     stmt = (
         select(models.Company)
         .options(selectinload(models.Company.role_tracks))
@@ -58,6 +64,8 @@ async def get_companies(
     )
     if tracking_mode is not None:
         stmt = stmt.where(models.Company.tracking_mode == tracking_mode)
+    if env is not None and env.strip().upper() in ("MAIN", "TEST"):
+        stmt = stmt.where(models.Company.environment_type == env.strip().upper())
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
@@ -65,17 +73,45 @@ async def get_companies(
 async def update_company_tracking(
     db: AsyncSession, company_id: int, mode: str
 ) -> Optional[models.Company]:
-    """Update a company's tracking_mode. Returns None if company not found."""
-    stmt = (
+    """Update a company's tracking_mode and cascade to all its child RoleTracks.
+    Eagerly loads role_tracks to prevent MissingGreenlet in async serializers.
+    Returns None if company not found."""
+    check_stmt = select(models.Company).where(models.Company.id == company_id)
+    res = await db.execute(check_stmt)
+    if res.scalars().first() is None:
+        return None
+
+    # Update company tracking mode
+    await db.execute(
         update(models.Company)
         .where(models.Company.id == company_id)
         .values(tracking_mode=mode)
-        .returning(models.Company)
     )
-    result = await db.execute(stmt)
+
+    # Cascade to all child role tracks
+    await db.execute(
+        update(models.RoleTrack)
+        .where(models.RoleTrack.company_id == company_id)
+        .values(tracking_mode=mode)
+    )
+
     await db.commit()
-    row = result.scalars().first()
-    return row
+
+    # Eagerly load company with role_tracks for response serialization
+    result = await db.execute(
+        select(models.Company)
+        .where(models.Company.id == company_id)
+        .options(selectinload(models.Company.role_tracks))
+    )
+    return result.scalars().first()
+
+
+async def reopen_timeline_event(
+    db: AsyncSession, event_id: int
+) -> Optional[models.TimelineEvent]:
+    """Reopen / uncomplete an event: sets user_status='PENDING', completed_at=None,
+    restoring display_state dynamically (PENDING if future, MISSED if past)."""
+    return await set_event_completion(db, event_id, is_completed=False)
 
 
 async def create_role_track(
@@ -102,7 +138,9 @@ async def create_role_track(
 
 
 async def get_timeline_events(
-    db: AsyncSession, drive_type: str = "FTE"
+    db: AsyncSession,
+    drive_type: str = "FTE",
+    env: Optional[str] = None,
 ) -> List[models.TimelineEvent]:
     """Return active timeline events ordered by end_time ASC.
 
@@ -110,6 +148,7 @@ async def get_timeline_events(
     - Company must be active.
     - RoleTrack.tracking_mode must be 'ELIGIBLE'.
     - Event matches drive_type via its RoleTrack (or drive_type == 'COMBINED').
+    - Optionally filter by Company.environment_type (MAIN | TEST).
     """
     stmt = (
         select(models.TimelineEvent)
@@ -138,6 +177,8 @@ async def get_timeline_events(
         )
         .order_by(models.TimelineEvent.end_time.asc())
     )
+    if env is not None and env.strip().upper() in ("MAIN", "TEST"):
+        stmt = stmt.where(models.Company.environment_type == env.strip().upper())
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
@@ -292,9 +333,11 @@ async def replace_form_event(
 
 async def get_pending_triage_items(
     db: AsyncSession,
+    env: Optional[str] = None,
 ) -> List[models.RoleTrack]:
     """Query RoleTracks joined with Company where is_triaged == False,
-    eagerly loading company, ordered by created_at DESC."""
+    eagerly loading company, ordered by created_at DESC.
+    Optionally filter by Company.environment_type (MAIN | TEST)."""
     stmt = (
         select(models.RoleTrack)
         .join(models.Company, models.RoleTrack.company_id == models.Company.id)
@@ -302,6 +345,8 @@ async def get_pending_triage_items(
         .options(selectinload(models.RoleTrack.company))
         .order_by(models.RoleTrack.created_at.desc())
     )
+    if env is not None and env.strip().upper() in ("MAIN", "TEST"):
+        stmt = stmt.where(models.Company.environment_type == env.strip().upper())
     result = await db.execute(stmt)
     return list(result.scalars().all())
 

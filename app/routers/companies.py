@@ -34,10 +34,14 @@ async def list_companies(
         default=None,
         description="Filter by tracking mode: ELIGIBLE | SILENT_TRACK | IGNORED",
     ),
+    env: Optional[str] = Query(
+        default=None,
+        description="Filter by feed environment: MAIN | TEST",
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> List[schemas.CompanyResponse]:
-    """Return all companies ordered by name. Optionally filter by `tracking_mode`."""
-    companies = await crud.get_companies(db, tracking_mode=tracking_mode)
+    """Return all companies ordered by name. Optionally filter by `tracking_mode` and/or `env`."""
+    companies = await crud.get_companies(db, tracking_mode=tracking_mode, env=env)
     return [schemas.CompanyResponse.model_validate(c) for c in companies]
 
 

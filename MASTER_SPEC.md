@@ -218,22 +218,23 @@ A stateless FastAPI background task queries PostgreSQL every **60 seconds**.
   * System executes a preflight `GET /health` verification before granting entry.
   * Preserves verified endpoint in persistent local storage (`AsyncStorage`).
 * **FR-7.2 Environment Toggle (View Isolation):**
-  * Persistent top-level switch (Main / Test). When toggled, the app executes requests with `?env=MAIN` or `?env=TEST`. The backend filters by `companies.environment_type`. Main and Test data never cross-pollinate.
+  * Persistent top-level 3-way feed filter (**All** / **Main Feed** / **Test Feed**), defaulting to **Main Feed** (`MAIN`) across Timeline, Companies, and Triage Hub. When toggled, the app executes requests with `?env=MAIN` or `?env=TEST` and filters by `companies.environment_type`. Main and Test data never cross-pollinate.
 * **FR-7.3 Timeline Screen:**
-  * Displays chronologically ordered stage deadlines grouped by date.
+  * Displays chronologically ordered stage deadlines grouped dynamically by exact calendar date (`Mon, Oct 12, 2026`, `Today • Tue, Oct 13`, `Tomorrow • Wed, Oct 14`, `Thu, Oct 15, 2026`), sorted strictly by `end_time` within each day.
+  * Automatically scrolls the `SectionList` viewport to the **Today** section (`Today • ...`) upon loading so the user lands directly on current deadlines rather than past dates.
   * Visual status badges (Blue, Red, Green, Grey) rendering task state.
   * *Global Masking:* Internship role tracks are strictly hidden from this view to prevent clutter.
   * Includes paperclip indicators on events flagged with `has_attachments`.
-  * Pull-to-refresh sync with `GET /timeline`.
+  * Pull-to-refresh sync with `GET /events/timeline`.
 * **FR-7.4 Triage Hub:**
-  * Dedicated view for reviewing incoming placement notices (which default to `SILENT_TRACK`).
-  * Action triggers applied per role: **Accept** (moves to `ELIGIBLE` & active timeline), **Edit** (amends metadata), or **Discard** (moves to `IGNORED`).
+  * Dedicated view for reviewing incoming placement notices (which default to `SILENT_TRACK`), with top-level **All / Main Feed / Test Feed** filter (defaulting to `MAIN`).
+  * Action triggers applied per role: **Accept** (moves to `ELIGIBLE` & active timeline), **Silent Track** (keeps in `SILENT_TRACK`), or **Discard** (moves to `IGNORED`).
 * **FR-7.5 Companies Directory:**
-  * Searchable list by company name or role.
-  * Filter categories: `All`, `Eligible`, `Silent Track`, `Ignored`.
-  * Detail views showing full placement drive history, package details, mutually exclusive warnings, and stage progression pipelines.
+  * Searchable list by company name or role, with **All / Main Feed / Test Feed** source toggle (defaulting to `MAIN`).
+  * Compact pill filter categories: `All`, `Eligible`, `Silent Track`, `Ignored`.
+  * Detail views showing full placement drive history, package details, mutually exclusive warnings, and stage progression pipelines ordered chronologically by stage deadline/event time.
 * **FR-7.6 Manual Drive / Stage Creation:**
-  * Global floating action trigger providing options: "Add Custom Company" and "Add Custom Stage".
+  * Global floating action trigger providing options: "Add Custom Company" (including **Main Feed** vs. **Test Feed** `environment_type` selection, defaulting to `MAIN`) and "Add Custom Stage".
   * Form inputs for manual overrides outside automated Telegram broadcasts.
 * **FR-7.7 Profile Settings Screen:**
-  * Secure UI to configure `student_name`, `roll_number`, emails, and Telegram Feed IDs (writes to `system_configs`). 
+  * Secure UI to configure `student_name`, `roll_number`, emails, and Telegram Feed IDs (writes to `system_configs`).

@@ -30,6 +30,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── 1. Database schema bootstrap ──────────────────────────────────────
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        with suppress(Exception):
+            await conn.exec_driver_sql(
+                "ALTER TABLE companies ADD COLUMN environment_type VARCHAR(16) NOT NULL DEFAULT 'MAIN'"
+            )
     logger.info("Database schema ready.")
 
     # ── 2. Telegram ingestion engine (optional) ────────────────────────────

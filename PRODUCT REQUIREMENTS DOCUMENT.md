@@ -36,8 +36,8 @@ A strictly personal, Human-In-The-Loop (HITL) automated command center.
 
 ### Workflow 2: The Morning Timeline Review
 * **Context:** The backend ingested 30 messages overnight.
-* **Action:** The user opens the Timeline tab.
-* **Expected Result:** A chronological list of actionable events (e.g., "ZS Associates - Aptitude Test"). Events requiring action are badged as **Blue (PENDING)**.
+* **Action:** The user opens the Timeline tab (which defaults to **Main Feed** and automatically scrolls to **Today**'s date section).
+* **Expected Result:** A Google Calendar-inspired chronological agenda of actionable events grouped by exact calendar day (`Mon, Oct 12, 2026`, `Today • Tue, Oct 13`, `Tomorrow • Wed, Oct 14`, `Thu, Oct 15, 2026`) and ordered strictly by `end_time` deadline within each day (e.g., "ZS Associates - Aptitude Test"). Events requiring action are badged as **Blue (PENDING)**.
 * **Attachment Indicator:** If an event has a paperclip icon, the user knows an unparsed PDF/Excel file was attached to the original message, prompting them to manually check the raw Telegram channel.
 
 ### Workflow 3: Task Execution & The Hitlist
@@ -65,9 +65,9 @@ A strictly personal, Human-In-The-Loop (HITL) automated command center.
 
 ## 4. Functional Requirements (FR)
 
-### FR1: Environment Isolation (Main vs. Test)
-* **Requirement:** The app must support a seamless toggle between "Production" and "Sandbox" data.
-* **Implementation:** The mobile app features a persistent top-level toggle. Toggling it filters all backend API requests (`?env=MAIN` or `?env=TEST`). Main feed data and testing data must never cross-pollinate.
+### FR1: Environment Isolation (Main Feed vs. Test Feed)
+* **Requirement:** The app must support a seamless toggle between "All", "Main Feed" (Production), and "Test Feed" (Sandbox) data, defaulting to "Main Feed".
+* **Implementation:** The mobile app features a top-level segmented filter (`All` / `Main Feed` / `Test Feed`) across Timeline, Companies, and Triage Hub, defaulting to `MAIN`. Selecting a feed filters backend API requests (`?env=MAIN` or `?env=TEST`) and client items by `environment_type`. Main feed data and testing data never cross-pollinate.
 
 ### FR2: Smart Notification Engine
 * **Requirement:** The user must be reliably alerted before deadlines, but not spammed for completed tasks.
@@ -91,7 +91,7 @@ A strictly personal, Human-In-The-Loop (HITL) automated command center.
 
 ### FR6: Manual Injections (Custom Overrides)
 * **Requirement:** The user needs to track off-campus referrals or offline events.
-* **Implementation:** A floating `[+]` button provides form inputs for "Add Custom Company" and "Add Custom Stage", bypassing Telegram ingestion entirely.
+* **Implementation:** A floating `[+]` button provides form inputs for "Add Custom Company" (with a **Main Feed** vs. **Test Feed** `environment_type` toggle defaulting to `MAIN`) and "Add Custom Stage", bypassing Telegram ingestion entirely.
 
 ---
 

@@ -29,6 +29,7 @@ class TimelineEventResponse(TimelineEventBase):
     display_state: str
     company_name: str = ""
     drive_type: str = "FTE"
+    environment_type: str = "MAIN"
     status: str = "PENDING"
     completed_at: Optional[datetime] = None
     is_custom: bool
@@ -70,6 +71,7 @@ class RoleTrackResponse(RoleTrackBase):
 class CompanyBase(BaseModel):
     name: str
     tracking_mode: str = "ELIGIBLE"
+    environment_type: str = "MAIN"
 
 
 class CompanyCreate(CompanyBase):
@@ -77,6 +79,7 @@ class CompanyCreate(CompanyBase):
     role_name: Optional[str] = "Default Role"
     drive_type: Optional[str] = "FTE"
     ctc_stipend_info: Optional[str] = None
+    environment_type: Optional[str] = "MAIN"
 
 
 class CompanyResponse(CompanyBase):
@@ -117,6 +120,7 @@ class TriageItemResponse(BaseModel):
     company_name: str
     role_name: str
     drive_type: str
+    environment_type: str = "MAIN"
     ctc_stipend_info: Optional[str] = None
     latest_status_note: Optional[str] = None
     created_at: datetime
