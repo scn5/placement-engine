@@ -267,32 +267,20 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 - Safety filter: drops any message with `date < cutoff` (edge cases)
 - Returns `[{index, label "[N]", id, text, date, timestamp, has_media}, …]`
 
-### 7.5 Listener (`listener.py`)
+### 7.5 Listener (`listener.py`) & Two-Tier Ingestion
 `TelegramIngestionService`:
 
-| Handler | Trigger | Routing |
+| Tier | Feeds / Target | Routing Logic |
 |---|---|---|
-| `_on_new_message` | `events.NewMessage` | Main feed vs subchannel (filtered by allowed feeds) |
-| `_on_edited_message` | `events.MessageEdited` | `is_edit=True` flag set |
+| **Tier 1 (Root Feeds)** | Configured `main_feed_id` or `test_feed_id` | 1. Reply-to stitching: parent context merged.<br>2. Invite link scan (`t.me/+...`, `t.me/joinchat/...`, `t.me/<username>`): auto-joins (`ImportChatInviteRequest` / `JoinChannelRequest`), links `Company` via `crud.link_or_create_subchannel_company` (`SILENT_TRACK`, `is_triaged=False`, stamped with parent `environment_type`), adds to `active_subchannel_ids`, and triggers 24h backfill.<br>3. Direct announcements (no invite): routed through `ChannelDebouncer` to Groq. |
+| **Tier 2 (Sub-channels)** | Any `chat_id` in `active_subchannel_ids` | 1. Noise gate (`pre_filter.should_filter_noise`).<br>2. Sliding debouncer (`ChannelDebouncer`, 90s).<br>3. Dispatches consolidated payload to Groq (`openai/gpt-oss-20b`) via `dispatcher.process_and_dispatch`. |
 
 **Read-Only Safety & Feed Isolation Policy:**
-- **Zero Outbound/Destructive Operations:** Strictly an incoming event listener (`events.NewMessage`, `events.MessageEdited`). No `send_message`, `delete_messages`, `edit_message`, or `LeaveChannelRequest`.
-- **Feed Isolation:** Automatically drops private DMs (`event.is_private`) and unconfigured channels. Only processes `MAIN_FEED_CHANNEL_ID`, `TEST_FEED_CHANNEL_ID`, or `SystemConfig` (`main_feed_id` / `test_feed_id`).
-
-**Main Feed path (`chat_id == MAIN_FEED_CHANNEL_ID`):**
-1. Reply-to stitching: fetches `reply_to_msg_id` parent text → prepends `[CONTEXT: …]`
-2. Join-link scan: `t.me/+…` or `t.me/joinchat/…` → `asyncio.create_task(_reconcile_and_backfill(link))`
-3. Emits `(chat_id, "main_feed", [msg_dict])` to payload handler
-
-**Subchannel path:**
-1. `pre_filter.should_filter_noise()` — drop if noise
-2. `ChannelDebouncer.add_message()` — buffer with 90s window
-3. On fire → emits `(chat_id, "subchannel", messages)` to payload handler
-
-**`set_payload_handler(handler)`** — pluggable async callback for Phase 4 dispatcher.
+- **Zero Outbound/Destructive Operations:** Strictly an incoming event listener (`events.NewMessage`, `events.MessageEdited`). No `send_message`, `delete_messages`, `edit_message`, or `LeaveChannelRequest`. Auto-joining subchannels via `ImportChatInviteRequest` / `JoinChannelRequest` is the only permitted Telegram action.
+- **Feed Isolation:** Automatically drops private DMs (`event.is_private`) and unmonitored channels.
+- **FastAPI Lifespan Integration (`app/main.py`):** Non-interactive startup using `await tg_client.connect()` and `await tg_client.is_user_authorized()`, bootstrapping `await tg_service.initialize()`, wiring dispatcher callback, logging `[TELEGRAM] Ingestion service active. Root feeds: Main=<id>, Test=<id>`, and running listener in background task `asyncio.create_task(tg_client.run_until_disconnected())`. On shutdown, debouncers and client are cleanly disconnected.
 
 > **⚠ Spec Gap:** Recursive reply fetching (depth ≤ 6) is not implemented — only single-level parent stitching exists. This affects deeply threaded announcements.
-> **⚠ Spec Gap:** Auto-join via `ImportChatInviteRequest` is not implemented — `_reconcile_and_backfill` calls `get_entity()` which works for public channels but will fail on private invite links if not already a member.
 > **⚠ Spec Gap:** 60-second TCP heartbeat job (DC keep-alive) is not implemented.
 
 ---

@@ -51,43 +51,60 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             from app.telegram.listener import TelegramIngestionService
 
             tg_client = create_telegram_client()
-            await tg_client.start(phone=settings.TELEGRAM_PHONE or None)
+            await tg_client.connect()
+            if not await tg_client.is_user_authorized():
+                logger.warning(
+                    "Telegram session exists but is not authorized — running without ingestion."
+                )
+            else:
+                tg_service = TelegramIngestionService(tg_client)
+                await tg_service.initialize()
+                tg_service.register_handlers()
 
-            tg_service = TelegramIngestionService(tg_client)
-            tg_service.register_handlers()
+                # ── 3. Wire dispatcher as payload handler ──────────────────────
+                from app.ai import dispatcher as _dispatcher
 
-            # ── 3. Wire dispatcher as payload handler ──────────────────────
-            from app.ai import dispatcher as _dispatcher
+                async def _payload_handler(
+                    chat_id: int, context_header: str, messages: List[dict]
+                ) -> None:
+                    """Bridge between the Telethon listener and the AI dispatcher.
+                    Each invocation opens its own DB session for isolation.
+                    """
+                    db = AsyncSessionLocal()
+                    try:
+                        await _dispatcher.process_and_dispatch(
+                            chat_id=chat_id,
+                            context_header=context_header,
+                            messages=messages,
+                            db=db,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Dispatcher raised for chat_id=%s context=%s",
+                            chat_id, context_header,
+                        )
+                    finally:
+                        await db.close()
 
-            async def _payload_handler(
-                chat_id: int, context_header: str, messages: List[dict]
-            ) -> None:
-                """Bridge between the Telethon listener and the AI dispatcher.
-                Each invocation opens its own DB session for isolation.
-                """
-                db = AsyncSessionLocal()
-                try:
-                    await _dispatcher.process_and_dispatch(
-                        chat_id=chat_id,
-                        context_header=context_header,
-                        messages=messages,
-                        db=db,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Dispatcher raised for chat_id=%s context=%s",
-                        chat_id, context_header,
-                    )
-                finally:
-                    await db.close()
+                await tg_service.set_payload_handler(_payload_handler)
 
-            await tg_service.set_payload_handler(_payload_handler)
+                root_feeds = await tg_service.get_root_feed_ids()
+                main_val = root_feeds.get("MAIN") or "NOT_SET"
+                test_val = root_feeds.get("TEST") or "NOT_SET"
+                print(
+                    f"[TELEGRAM] Ingestion service active. Root feeds: Main={main_val}, Test={test_val}"
+                )
+                logger.info(
+                    "[TELEGRAM] Ingestion service active. Root feeds: Main=%s, Test=%s",
+                    main_val,
+                    test_val,
+                )
 
-            tg_task = asyncio.create_task(
-                tg_client.run_until_disconnected(),
-                name="telegram-listener",
-            )
-            logger.info("Telegram ingestion engine started and wired to AI dispatcher.")
+                tg_task = asyncio.create_task(
+                    tg_client.run_until_disconnected(),
+                    name="telegram-listener",
+                )
+                logger.info("Telegram ingestion engine started and wired to AI dispatcher.")
         except Exception:
             logger.exception(
                 "Failed to start Telegram client — running without ingestion."

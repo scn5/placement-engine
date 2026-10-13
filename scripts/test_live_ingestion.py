@@ -106,11 +106,35 @@ async def main() -> None:
         me = await tg_client.get_me()
         user_name = me.first_name or "Unknown"
         print(f"[OK] Telegram Authenticated Session: Connected as {user_name} (ID: {me.id})")
+
+        # ── 4. Target Test Channel ID from Database & Entity Resolution ───────
+        target_id: Optional[int] = None
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(SystemConfig))
+                cfg = result.scalars().first()
+                if cfg and cfg.test_feed_id is not None:
+                    target_id = cfg.test_feed_id
+                elif settings.TEST_FEED_CHANNEL_ID is not None:
+                    target_id = settings.TEST_FEED_CHANNEL_ID
+        except Exception as e:
+            print(f"[WARN] Failed to query SystemConfig: {e}")
+
+        if target_id is not None:
+            try:
+                entity = await tg_client.get_entity(int(target_id))
+                entity_title = getattr(entity, "title", getattr(entity, "username", str(entity)))
+                print(f"[OK] Resolved Target Test Channel: '{entity_title}' (ID: {target_id})")
+            except Exception as e:
+                print(f"[WARN] Could not resolve entity for target channel ID {target_id}: {e}")
+        else:
+            print("[INFO] Target Test Channel ID: NOT_SET")
+
     finally:
         if tg_client.is_connected():
             await tg_client.disconnect()
 
-    # ── 4. Groq API Check ────────────────────────────────────────────────
+    # ── 5. Groq API Check ────────────────────────────────────────────────
     base_url = settings.LLM_BASE_URL or "https://api.groq.com/openai/v1"
     model = settings.LLM_MODEL or "openai/gpt-oss-20b"
     ai_client = AsyncOpenAI(api_key=groq_api_key, base_url=base_url)
@@ -122,25 +146,12 @@ async def main() -> None:
         )
         if not response or not response.id:
             raise RuntimeError("Empty response from Groq API")
-        print("[OK] Groq API: Connected and responding.")
+        print(f"[OK] Groq API: Connected and responding ({model}).")
     except Exception as e:
         print(f"ERROR: Groq API check failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # ── 5. Target Test Channel ID from Database ──────────────────────────
-    target_id: str = "NOT_SET"
-    try:
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(SystemConfig))
-            cfg = result.scalars().first()
-            if cfg and cfg.test_feed_id is not None:
-                target_id = str(cfg.test_feed_id)
-            elif settings.TEST_FEED_CHANNEL_ID is not None:
-                target_id = str(settings.TEST_FEED_CHANNEL_ID)
-    except Exception:
-        pass
-
-    print(f"[INFO] Target Test Channel ID: {target_id}")
+    print("\n[SUCCESS] Live Ingestion Engine Pre-flight Readiness: FULLY OPERATIONAL.")
 
 
 if __name__ == "__main__":

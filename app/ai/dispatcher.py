@@ -303,9 +303,39 @@ async def process_and_dispatch(
         text_block, current_context
     )
 
-    # Fallback name resolution if subchannel isn't mapped yet
+    # Fallback name resolution or creation if subchannel isn't mapped yet
     if company is None and llm_result.company_name:
         company = await _find_company_by_name(db, llm_result.company_name)
+        if company is None:
+            env_type = "TEST" if "test" in context_header.lower() else "MAIN"
+            company = models.Company(
+                name=llm_result.company_name.strip(),
+                normalized_name=llm_result.company_name.strip().lower(),
+                subchannel_id=chat_id if context_header in ("subchannel", "backfill") else None,
+                tracking_mode="SILENT_TRACK",
+                environment_type=env_type,
+                is_custom=False,
+            )
+            db.add(company)
+            await db.flush()
+
+            role_track = models.RoleTrack(
+                company_id=company.id,
+                role_name="Default Role",
+                drive_type="FTE",
+                tracking_mode="SILENT_TRACK",
+                is_triaged=False,
+                lifecycle_status="APPLICATION_WINDOW",
+            )
+            db.add(role_track)
+            await db.commit()
+            await db.refresh(company)
+            logger.info(
+                "Created new company=%s for chat_id=%s env=%s (is_triaged=False)",
+                company.name,
+                chat_id,
+                env_type,
+            )
 
     if company is None:
         logger.warning(

@@ -450,3 +450,68 @@ async def flag_for_retriage(
     await db.commit()
     await db.refresh(track)
     return track
+
+
+async def link_or_create_subchannel_company(
+    db: AsyncSession,
+    subchannel_id: int,
+    company_name: str,
+    environment_type: str = "MAIN",
+) -> models.Company:
+    """Link an auto-joined subchannel to an existing company by subchannel_id or normalized name,
+    or create a new company in SILENT_TRACK mode with an untriaged (is_triaged=False) RoleTrack."""
+    env = (environment_type or "MAIN").strip().upper()
+    if env not in ("MAIN", "TEST"):
+        env = "MAIN"
+
+    # 1. Existing company matching subchannel_id
+    res = await db.execute(
+        select(models.Company).where(models.Company.subchannel_id == subchannel_id)
+    )
+    existing = res.scalars().first()
+    if existing:
+        if existing.environment_type != env:
+            existing.environment_type = env
+            await db.commit()
+            await db.refresh(existing)
+        return existing
+
+    # 2. Existing company matching normalized name
+    norm = company_name.strip().lower()
+    res = await db.execute(
+        select(models.Company).where(models.Company.normalized_name == norm)
+    )
+    matched = res.scalars().first()
+    if matched:
+        matched.subchannel_id = subchannel_id
+        matched.environment_type = env
+        await db.commit()
+        await db.refresh(matched)
+        return matched
+
+    # 3. Create new Company in SILENT_TRACK mode
+    display_name = company_name.strip() or f"Subchannel {subchannel_id}"
+    new_company = models.Company(
+        name=display_name,
+        normalized_name=norm or f"subchannel_{subchannel_id}",
+        subchannel_id=subchannel_id,
+        tracking_mode="SILENT_TRACK",
+        environment_type=env,
+        is_custom=False,
+    )
+    db.add(new_company)
+    await db.flush()
+
+    role_track = models.RoleTrack(
+        company_id=new_company.id,
+        role_name="Default Role",
+        drive_type="FTE",
+        tracking_mode="SILENT_TRACK",
+        is_triaged=False,
+        lifecycle_status="APPLICATION_WINDOW",
+    )
+    db.add(role_track)
+    await db.commit()
+    await db.refresh(new_company)
+    return new_company
+
