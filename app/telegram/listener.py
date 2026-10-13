@@ -111,11 +111,49 @@ class TelegramIngestionService:
             logger.exception("Unhandled error in _on_edited_message (chat=%s)", event.chat_id)
 
     # ------------------------------------------------------------------
-    # Routing
+    # Routing & Feed Isolation
     # ------------------------------------------------------------------
 
+    async def _get_allowed_feed_ids(self) -> set[int]:
+        """Collect configured feed channel IDs from Settings and DB SystemConfig."""
+        feeds: set[int] = set()
+        if settings.MAIN_FEED_CHANNEL_ID:
+            feeds.add(int(settings.MAIN_FEED_CHANNEL_ID))
+        if settings.TEST_FEED_CHANNEL_ID:
+            feeds.add(int(settings.TEST_FEED_CHANNEL_ID))
+        try:
+            from app.database import AsyncSessionLocal
+            from app.models import SystemConfig
+            from sqlalchemy import select
+
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(select(SystemConfig))
+                cfg = res.scalars().first()
+                if cfg:
+                    if cfg.main_feed_id:
+                        feeds.add(int(cfg.main_feed_id))
+                    if cfg.test_feed_id:
+                        feeds.add(int(cfg.test_feed_id))
+        except Exception:
+            pass
+        return feeds
+
     async def _process_event(self, event, is_edit: bool) -> None:
-        if event.chat_id == settings.MAIN_FEED_CHANNEL_ID:
+        # Safety guardrail: Ignore private 1-on-1 chats and direct messages
+        if getattr(event, "is_private", False):
+            logger.debug("Feed isolation: Dropped private chat message from chat_id=%s", event.chat_id)
+            return
+
+        # Feed isolation: Ignore any chat that is not in the configured feeds
+        allowed_feeds = await self._get_allowed_feed_ids()
+        if allowed_feeds and event.chat_id not in allowed_feeds:
+            logger.debug(
+                "Feed isolation: Dropped message from unconfigured chat_id=%s",
+                event.chat_id,
+            )
+            return
+
+        if settings.MAIN_FEED_CHANNEL_ID and event.chat_id == settings.MAIN_FEED_CHANNEL_ID:
             await self._handle_main_feed(event, is_edit)
         else:
             await self._handle_subchannel(event, is_edit)

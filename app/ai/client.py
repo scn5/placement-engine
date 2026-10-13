@@ -16,7 +16,8 @@ def get_ai_client() -> AsyncOpenAI:
         LLM_BASE_URL  — optional; override to point at OpenRouter / local server.
                         If None the official OpenAI endpoint is used.
     """
-    kwargs = {"api_key": settings.LLM_API_KEY or "no-key"}
+    api_key = settings.LLM_API_KEY or settings.GROQ_API_KEY or "no-key"
+    kwargs = {"api_key": api_key}
     if settings.LLM_BASE_URL:
         kwargs["base_url"] = settings.LLM_BASE_URL
     return AsyncOpenAI(**kwargs)

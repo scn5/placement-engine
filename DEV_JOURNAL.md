@@ -66,3 +66,11 @@ The Decision/Fix:
 2. Implemented `crud.soft_delete_company(db, company_id)` (sets `Company.is_active = False` and cascades `TimelineEvent.is_deleted = True` across all associated events) and `crud.soft_delete_timeline_event(db, event_id)` (sets `TimelineEvent.is_deleted = True`).
 3. Updated `crud.get_companies`, `crud.get_timeline_events`, `crud.get_company_events`, and `crud.get_pending_triage_items` to strictly filter `Company.is_active == True` and `TimelineEvent.is_deleted == False`.
 4. Exposed `DELETE /companies/{company_id}` in `app/routers/companies.py` and `DELETE /events/{event_id}` in `app/routers/events.py`, returning `{"status": "deleted", "id": ...}`.
+
+[October 2026]: Telegram Read-Only Safety Policy, Feed Isolation & Live Smoke Test
+The Problem: Telegram ingestion needed strict runtime safety guarantees: ensuring zero risk of outbound messages, channel deletions, or leaving channels, and enforcing feed isolation so private chats, group DMs, and unconfigured channels are never processed.
+The Context/Why it failed: `_process_event` previously routed any non-main-feed event directly to `_handle_subchannel`, which could inadvertently process unrelated chats if the authenticated user account was part of personal conversations.
+The Decision/Fix:
+1. Conducted codebase safety audit confirming zero occurrences of outbound message sending (`send_message`, `SendMediaRequest`), message deletions/edits (`delete_messages`, `edit_message`), or channel-leaving actions (`LeaveChannelRequest`, `DeleteChatRequest`). Confirmed company status updates perform purely local SQLite/PostgreSQL operations.
+2. Implemented strict feed isolation in `TelegramIngestionService._process_event`: private chats (`event.is_private`) and messages from any `chat_id` not matching configured `main_feed_id` or `test_feed_id` (from Settings or `SystemConfig`) are dropped immediately at the event level.
+3. Built `scripts/test_live_ingestion.py` for safe, non-interactive live preflight verification of Telegram auth (`client.get_me()`), Groq LLM connectivity (`openai/gpt-oss-20b`), target test channel resolution, and programmatic safety audit.

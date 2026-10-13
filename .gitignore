@@ -8,6 +8,8 @@ ENV/
 .env
 *.env
 !.env.example
+*.session
+*.session-journal
 
 # Bytecode and caches
 __pycache__/

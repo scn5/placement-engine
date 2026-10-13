@@ -272,8 +272,12 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 
 | Handler | Trigger | Routing |
 |---|---|---|
-| `_on_new_message` | `events.NewMessage` | Main feed vs subchannel |
+| `_on_new_message` | `events.NewMessage` | Main feed vs subchannel (filtered by allowed feeds) |
 | `_on_edited_message` | `events.MessageEdited` | `is_edit=True` flag set |
+
+**Read-Only Safety & Feed Isolation Policy:**
+- **Zero Outbound/Destructive Operations:** Strictly an incoming event listener (`events.NewMessage`, `events.MessageEdited`). No `send_message`, `delete_messages`, `edit_message`, or `LeaveChannelRequest`.
+- **Feed Isolation:** Automatically drops private DMs (`event.is_private`) and unconfigured channels. Only processes `MAIN_FEED_CHANNEL_ID`, `TEST_FEED_CHANNEL_ID`, or `SystemConfig` (`main_feed_id` / `test_feed_id`).
 
 **Main Feed path (`chat_id == MAIN_FEED_CHANNEL_ID`):**
 1. Reply-to stitching: fetches `reply_to_msg_id` parent text → prepends `[CONTEXT: …]`
