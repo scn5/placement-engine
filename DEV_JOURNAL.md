@@ -117,3 +117,18 @@ The Decision/Fix:
 3. Guarded `GET /companies/{company_id}/events` in `app/routers/companies.py` with an existence check returning HTTP 404 if the company does not exist.
 4. Refactored `crud.get_timeline_events()` from `INNER JOIN` to `LEFT OUTER JOIN` on `RoleTrack`, allowing company-level events (`role_track_id IS NULL`) for eligible companies to be retrieved across viewports.
 5. Synchronized `status` with `display_state` on `TimelineEventResponse` and added computed property fallbacks.
+
+[October 2026]: Phase 3 — Test Suite Hardening & Reality-Check Testing
+The Problem:
+1. `verify_phase2.py` tested CRUD functions in isolation without exercising the FastAPI HTTP routing layer, leaving mobile payload compatibility (`company_name` vs `name`), 404 existence checks, timeline environment isolation, and event completion HTTP endpoints unverified at the transport level.
+2. `verify_phase4.py` tested simplified scenarios but lacked tests for dirty payloads from subchannels where `company_name`, `drive_type`, and `role_name` were omitted, and did not test end-to-end `CREATE_EVENT`, `STATUS_NOTE`, or `RESCHEDULE_EVENT` (both start and end times) dispatch.
+3. `verify_triage.py` had fragile inter-test dependencies (`test_fastapi_endpoints` relied on residual state from `test_triage_flow`), did not verify that accepting a role cascades `Company.tracking_mode = "ELIGIBLE"`, and did not test `POST /triage/{id}/ignore` at the HTTP layer.
+The Context/Why it failed: Unit-level sanitized mocks allowed architectural regressions to slip past the test suites unnoticed when real payloads or HTTP requests deviated from happy-path assumptions.
+The Decision/Fix:
+1. In `verify_phase2.py`, added `test_router_http_endpoints()` using `httpx.AsyncClient` with `ASGITransport(app=app)`. Verified `POST /companies/` with mobile payload creating both `Company` and initial `RoleTrack`, `GET /companies/{id}/events` (200 for existing, 404 for missing), `GET /events/timeline?env=MAIN` vs `?env=TEST` environment isolation, and `PATCH /events/{id}/complete` / `POST /events/{id}/uncomplete` state transitions.
+2. In `verify_phase4.py`, added 4 hardened test cases:
+   - Dirty payload subchannel message missing `company_name`, `drive_type`, and `role_name`, asserting fallback company resolution via `subchannel_id` and default `drive_type = "FTE"`.
+   - End-to-end `CREATE_EVENT` dispatch verifying DB persistence and role track association.
+   - End-to-end `STATUS_NOTE` dispatch verifying DB write to `latest_status_note`.
+   - `RESCHEDULE_EVENT` dispatch asserting update of both `start_time` and `end_time`.
+3. In `verify_triage.py`, made `test_fastapi_endpoints()` fully self-contained with isolated fixtures, asserted parent `Company.tracking_mode` promotion from `SILENT_TRACK` to `ELIGIBLE` upon accepting a role track, and tested both `POST /triage/{id}/accept` and `POST /triage/{id}/ignore` endpoints.

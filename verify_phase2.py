@@ -34,7 +34,8 @@ _db_module.engine = _test_engine
 _db_module.AsyncSessionLocal = _TestSession
 
 # Now safe to import the rest of the application
-from app import crud, schemas
+from sqlalchemy import select
+from app import crud, models, schemas
 from app.models import Base
 
 
@@ -266,6 +267,137 @@ async def test_tracking_mode_filter(db: AsyncSession, company) -> None:
     print("  [B] ✓ Tracking mode filter (IGNORED / ELIGIBLE) verified")
 
 
+async def test_router_http_endpoints() -> None:
+    """Case 7: Router-level HTTP endpoint verification via httpx.AsyncClient."""
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+    from app.database import get_db
+
+    async def override_get_db():
+        async with _TestSession() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # ── 1. POST /companies/ with mobile payload ──
+        mobile_payload = {
+            "company_name": "Acme Corp",
+            "drive_type": "FTE",
+            "target_role": "SDE",
+            "ctc_stipend_info": "18 LPA",
+            "environment_type": "MAIN",
+        }
+        res = await client.post("/companies/", json=mobile_payload)
+        assert res.status_code == 201, f"Expected 201, got {res.status_code}: {res.text}"
+        data = res.json()
+        assert data["name"] == "Acme Corp"
+        assert data["company_name"] == "Acme Corp"
+        acme_id = data["id"]
+        assert acme_id is not None
+
+        # Verify initial RoleTrack was created in DB
+        async with _TestSession() as db:
+            track_res = await db.execute(
+                select(models.RoleTrack).where(models.RoleTrack.company_id == acme_id)
+            )
+            tracks = track_res.scalars().all()
+            assert len(tracks) >= 1, "Expected initial RoleTrack to be created"
+            assert any(t.role_name == "SDE" and t.drive_type == "FTE" for t in tracks)
+            acme_track_id = tracks[0].id
+
+        # ── 2. GET /companies/{id}/events ──
+        # Create an event under Acme Corp
+        ev_res = await client.post(
+            "/events/",
+            json={
+                "company_id": acme_id,
+                "role_track_id": acme_track_id,
+                "event_type": "OA_WINDOW",
+                "title": "Acme Coding Round",
+                "end_time": utc(+2).isoformat(),
+            },
+        )
+        assert ev_res.status_code == 201, f"Expected 201 for event creation, got {ev_res.status_code}"
+        acme_event_id = ev_res.json()["id"]
+
+        # Scoped events for existing company: 200
+        res_events = await client.get(f"/companies/{acme_id}/events")
+        assert res_events.status_code == 200
+        events_list = res_events.json()
+        assert any(e["id"] == acme_event_id for e in events_list)
+
+        # Non-existent company: 404
+        res_404 = await client.get("/companies/999999/events")
+        assert res_404.status_code == 404
+
+        # ── 3. GET /events/timeline?env=MAIN and ?env=TEST ──
+        # Create a TEST environment company and event
+        test_co_res = await client.post(
+            "/companies/",
+            json={
+                "company_name": "TestCorp Sandbox",
+                "drive_type": "FTE",
+                "target_role": "QA Engineer",
+                "environment_type": "TEST",
+            },
+        )
+        assert test_co_res.status_code == 201
+        test_co_id = test_co_res.json()["id"]
+
+        async with _TestSession() as db:
+            t_tracks = (
+                await db.execute(
+                    select(models.RoleTrack).where(models.RoleTrack.company_id == test_co_id)
+                )
+            ).scalars().all()
+            test_track_id = t_tracks[0].id
+
+        test_ev_res = await client.post(
+            "/events/",
+            json={
+                "company_id": test_co_id,
+                "role_track_id": test_track_id,
+                "event_type": "OA_WINDOW",
+                "title": "Sandbox Test OA",
+                "end_time": utc(+2).isoformat(),
+            },
+        )
+        assert test_ev_res.status_code == 201
+        test_ev_id = test_ev_res.json()["id"]
+
+        # Timeline with ?env=MAIN
+        res_main = await client.get("/events/timeline?env=MAIN")
+        assert res_main.status_code == 200
+        main_ids = {e["id"] for e in res_main.json()}
+        assert acme_event_id in main_ids, "Acme Corp (MAIN) event must be present in MAIN timeline"
+        assert test_ev_id not in main_ids, "TestCorp (TEST) event must NOT be present in MAIN timeline"
+
+        # Timeline with ?env=TEST
+        res_test = await client.get("/events/timeline?env=TEST")
+        assert res_test.status_code == 200
+        test_ids = {e["id"] for e in res_test.json()}
+        assert test_ev_id in test_ids, "TestCorp (TEST) event must be present in TEST timeline"
+        assert acme_event_id not in test_ids, "Acme Corp (MAIN) event must NOT be present in TEST timeline"
+
+        # ── 4. PATCH /events/{id}/complete and POST /events/{id}/uncomplete ──
+        patch_res = await client.patch(f"/events/{acme_event_id}/complete?completed=true")
+        assert patch_res.status_code == 200
+        patch_data = patch_res.json()
+        assert patch_data["user_status"] == "COMPLETED"
+        assert patch_data["display_state"] == "COMPLETED_ACTIVE"
+
+        uncomplete_res = await client.post(f"/events/{acme_event_id}/uncomplete")
+        assert uncomplete_res.status_code == 200
+        uncomplete_data = uncomplete_res.json()
+        assert uncomplete_data["user_status"] == "PENDING"
+        assert uncomplete_data["display_state"] == "PENDING"
+        assert uncomplete_data["completed_at"] is None
+
+    app.dependency_overrides.clear()
+    print("  [7] ✓ Router HTTP verification (POST /companies, GET /companies/{id}/events, timeline env isolation, complete/uncomplete) verified")
+
+
 # ---------------------------------------------------------------------------
 # Main Runner
 # ---------------------------------------------------------------------------
@@ -286,6 +418,7 @@ async def main() -> None:
         await test_extend_deadline_recovery(db, missed_event)
         await test_replace_form_versioning(db, company, fte_track)
         await test_tracking_mode_filter(db, company)
+        await test_router_http_endpoints()
 
         print("\n✅ Phase 2 CRUD Engine & REST API Verified Successfully!")
     finally:

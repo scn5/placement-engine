@@ -454,6 +454,226 @@ async def test_context_injection_in_prompt() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 6 — Subchannel Message Missing Company & Drive Type (Dirty Payload)
+# ---------------------------------------------------------------------------
+
+async def test_subchannel_missing_company_and_drive_type() -> None:
+    db = await _new_session()
+    try:
+        # Seed company with active subchannel_id 123456
+        company = await _setup_company(db, name="Dirty Payload Corp", subchannel_id=123456)
+        await _setup_role_track(db, company.id, drive_type="FTE")
+
+        dirty_result = LLMExtractionResult(
+            company_name=None,
+            actions=[
+                ExtractedEvent(
+                    action="CREATE_EVENT",
+                    company_name=None,
+                    role_name=None,
+                    drive_type=None,  # Schema defaults to "FTE"
+                    audience_scope="COHORT",
+                    event_type="PPT",
+                    title="Pre-Placement Talk",
+                    end_time=_utc(+2),
+                )
+            ],
+        )
+
+        with patch("app.ai.extractor.extract_placement_actions", AsyncMock(return_value=dirty_result)):
+            await process_and_dispatch(
+                chat_id=123456,
+                context_header="subchannel",
+                messages=[{"text": "PPT scheduled for day after tomorrow"}],
+                db=db,
+            )
+
+        events = (
+            await db.execute(
+                select(TimelineEvent).where(TimelineEvent.company_id == company.id)
+            )
+        ).scalars().all()
+
+        assert len(events) >= 1, "Expected event to be created for seeded company via subchannel_id"
+        ppt_event = next((e for e in events if e.title == "Pre-Placement Talk"), None)
+        assert ppt_event is not None, "Pre-Placement Talk event missing"
+        assert ppt_event.company_id == company.id
+        assert ppt_event.drive_type == "FTE"
+
+        print("  [6] ✓ Subchannel message missing company & drive type linked via subchannel_id (default FTE)")
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — End-to-End CREATE_EVENT Dispatch
+# ---------------------------------------------------------------------------
+
+async def test_e2e_create_event_dispatch() -> None:
+    db = await _new_session()
+    try:
+        company = await _setup_company(db, name="E2E Corp", subchannel_id=60001)
+        track = await _setup_role_track(db, company.id, drive_type="FTE")
+
+        create_result = LLMExtractionResult(
+            company_name="E2E Corp",
+            actions=[
+                ExtractedEvent(
+                    action="CREATE_EVENT",
+                    company_name="E2E Corp",
+                    role_name="Software Engineer",
+                    drive_type="FTE",
+                    audience_scope="COHORT",
+                    event_type="OA_WINDOW",
+                    title="Online Assessment Round 1",
+                    action_link="https://e2e.corp/oa",
+                    start_time=_utc(+1),
+                    end_time=_utc(+2),
+                )
+            ],
+        )
+
+        with patch("app.ai.extractor.extract_placement_actions", AsyncMock(return_value=create_result)):
+            await process_and_dispatch(
+                chat_id=60001,
+                context_header="subchannel",
+                messages=[{"text": "OA Round 1 link: https://e2e.corp/oa active tomorrow"}],
+                db=db,
+            )
+
+        events = (
+            await db.execute(
+                select(TimelineEvent).where(TimelineEvent.company_id == company.id)
+            )
+        ).scalars().all()
+
+        matched = next((e for e in events if e.title == "Online Assessment Round 1"), None)
+        assert matched is not None, "Expected CREATE_EVENT to persist event in DB"
+        assert matched.role_track_id == track.id, "Expected event to match resolved role track"
+        assert matched.action_link == "https://e2e.corp/oa"
+        assert matched.event_type == "OA_WINDOW"
+        assert matched.user_status == "PENDING"
+        assert matched.display_state == "PENDING"
+
+        print("  [7] ✓ End-to-end CREATE_EVENT: TimelineEvent persisted & matched to role track")
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — End-to-End STATUS_NOTE Dispatch
+# ---------------------------------------------------------------------------
+
+async def test_e2e_status_note_dispatch() -> None:
+    db = await _new_session()
+    try:
+        company = await _setup_company(db, name="Status Note Corp", subchannel_id=70001)
+        track = await _setup_role_track(db, company.id, drive_type="FTE")
+
+        status_result = LLMExtractionResult(
+            company_name="Status Note Corp",
+            actions=[
+                ExtractedEvent(
+                    action="STATUS_NOTE",
+                    company_name="Status Note Corp",
+                    role_name="Software Engineer",
+                    audience_scope="COHORT",
+                    status_note="CGPA criteria relaxed to 6.5",
+                )
+            ],
+        )
+
+        with patch("app.ai.extractor.extract_placement_actions", AsyncMock(return_value=status_result)):
+            await process_and_dispatch(
+                chat_id=70001,
+                context_header="subchannel",
+                messages=[{"text": "Shortlist criteria relaxed to 6.5 CGPA for all branches"}],
+                db=db,
+            )
+
+        refreshed_track = (
+            await db.execute(
+                select(RoleTrack).where(RoleTrack.id == track.id)
+            )
+        ).scalars().first()
+
+        assert refreshed_track is not None
+        assert refreshed_track.latest_status_note == "CGPA criteria relaxed to 6.5", (
+            f"Expected latest_status_note updated, got: {refreshed_track.latest_status_note}"
+        )
+
+        print("  [8] ✓ End-to-end STATUS_NOTE: latest_status_note written to RoleTrack")
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — RESCHEDULE_EVENT updates both Start and End Times
+# ---------------------------------------------------------------------------
+
+async def test_reschedule_event_updates_start_and_end_times() -> None:
+    db = await _new_session()
+    try:
+        company = await _setup_company(db, name="Reschedule Corp", subchannel_id=80001)
+        track = await _setup_role_track(db, company.id, drive_type="FTE")
+
+        old_start = _utc(+1)
+        old_end = _utc(+2)
+        event = await _setup_event(
+            db,
+            company_id=company.id,
+            role_track_id=track.id,
+            event_type="INTERVIEW",
+            title="Technical Interview",
+            end_time=old_end,
+        )
+        event.start_time = old_start
+        await db.commit()
+
+        new_start = _utc(+3)
+        new_end = _utc(+4)
+
+        reschedule_result = LLMExtractionResult(
+            company_name="Reschedule Corp",
+            actions=[
+                ExtractedEvent(
+                    action="RESCHEDULE_EVENT",
+                    company_name="Reschedule Corp",
+                    event_type="INTERVIEW",
+                    start_time=new_start,
+                    end_time=new_end,
+                    audience_scope="COHORT",
+                )
+            ],
+        )
+
+        with patch("app.ai.extractor.extract_placement_actions", AsyncMock(return_value=reschedule_result)):
+            await process_and_dispatch(
+                chat_id=80001,
+                context_header="subchannel",
+                messages=[{"text": "Interviews rescheduled to Friday 2pm - 6pm"}],
+                db=db,
+            )
+
+        refreshed_event = (
+            await db.execute(
+                select(TimelineEvent).where(TimelineEvent.id == event.id)
+            )
+        ).scalars().first()
+
+        assert refreshed_event is not None
+        assert refreshed_event.start_time is not None, "Expected start_time to be set"
+        start_diff = abs((refreshed_event.start_time.replace(tzinfo=timezone.utc) - new_start).total_seconds())
+        end_diff = abs((refreshed_event.end_time.replace(tzinfo=timezone.utc) - new_end).total_seconds())
+        assert start_diff < 2, f"Expected start_time near {new_start}, got {refreshed_event.start_time}"
+        assert end_diff < 2, f"Expected end_time near {new_end}, got {refreshed_event.end_time}"
+
+        print("  [9] ✓ RESCHEDULE_EVENT: updated both start_time and end_time on target event")
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -469,6 +689,10 @@ async def main() -> None:
     await test_replace_form_mutation()
     await test_extend_deadline_mutation()
     await test_context_injection_in_prompt()
+    await test_subchannel_missing_company_and_drive_type()
+    await test_e2e_create_event_dispatch()
+    await test_e2e_status_note_dispatch()
+    await test_reschedule_event_updates_start_and_end_times()
 
     await _test_engine.dispose()
     print("\n✅ Phase 4 LLM Extraction & Dispatch Engine Verified Successfully!")
@@ -476,3 +700,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

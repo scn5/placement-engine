@@ -39,6 +39,7 @@ _TestSession = async_sessionmaker(
 _db_module.engine = _test_engine
 _db_module.AsyncSessionLocal = _TestSession
 
+from sqlalchemy import select
 from app import crud, models, schemas
 from app.models import Base
 from app.routers.triage import flag_for_retriage
@@ -56,8 +57,9 @@ async def test_triage_flow() -> None:
         # ── 1. Create Company and newly discovered RoleTracks (default: SILENT_TRACK, is_triaged=False)
         company = await crud.create_company(
             db,
-            schemas.CompanyCreate(name="Stripe", tracking_mode="ELIGIBLE", is_custom=False),
+            schemas.CompanyCreate(name="Stripe", tracking_mode="SILENT_TRACK", is_custom=False),
         )
+        assert company.tracking_mode == "SILENT_TRACK", f"Expected SILENT_TRACK, got {company.tracking_mode}"
 
         role_swe = await crud.create_role_track(
             db,
@@ -152,6 +154,14 @@ async def test_triage_flow() -> None:
         assert triaged_swe.tracking_mode == "ELIGIBLE"
         assert triaged_swe.is_triaged is True
 
+        # Explicit assertion: parent Company.tracking_mode promoted from SILENT_TRACK to ELIGIBLE
+        refreshed_company = (
+            await db.execute(select(models.Company).where(models.Company.id == company.id))
+        ).scalars().first()
+        assert refreshed_company.tracking_mode == "ELIGIBLE", (
+            f"Expected parent Company.tracking_mode promoted to ELIGIBLE, got {refreshed_company.tracking_mode}"
+        )
+
         triaged_pm = await crud.triage_role_track(db, role_pm.id, action="IGNORED")
         assert triaged_pm.tracking_mode == "IGNORED"
         assert triaged_pm.is_triaged is True
@@ -170,7 +180,7 @@ async def test_triage_flow() -> None:
         feed_ids = [e.id for e in feed_after]
         assert ev_swe.id in feed_ids, "ELIGIBLE event must appear in timeline feed"
         assert ev_pm.id not in feed_ids, "IGNORED event must NOT appear in timeline feed"
-        print("  [4] ✓ Triage mutations & ELIGIBLE timeline filtering verified")
+        print("  [4] ✓ Triage mutations, Company tracking cascade & ELIGIBLE timeline filtering verified")
 
         # ── 5. Re-triage Logic: flag_for_retriage
         # Test Case A: Role in SILENT_TRACK -> flag_for_retriage resets is_triaged=False
@@ -215,36 +225,116 @@ async def test_fastapi_endpoints() -> None:
 
     app.dependency_overrides[get_db] = override_get_db
 
+    # Setup isolated test fixtures specifically for endpoint tests
+    async with _TestSession() as db:
+        co_accept = models.Company(
+            name="Endpoint Accept Corp",
+            normalized_name="endpoint accept corp",
+            tracking_mode="SILENT_TRACK",
+            is_active=True,
+            is_custom=False,
+            created_at=utc(),
+        )
+        co_ignore = models.Company(
+            name="Endpoint Ignore Corp",
+            normalized_name="endpoint ignore corp",
+            tracking_mode="SILENT_TRACK",
+            is_active=True,
+            is_custom=False,
+            created_at=utc(),
+        )
+        db.add_all([co_accept, co_ignore])
+        await db.flush()
+
+        track_accept = models.RoleTrack(
+            company_id=co_accept.id,
+            role_name="Accept SDE",
+            drive_type="FTE",
+            tracking_mode="SILENT_TRACK",
+            is_triaged=False,
+            created_at=utc(),
+        )
+        track_ignore = models.RoleTrack(
+            company_id=co_ignore.id,
+            role_name="Ignore SDE",
+            drive_type="FTE",
+            tracking_mode="SILENT_TRACK",
+            is_triaged=False,
+            created_at=utc(),
+        )
+        db.add_all([track_accept, track_ignore])
+        await db.commit()
+        await db.refresh(track_accept)
+        await db.refresh(track_ignore)
+
+        accept_track_id = track_accept.id
+        ignore_track_id = track_ignore.id
+        co_accept_id = co_accept.id
+        co_ignore_id = co_ignore.id
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. GET /triage/pending
+        # 1. GET /triage/pending includes our seeded untriaged items
         res = await client.get("/triage/pending")
         assert res.status_code == 200
         items = res.json()
         assert isinstance(items, list)
-        assert len(items) == 1  # role_intern from previous test
+        pending_ids = [item["id"] for item in items]
+        assert accept_track_id in pending_ids
+        assert ignore_track_id in pending_ids
 
         # 2. GET /triage (alias)
         res_alias = await client.get("/triage")
         assert res_alias.status_code == 200
-        assert len(res_alias.json()) == 1
+        alias_ids = [item["id"] for item in res_alias.json()]
+        assert accept_track_id in alias_ids
 
         # 3. POST /triage/{id}/accept
-        track_id = items[0]["id"]
-        res_accept = await client.post(f"/triage/{track_id}/accept")
+        res_accept = await client.post(f"/triage/{accept_track_id}/accept")
         assert res_accept.status_code == 200
-        assert res_accept.json()["id"] == track_id
+        assert res_accept.json()["id"] == accept_track_id
 
-        # After accepting, queue is empty
-        res_empty = await client.get("/triage/pending")
-        assert len(res_empty.json()) == 0
+        # Verify acceptance and company cascade in DB
+        async with _TestSession() as db:
+            refreshed_track = (
+                await db.execute(select(models.RoleTrack).where(models.RoleTrack.id == accept_track_id))
+            ).scalars().first()
+            assert refreshed_track.tracking_mode == "ELIGIBLE"
+            assert refreshed_track.is_triaged is True
 
-        # 4. POST /triage/999999 -> 404
+            refreshed_co = (
+                await db.execute(select(models.Company).where(models.Company.id == co_accept_id))
+            ).scalars().first()
+            assert refreshed_co.tracking_mode == "ELIGIBLE", (
+                f"Expected parent company tracking_mode promoted to ELIGIBLE on /accept, got {refreshed_co.tracking_mode}"
+            )
+
+        # 4. POST /triage/{id}/ignore
+        res_ignore = await client.post(f"/triage/{ignore_track_id}/ignore")
+        assert res_ignore.status_code == 200
+        assert res_ignore.json()["id"] == ignore_track_id
+
+        # Verify discard status and parent company remains unchanged
+        async with _TestSession() as db:
+            refreshed_ignored_track = (
+                await db.execute(select(models.RoleTrack).where(models.RoleTrack.id == ignore_track_id))
+            ).scalars().first()
+            assert refreshed_ignored_track.tracking_mode == "IGNORED"
+            assert refreshed_ignored_track.is_triaged is True
+
+            refreshed_co_ignore = (
+                await db.execute(select(models.Company).where(models.Company.id == co_ignore_id))
+            ).scalars().first()
+            assert refreshed_co_ignore.tracking_mode != "ELIGIBLE", (
+                f"Parent company should NOT be promoted to ELIGIBLE on /ignore, got {refreshed_co_ignore.tracking_mode}"
+            )
+
+        # 5. POST /triage/999999 -> 404
         res_404 = await client.post("/triage/999999", json={"action": "ELIGIBLE"})
         assert res_404.status_code == 404
 
     app.dependency_overrides.clear()
-    print("  [6] ✓ FastAPI REST HTTP endpoints (/triage/pending, /triage/{id}/accept, 404) verified")
+    print("  [6] ✓ FastAPI REST HTTP endpoints (/triage/pending, /accept cascade, /ignore, 404) verified")
 
 
 async def main() -> None:

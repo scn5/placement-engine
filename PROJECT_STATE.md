@@ -409,10 +409,10 @@ All scripts are self-contained and require no live credentials or running server
 | Script | Coverage | DB |
 |---|---|---|
 | `verify_phase1.py` | ORM model instantiation, all 4 `display_state` branches, Pydantic schema round-trip | None |
-| `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline extension/recovery | In-memory SQLite |
+| `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline recovery, HTTP router tests (`POST /companies/` mobile contract, `GET /companies/{id}/events` 200/404, timeline `?env=MAIN\|TEST` isolation, complete/uncomplete) | In-memory SQLite |
 | `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects |
-| `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM versioning, EXTEND_DEADLINE recovery, prompt context injection | In-memory SQLite |
-| `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, `/triage` HTTP endpoints | In-memory SQLite |
+| `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM, EXTEND_DEADLINE, prompt context injection, dirty subchannel payloads (missing company/drive), e2e CREATE_EVENT, e2e STATUS_NOTE, RESCHEDULE_EVENT start/end updates | In-memory SQLite |
+| `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
 | `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
