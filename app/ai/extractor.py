@@ -36,6 +36,11 @@ async def extract_placement_actions(
         returns an empty LLMExtractionResult() instead of raising.
     """
     system_prompt = build_system_prompt(current_context)
+    if "You are an assistant that outputs valid JSON conforming to the requested schema." not in system_prompt:
+        system_prompt = (
+            "You are an assistant that outputs valid JSON conforming to the requested schema.\n"
+            + system_prompt
+        )
     client = get_ai_client()
 
     try:
@@ -48,6 +53,7 @@ async def extract_placement_actions(
             ],
             temperature=0.05,   # near-zero for deterministic structured output
             max_tokens=1024,
+            timeout=30.0,
         )
     except Exception as exc:
         logger.error(

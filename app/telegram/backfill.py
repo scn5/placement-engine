@@ -36,13 +36,13 @@ async def fetch_24h_backfill(client: "TelegramClient", entity) -> List[dict]:
             "label":     str,          # "[1]", "[2]", …
             "id":        int,
             "text":      str,
-            "date":      str,          # ISO-8601 UTC string
+            "raw_text":  str,
+            "date":      float,        # UTC epoch seconds
             "timestamp": float,        # UTC epoch seconds
             "has_media": bool,
         }
 
-    Safety filter: even if iter_messages yields messages older than the
-    cutoff (e.g. due to offset_date edge cases), they are excluded here.
+    Safety filter: messages older than cutoff are excluded.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=_BACKFILL_WINDOW_HOURS)
     entity_id = getattr(entity, "id", repr(entity))
@@ -52,20 +52,20 @@ async def fetch_24h_backfill(client: "TelegramClient", entity) -> List[dict]:
     try:
         async for message in client.iter_messages(
             entity,
-            offset_date=cutoff,
-            reverse=True,  # chronological (oldest → newest)
+            limit=200,
         ):
             msg_date = _to_utc(getattr(message, "date", None))
             if msg_date is None or msg_date < cutoff:
                 # Safety gate: drop anything outside the 24h window
                 continue
 
+            text = getattr(message, "text", "") or ""
             raw.append(
                 {
-                    "_date_obj": msg_date,
                     "id": message.id,
-                    "text": getattr(message, "text", "") or "",
-                    "date": msg_date.isoformat(),
+                    "text": text,
+                    "raw_text": text,
+                    "date": msg_date.timestamp(),
                     "timestamp": msg_date.timestamp(),
                     "has_media": getattr(message, "media", None) is not None,
                 }
@@ -74,13 +74,11 @@ async def fetch_24h_backfill(client: "TelegramClient", entity) -> List[dict]:
         logger.exception("Error during backfill for entity=%s", entity_id)
         return []
 
-    # Ensure strict chronological order (iter_messages with reverse=True should
-    # already be ordered, but be defensive).
+    # Ensure strict chronological order
     raw.sort(key=lambda m: m["timestamp"])
 
     result: List[dict] = []
     for idx, entry in enumerate(raw, start=1):
-        entry.pop("_date_obj", None)
         entry["index"] = idx
         entry["label"] = f"[{idx}]"
         result.append(entry)

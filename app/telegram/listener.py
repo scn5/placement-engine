@@ -103,7 +103,28 @@ class TelegramIngestionService:
         self._debouncer = ChannelDebouncer()
         self._payload_handler: Optional[_PayloadHandler] = None
         self.active_subchannel_ids: set[int] = set()
-        self._root_feeds: dict[int, str] = {}  # chat_id -> "MAIN" | "TEST"
+        self.root_feed_ids: dict[int, str] = {}  # chat_id -> "MAIN" | "TEST"
+        self._root_feeds = self.root_feed_ids  # alias for backward-compatibility
+        self._background_tasks: set[asyncio.Task] = set()
+
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Maintain an in-memory reference to a background task and log any unhandled errors."""
+        self._background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    logger.error(
+                        "Background task '%s' failed with error: %s",
+                        t.get_name(),
+                        exc,
+                        exc_info=exc,
+                    )
+
+        task.add_done_callback(_on_done)
+        return task
 
     # ------------------------------------------------------------------
     # Public interface
@@ -148,6 +169,12 @@ class TelegramIngestionService:
         """Gracefully flush all pending debounce buffers before going offline."""
         logger.info("Flushing debounce buffers on shutdown…")
         await self._debouncer.flush_all(self._debounce_callback)
+        if self._background_tasks:
+            for task in list(self._background_tasks):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -171,11 +198,11 @@ class TelegramIngestionService:
 
     async def refresh_root_feeds(self) -> dict[int, str]:
         """Collect configured feed channel IDs from Settings and DB SystemConfig."""
-        self._root_feeds.clear()
+        self.root_feed_ids.clear()
         if settings.MAIN_FEED_CHANNEL_ID:
-            self._root_feeds[int(settings.MAIN_FEED_CHANNEL_ID)] = "MAIN"
+            self.root_feed_ids[int(settings.MAIN_FEED_CHANNEL_ID)] = "MAIN"
         if settings.TEST_FEED_CHANNEL_ID:
-            self._root_feeds[int(settings.TEST_FEED_CHANNEL_ID)] = "TEST"
+            self.root_feed_ids[int(settings.TEST_FEED_CHANNEL_ID)] = "TEST"
         try:
             from app.database import AsyncSessionLocal
             from app.models import SystemConfig
@@ -186,18 +213,20 @@ class TelegramIngestionService:
                 cfg = res.scalars().first()
                 if cfg:
                     if cfg.main_feed_id:
-                        self._root_feeds[int(cfg.main_feed_id)] = "MAIN"
+                        self.root_feed_ids[int(cfg.main_feed_id)] = "MAIN"
                     if cfg.test_feed_id:
-                        self._root_feeds[int(cfg.test_feed_id)] = "TEST"
+                        self.root_feed_ids[int(cfg.test_feed_id)] = "TEST"
         except Exception:
-            pass
-        return self._root_feeds
+            logger.exception("Failed to refresh root feeds from database.")
+        self._root_feeds = self.root_feed_ids
+        return self.root_feed_ids
 
     async def get_root_feed_ids(self) -> dict[str, int]:
         """Return dict of configured root feeds e.g. {'MAIN': ..., 'TEST': ...}."""
-        feeds = await self.refresh_root_feeds()
+        if not self.root_feed_ids:
+            await self.refresh_root_feeds()
         out: dict[str, int] = {}
-        for cid, env in feeds.items():
+        for cid, env in self.root_feed_ids.items():
             out[env] = cid
         return out
 
@@ -225,11 +254,9 @@ class TelegramIngestionService:
             logger.debug("Feed isolation: Dropped private chat message from chat_id=%s", event.chat_id)
             return
 
-        root_feeds = await self.refresh_root_feeds()
-
         # ── TIER 1: Root Feed Ingestion (main_feed_id & test_feed_id) ────────
-        if event.chat_id in root_feeds:
-            parent_env = root_feeds[event.chat_id]
+        if event.chat_id in self.root_feed_ids:
+            parent_env = self.root_feed_ids[event.chat_id]
             await self._handle_root_feed(event, is_edit, parent_env)
             return
 
@@ -259,9 +286,11 @@ class TelegramIngestionService:
         if invite_links:
             logger.info("Found %d invite link(s) in root feed %s", len(invite_links), event.chat_id)
             for link_type, token in invite_links:
-                asyncio.create_task(
-                    self._join_and_link_subchannel(link_type, token, parent_env),
-                    name=f"join-{token[:8]}",
+                self._track_task(
+                    asyncio.create_task(
+                        self._join_and_link_subchannel(link_type, token, parent_env),
+                        name=f"join-{token[:8]}",
+                    )
                 )
         else:
             # Direct announcement: debounce and dispatch directly to Groq
@@ -384,9 +413,11 @@ class TelegramIngestionService:
         self.active_subchannel_ids.add(subchannel_id)
 
         # Trigger 24h backfill bootstrap
-        asyncio.create_task(
-            self._reconcile_and_backfill_entity(entity, parent_env),
-            name=f"backfill-{subchannel_id}",
+        self._track_task(
+            asyncio.create_task(
+                self._reconcile_and_backfill_entity(entity, parent_env),
+                name=f"backfill-{subchannel_id}",
+            )
         )
 
         return subchannel_id

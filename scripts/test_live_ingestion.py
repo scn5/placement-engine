@@ -13,6 +13,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Ensure placement-engine root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

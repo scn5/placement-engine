@@ -515,3 +515,36 @@ async def link_or_create_subchannel_company(
     await db.refresh(new_company)
     return new_company
 
+
+async def get_company_by_subchannel_id(
+    db: AsyncSession,
+    subchannel_id: int,
+) -> Optional[models.Company]:
+    """Retrieve an active or linked company by its subchannel ID."""
+    stmt = select(models.Company).where(models.Company.subchannel_id == subchannel_id)
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
+async def reschedule_event(
+    db: AsyncSession,
+    event_id: int,
+    new_end_time: datetime,
+    new_start_time: Optional[datetime] = None,
+) -> Optional[models.TimelineEvent]:
+    """Reschedule an event by updating both start_time and end_time."""
+    values: dict = {"end_time": new_end_time}
+    if new_start_time is not None:
+        values["start_time"] = new_start_time
+
+    stmt = (
+        update(models.TimelineEvent)
+        .where(models.TimelineEvent.id == event_id)
+        .values(**values)
+        .returning(models.TimelineEvent)
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+    row = result.scalars().first()
+    return await _load_event(db, row.id) if row is not None else None
+

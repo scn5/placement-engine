@@ -72,7 +72,8 @@ def build_system_prompt(context: Optional[dict] = None) -> str:
         indent=2,
     )
 
-    return f"""You are a placement-drive tracking assistant for NITK Surathkal.
+    return f"""You are an assistant that outputs valid JSON conforming to the requested schema.
+You are a placement-drive tracking assistant for NITK Surathkal.
 Your sole task is to extract structured placement actions from Telegram channel messages.
 Today is {now_str}.
 {schedule_block}

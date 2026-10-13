@@ -8,7 +8,7 @@ dispatcher. The LLM must emit JSON that validates against LLMExtractionResult.
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Enum-style literals — used in ExtractedEvent and downstream dispatch logic
@@ -40,13 +40,17 @@ class ExtractedEvent(BaseModel):
 
     action: ActionType
 
+    company_name: Optional[str] = Field(
+        default=None,
+        description="Company name if extracted per-event.",
+    )
     role_name: Optional[str] = Field(
         default=None,
         description="Specific role targeted (e.g. 'DAA', 'BTSA', 'Software Engineer'). "
                     "None means applies to all roles for the company.",
     )
-    drive_type: DriveType = "FTE"
-    audience_scope: AudienceScope = "COHORT"
+    drive_type: Optional[DriveType] = "FTE"
+    audience_scope: Optional[AudienceScope] = "COHORT"
 
     event_type: Optional[str] = Field(
         default=None,
@@ -60,6 +64,22 @@ class ExtractedEvent(BaseModel):
         default=None,
         description="URL to associate with the event (form link, OA portal, etc.).",
     )
+
+    @field_validator("drive_type", mode="before")
+    @classmethod
+    def default_drive_type(cls, v):
+        return "FTE" if v is None else v
+
+    @field_validator("audience_scope", mode="before")
+    @classmethod
+    def default_audience_scope(cls, v):
+        return "COHORT" if v is None else v
+
+    @model_validator(mode="after")
+    def default_title_to_event_type(self) -> "ExtractedEvent":
+        if self.title is None and self.event_type is not None:
+            self.title = self.event_type
+        return self
 
     # All datetimes must be UTC-aware; the LLM is instructed to emit ISO-8601 + Z.
     start_time: Optional[datetime] = Field(

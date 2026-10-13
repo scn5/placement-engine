@@ -29,10 +29,7 @@ logger = logging.getLogger(__name__)
 async def _find_company_by_subchannel(
     db: AsyncSession, chat_id: int
 ) -> Optional[models.Company]:
-    result = await db.execute(
-        select(models.Company).where(models.Company.subchannel_id == chat_id)
-    )
-    return result.scalars().first()
+    return await crud.get_company_by_subchannel_id(db, chat_id)
 
 
 async def _find_company_by_name(
@@ -204,9 +201,17 @@ async def _execute_action(
             db, company.id, extracted.event_type, role_track_id
         )
         if target:
-            await crud.extend_event_deadline(db, target.id, extracted.end_time)
+            updated = await crud.reschedule_event(
+                db, target.id, extracted.end_time, extracted.start_time
+            )
             logger.info(
-                "RESCHEDULE_EVENT: event=%s company=%s", target.id, company.name
+                "RESCHEDULE_EVENT: event=%s company=%s start=%s end=%s",
+                target.id, company.name, extracted.start_time, extracted.end_time,
+            )
+        else:
+            logger.warning(
+                "RESCHEDULE_EVENT: no matching event for company=%s type=%s",
+                company.name, extracted.event_type,
             )
 
     # ── REPLACE_FORM ────────────────────────────────────────────────────────
@@ -237,21 +242,42 @@ async def _execute_action(
                 "STATUS_NOTE skipped for company=%s: no status_note.", company.name
             )
             return
-        if role_track:
+        target_track = role_track
+        if target_track is None:
+            # Fallback to primary role track of the resolved company
+            primary_res = await db.execute(
+                select(models.RoleTrack)
+                .where(models.RoleTrack.company_id == company.id)
+                .order_by(models.RoleTrack.id.asc())
+            )
+            target_track = primary_res.scalars().first()
+
+        if target_track:
             await db.execute(
                 update(models.RoleTrack)
-                .where(models.RoleTrack.id == role_track.id)
+                .where(models.RoleTrack.id == target_track.id)
                 .values(latest_status_note=extracted.status_note)
             )
             await db.commit()
             logger.info(
                 "STATUS_NOTE: company=%s role=%s note=%r",
-                company.name, role_track.role_name, extracted.status_note,
+                company.name, target_track.role_name, extracted.status_note,
             )
         else:
-            logger.warning(
-                "STATUS_NOTE: no role track found for company=%s — note not persisted.",
-                company.name,
+            # Company has no role tracks at all; create default track to persist note
+            new_track = models.RoleTrack(
+                company_id=company.id,
+                role_name="Default Role",
+                drive_type=extracted.drive_type or "FTE",
+                tracking_mode="SILENT_TRACK",
+                is_triaged=False,
+                latest_status_note=extracted.status_note,
+            )
+            db.add(new_track)
+            await db.commit()
+            logger.info(
+                "STATUS_NOTE: created default track for company=%s note=%r",
+                company.name, extracted.status_note,
             )
 
     # ── NO_ACTION ───────────────────────────────────────────────────────────
@@ -306,38 +332,58 @@ async def process_and_dispatch(
     # Fallback name resolution or creation if subchannel isn't mapped yet
     if company is None and llm_result.company_name:
         company = await _find_company_by_name(db, llm_result.company_name)
-        if company is None:
-            env_type = "TEST" if "test" in context_header.lower() else "MAIN"
-            company = models.Company(
-                name=llm_result.company_name.strip(),
-                normalized_name=llm_result.company_name.strip().lower(),
-                subchannel_id=chat_id if context_header in ("subchannel", "backfill") else None,
-                tracking_mode="SILENT_TRACK",
-                environment_type=env_type,
-                is_custom=False,
-            )
-            db.add(company)
-            await db.flush()
+        if company is not None:
+            if company.subchannel_id is None and context_header in ("subchannel", "backfill"):
+                company.subchannel_id = chat_id
+                await db.commit()
+                await db.refresh(company)
+        else:
+            # Defensive check: ensure subchannel is not already linked before creating new
+            existing_sub = await crud.get_company_by_subchannel_id(db, chat_id)
+            if existing_sub is not None:
+                company = existing_sub
+            else:
+                env_type = "TEST" if "test" in context_header.lower() else "MAIN"
+                try:
+                    company = models.Company(
+                        name=llm_result.company_name.strip(),
+                        normalized_name=llm_result.company_name.strip().lower(),
+                        subchannel_id=chat_id if context_header in ("subchannel", "backfill") else None,
+                        tracking_mode="SILENT_TRACK",
+                        environment_type=env_type,
+                        is_custom=False,
+                    )
+                    db.add(company)
+                    await db.flush()
 
-            role_track = models.RoleTrack(
-                company_id=company.id,
-                role_name="Default Role",
-                drive_type="FTE",
-                tracking_mode="SILENT_TRACK",
-                is_triaged=False,
-                lifecycle_status="APPLICATION_WINDOW",
-            )
-            db.add(role_track)
-            await db.commit()
-            await db.refresh(company)
-            logger.info(
-                "Created new company=%s for chat_id=%s env=%s (is_triaged=False)",
-                company.name,
-                chat_id,
-                env_type,
-            )
+                    role_track = models.RoleTrack(
+                        company_id=company.id,
+                        role_name="Default Role",
+                        drive_type="FTE",
+                        tracking_mode="SILENT_TRACK",
+                        is_triaged=False,
+                        lifecycle_status="APPLICATION_WINDOW",
+                    )
+                    db.add(role_track)
+                    await db.commit()
+                    await db.refresh(company)
+                    logger.info(
+                        "Created new company=%s for chat_id=%s env=%s (is_triaged=False)",
+                        company.name,
+                        chat_id,
+                        env_type,
+                    )
+                except Exception:
+                    await db.rollback()
+                    company = await crud.get_company_by_subchannel_id(db, chat_id)
+                    if company is None:
+                        company = await _find_company_by_name(db, llm_result.company_name)
 
     if company is None:
+        # Attempt fallback to parent Company via subchannel_id
+        company = await crud.get_company_by_subchannel_id(db, chat_id)
+
+    if company is None and not any(getattr(a, "company_name", None) for a in llm_result.actions):
         logger.warning(
             "Company unresolved for chat_id=%s (LLM hint: %r) — aborting dispatch.",
             chat_id, llm_result.company_name,
@@ -345,7 +391,7 @@ async def process_and_dispatch(
         return
 
     if not llm_result.actions:
-        logger.debug("No actions extracted for company=%s.", company.name)
+        logger.debug("No actions extracted for company=%s.", company.name if company else "unknown")
         return
 
     # ── 5. Execute state machine ─────────────────────────────────────────────
@@ -354,14 +400,32 @@ async def process_and_dispatch(
         if extracted.audience_scope == "INDIVIDUAL":
             logger.info(
                 "Dropped INDIVIDUAL event: action=%s company=%s",
-                extracted.action, company.name,
+                extracted.action, company.name if company else "unknown",
+            )
+            continue
+
+        target_company = company
+        extracted_comp_name = getattr(extracted, "company_name", None)
+        if extracted_comp_name:
+            resolved = await _find_company_by_name(db, extracted_comp_name)
+            if resolved:
+                target_company = resolved
+        else:
+            # Subchannel Context Fallback: when company_name is null, look up parent Company using chat_id
+            if target_company is None:
+                target_company = await crud.get_company_by_subchannel_id(db, chat_id)
+
+        if target_company is None:
+            logger.warning(
+                "Company unresolved for action=%s chat_id=%s — skipping.",
+                extracted.action, chat_id,
             )
             continue
 
         try:
-            await _execute_action(db, company, extracted)
+            await _execute_action(db, target_company, extracted)
         except Exception:
             logger.exception(
                 "Unhandled error executing action=%s for company=%s",
-                extracted.action, company.name,
+                extracted.action, target_company.name,
             )
