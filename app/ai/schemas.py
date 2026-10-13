@@ -53,7 +53,7 @@ class ExtractedEvent(BaseModel):
     audience_scope: Optional[AudienceScope] = "COHORT"
 
     event_type: Optional[str] = Field(
-        default=None,
+        default="CUSTOM",
         description="One of: IRIS_DEADLINE, FORM_SUBMISSION, PPT, OA_WINDOW, INTERVIEW, CUSTOM.",
     )
     title: Optional[str] = Field(
@@ -75,10 +75,16 @@ class ExtractedEvent(BaseModel):
     def default_audience_scope(cls, v):
         return "COHORT" if v is None else v
 
+    @field_validator("event_type", mode="before")
+    @classmethod
+    def default_event_type(cls, v):
+        return "CUSTOM" if not v else v
+
     @model_validator(mode="after")
     def default_title_to_event_type(self) -> "ExtractedEvent":
-        if self.title is None and self.event_type is not None:
-            self.title = self.event_type
+        if not self.title or not self.title.strip():
+            etype = self.event_type or "CUSTOM"
+            self.title = etype.replace("_", " ").title()
         return self
 
     # All datetimes must be UTC-aware; the LLM is instructed to emit ISO-8601 + Z.

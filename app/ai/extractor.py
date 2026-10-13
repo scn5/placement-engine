@@ -81,7 +81,7 @@ async def extract_placement_actions(
             response_format={"type": "json_object"},
             messages=messages,
             temperature=0.0,
-            max_tokens=1024,
+            max_tokens=4096,
             timeout=30.0,
         )
     except BadRequestError as exc:
@@ -96,7 +96,7 @@ async def extract_placement_actions(
                     model=settings.LLM_MODEL,
                     messages=messages,
                     temperature=0.0,
-                    max_tokens=1024,
+                    max_tokens=4096,
                     timeout=30.0,
                 )
                 fallback_raw: str = (fallback_response.choices[0].message.content or "").strip()
