@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import false, func, or_, select, true, update
+from sqlalchemy import and_, false, func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,26 +20,41 @@ async def create_company(
 
     Atomically persists a default child RoleTrack from the supplied role
     metadata. Manually created companies are pre-triaged (is_triaged=True)."""
-    normalized = company_in.name.strip().lower()
+    raw_name = (company_in.name or "").strip()
+    if not raw_name and getattr(company_in, "company_name", None):
+        raw_name = company_in.company_name.strip()
+    if not raw_name:
+        raw_name = "Untitled Company"
+
+    normalized = raw_name.lower()
     env_type = (company_in.environment_type or "MAIN").strip().upper()
     if env_type not in ("MAIN", "TEST"):
         env_type = "MAIN"
+
+    tracking_mode = company_in.tracking_mode or "ELIGIBLE"
+
     db_company = models.Company(
-        name=company_in.name.strip(),
+        name=raw_name,
         normalized_name=normalized,
-        tracking_mode=company_in.tracking_mode,
+        tracking_mode=tracking_mode,
         environment_type=env_type,
         is_custom=company_in.is_custom,
     )
     db.add(db_company)
     await db.flush()  # assign db_company.id within the same transaction
 
+    role_name = (
+        getattr(company_in, "target_role", None)
+        or company_in.role_name
+        or "Default Role"
+    ).strip() or "Default Role"
+
     db_track = models.RoleTrack(
         company_id=db_company.id,
-        role_name=(company_in.role_name or "").strip() or "Default Role",
+        role_name=role_name,
         drive_type=company_in.drive_type or "FTE",
         ctc_stipend_info=company_in.ctc_stipend_info,
-        tracking_mode=company_in.tracking_mode,
+        tracking_mode=tracking_mode,
         # Placeholder default track: never a triage candidate (manual or not).
         is_triaged=True,
     )
@@ -199,19 +214,27 @@ async def get_timeline_events(
     stmt = (
         select(models.TimelineEvent)
         .join(models.Company, models.TimelineEvent.company_id == models.Company.id)
-        .join(
+        .outerjoin(
             models.RoleTrack,
             models.TimelineEvent.role_track_id == models.RoleTrack.id,
         )
         .where(
             models.Company.is_active == True,  # noqa: E712
             models.TimelineEvent.is_deleted == False,  # noqa: E712
-            models.RoleTrack.tracking_mode == "ELIGIBLE",
+            or_(
+                models.RoleTrack.tracking_mode == "ELIGIBLE",
+                and_(
+                    models.TimelineEvent.role_track_id.is_(None),
+                    models.Company.tracking_mode == "ELIGIBLE",
+                ),
+            ),
         )
         .where(
             or_(
                 # COMBINED viewport: accept every drive type
                 true() if drive_type == "COMBINED" else false(),
+                # Events with no specific role track apply to all viewports
+                models.TimelineEvent.role_track_id.is_(None),
                 # COMBINED role tracks apply to all viewports
                 models.RoleTrack.drive_type == "COMBINED",
                 # Role-specific events matching the requested drive type
@@ -421,9 +444,23 @@ async def triage_role_track(
     track.tracking_mode = action
     track.is_triaged = True
     track.updated_at = datetime.now(timezone.utc)
+
+    if action == "ELIGIBLE":
+        await db.execute(
+            update(models.Company)
+            .where(models.Company.id == track.company_id)
+            .values(tracking_mode="ELIGIBLE")
+        )
+
     await db.commit()
-    await db.refresh(track)
-    return track
+
+    # Re-eagerly load RoleTrack with company to prevent MissingGreenletError on serialization
+    res = await db.execute(
+        select(models.RoleTrack)
+        .options(selectinload(models.RoleTrack.company))
+        .where(models.RoleTrack.id == role_track_id)
+    )
+    return res.scalars().first()
 
 
 async def flag_for_retriage(

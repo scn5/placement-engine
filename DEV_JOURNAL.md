@@ -85,3 +85,35 @@ The Decision/Fix:
    - Tier 2: Monitors all chat IDs in `active_subchannel_ids`. Pre-filters non-temporal chatter, runs through `ChannelDebouncer`, and dispatches consolidated payloads to Groq (`openai/gpt-oss-20b`).
    - Private chat rejection: Immediately drops private messages (`event.is_private`) and unmonitored channels.
 3. Enhanced `scripts/test_live_ingestion.py` to verify non-interactive Telegram login, target test channel entity resolution from `SystemConfig` (`Placement test sandbox`), and Groq completion response. All 6 verification suites passed cleanly.
+
+[October 2026]: Phase 1 — Database Session Safety, CORS Regex, Backfill Semantics & AI Client Lifecycle
+The Problem:
+1. `get_db()` yielded sessions without an explicit rollback block on unhandled exceptions, risking dirty connections returning to the pool.
+2. Wildcard CORS `allow_origins=["*"]` with `allow_credentials=True` violated W3C fetch standards, causing mobile/browser clients to reject preflight requests.
+3. Telegram 24h backfill used inverted `offset_date` with `reverse=True`, dropping messages or breaking order, and its output dict format did not strictly conform to the live message contract.
+4. Telethon listener invoked un-cached `await self.refresh_root_feeds()` per message event and lacked tracking of spawned background tasks.
+5. Strict `ExtractedEvent` schema caused validation errors on null `drive_type`, `audience_scope`, `company_name`, `role_name`, or `title`. AI client instantiated a new client per extraction without request timeout or Groq JSON schema compliance prompts.
+The Context/Why it failed: High-throughput ingestion exposed connection pool contamination, CORS validation failures on credentialed mobile web/fetch clients, and fragility when LLMs omitted optional fields or when LLM API latency spiked.
+The Decision/Fix:
+1. Wrapped `get_db()` session yield in `try/except Exception: await session.rollback(); raise`.
+2. Updated CORS middleware to use `allow_origin_regex=r"^https?://.*"`.
+3. In `app/telegram/backfill.py`, fixed 24h backfill to fetch recent messages backwards with a safety cap (`limit=200`), filtering `msg_date >= cutoff`, and aligned message dict schema (`text`, `raw_text`, `date`, `timestamp`, `has_media`).
+4. In `app/telegram/listener.py`, cached `self.root_feed_ids` on initialization and tracked background tasks in `self._background_tasks` with done callbacks.
+5. In `app/ai/schemas.py`, relaxed `ExtractedEvent` with defaults (`drive_type="FTE"`, `audience_scope="COHORT"`, nullable strings for `company_name`/`role_name`/`title`).
+6. In `app/ai/dispatcher.py`, added subchannel-to-company fallback lookup when `company_name` is null, updated `RESCHEDULE_EVENT` to modify both start and end time, and persisted `STATUS_NOTE` to primary role track when unmapped.
+7. In `app/ai/client.py` and `extractor.py`, implemented cached `AsyncOpenAI` singleton, added `timeout=30.0`, and updated system prompt with explicit JSON compliance instructions.
+
+[October 2026]: Phase 2 — REST Contracts, Cascading State & Timeline Outer Join
+The Problem:
+1. `CompanyCreate` threw validation errors when mobile client submitted `company_name` instead of `name`, and lacked optional role fields (`target_role`, `drive_type`, `ctc_stipend_info`), preventing atomic company + role creation.
+2. Triage actions (`action == "ELIGIBLE"`) on child `RoleTrack` updated the track but left parent `Company.tracking_mode` unchanged, causing inconsistency.
+3. Accessing company stages via `GET /companies/{company_id}/events` returned 500/unhandled if not explicitly guarded with 404 for missing companies.
+4. `get_timeline_events()` utilized an `INNER JOIN` on `RoleTrack`, silently dropping company-level events that lacked a `role_track_id` (e.g. general company deadlines or presentations).
+5. `TimelineEventResponse` lacked a mirrored `status` field for frontend `display_state` consumers and omitted joined computed properties.
+The Context/Why it failed: The mobile app expected unified company/role payload submission on creation, cascading company-level visibility on triage approval, and safe access to company-level events without strict foreign-key joins.
+The Decision/Fix:
+1. Updated `CompanyCreate` and `CompanyResponse` schemas to support and alias `company_name` and `name`, accepting `target_role`/`role_name`, `drive_type`, and `ctc_stipend_info`. Updated `crud.create_company()` to atomically create the parent `Company` (`tracking_mode="ELIGIBLE"`) and child `RoleTrack` (`is_triaged=True`).
+2. Updated `crud.triage_role_track()` to cascade `action == "ELIGIBLE"` to the parent `Company` (`tracking_mode="ELIGIBLE"`) and eagerly reloaded `RoleTrack.company` to eliminate `MissingGreenletError`.
+3. Guarded `GET /companies/{company_id}/events` in `app/routers/companies.py` with an existence check returning HTTP 404 if the company does not exist.
+4. Refactored `crud.get_timeline_events()` from `INNER JOIN` to `LEFT OUTER JOIN` on `RoleTrack`, allowing company-level events (`role_track_id IS NULL`) for eligible companies to be retrieved across viewports.
+5. Synchronized `status` with `display_state` on `TimelineEventResponse` and added computed property fallbacks.

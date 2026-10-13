@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +38,14 @@ class TimelineEventResponse(TimelineEventBase):
 
     model_config = ConfigDict(from_attributes=True)
 
+    @model_validator(mode="after")
+    def sync_status_fields(self) -> "TimelineEventResponse":
+        if self.display_state:
+            self.status = self.display_state
+        elif self.status:
+            self.display_state = self.status
+        return self
+
 
 # ---------------------------------------------------------------------------
 # RoleTrack Schemas
@@ -69,21 +77,52 @@ class RoleTrackResponse(RoleTrackBase):
 # Company Schemas
 # ---------------------------------------------------------------------------
 class CompanyBase(BaseModel):
-    name: str
+    name: Optional[str] = None
     tracking_mode: str = "ELIGIBLE"
     environment_type: str = "MAIN"
 
 
 class CompanyCreate(CompanyBase):
+    name: Optional[str] = None
+    company_name: Optional[str] = None
     is_custom: bool = False
     role_name: Optional[str] = "Default Role"
+    target_role: Optional[str] = "Default Role"
     drive_type: Optional[str] = "FTE"
     ctc_stipend_info: Optional[str] = None
     environment_type: Optional[str] = "MAIN"
 
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_create_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("name") and data.get("company_name"):
+                data["name"] = data["company_name"]
+            elif data.get("name") and not data.get("company_name"):
+                data["company_name"] = data["name"]
+            if not data.get("role_name") and data.get("target_role"):
+                data["role_name"] = data["target_role"]
+            elif data.get("role_name") and not data.get("target_role"):
+                data["target_role"] = data["role_name"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_create_fields(self) -> "CompanyCreate":
+        if not self.name and self.company_name:
+            self.name = self.company_name
+        elif not self.company_name and self.name:
+            self.company_name = self.name
+        if not self.role_name and self.target_role:
+            self.role_name = self.target_role
+        elif not self.target_role and self.role_name:
+            self.target_role = self.role_name
+        return self
+
 
 class CompanyResponse(CompanyBase):
     id: int
+    name: str
+    company_name: str = ""
     normalized_name: str
     main_feed_msg_id: Optional[int] = None
     subchannel_id: Optional[int] = None
@@ -93,6 +132,14 @@ class CompanyResponse(CompanyBase):
     role_tracks: List[RoleTrackResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="after")
+    def sync_response_names(self) -> "CompanyResponse":
+        if not self.company_name and self.name:
+            self.company_name = self.name
+        elif not self.name and self.company_name:
+            self.name = self.company_name
+        return self
 
 
 # ---------------------------------------------------------------------------

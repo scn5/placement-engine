@@ -50,6 +50,11 @@ class Company(Base):
         kwargs.setdefault("created_at", datetime.now(timezone.utc))
         super().__init__(**kwargs)
 
+    @property
+    def company_name(self) -> str:
+        """Alias for name for frontend contract compatibility."""
+        return self.name
+
 
 class RoleTrack(Base):
     __tablename__ = "role_tracks"

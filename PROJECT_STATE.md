@@ -35,6 +35,10 @@ placement-engine/
 ├── verify_phase2.py              # CRUD & router tests (in-memory SQLite)
 ├── verify_phase3.py              # Telegram ingestion mock suite
 ├── verify_phase4.py              # LLM extraction & dispatch mock suite
+├── verify_triage.py              # Triage Hub & role tracking regression suite
+├── verify_settings.py            # Settings API & SystemConfig regression suite
+├── scripts/
+│   └── test_live_ingestion.py    # Non-interactive live preflight & safety audit
 ├── dev.db                        # Local SQLite database (git-ignored)
 │
 └── app/
@@ -49,7 +53,9 @@ placement-engine/
     ├── routers/
     │   ├── __init__.py
     │   ├── companies.py          # /companies endpoints
-    │   └── events.py             # /events endpoints
+    │   ├── events.py             # /events endpoints
+    │   ├── triage.py             # /triage staging queue & action endpoints
+    │   └── settings.py           # /settings user profile & feed configuration
     │
     ├── telegram/
     │   ├── __init__.py
@@ -61,10 +67,10 @@ placement-engine/
     │
     └── ai/
         ├── __init__.py
-        ├── client.py             # AsyncOpenAI factory (base_url configurable)
-        ├── schemas.py            # LLM extraction Pydantic models
+        ├── client.py             # AsyncOpenAI factory (cached singleton)
+        ├── schemas.py            # LLM extraction Pydantic models (relaxed defaults)
         ├── prompts.py            # System prompt builder (UTC + context injection)
-        ├── extractor.py          # LLM inference + ValidationError fallback
+        ├── extractor.py          # LLM inference + ValidationError fallback + timeout
         └── dispatcher.py        # State-machine CRUD executor
 ```
 
@@ -189,9 +195,9 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 #### Companies — `/companies`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `POST` | `/companies/` | `CompanyCreate` (includes optional `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates default `RoleTrack` |
-| `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` (filters `is_active == True`) |
-| `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological, filters `is_deleted == False`) |
+| `POST` | `/companies/` | `CompanyCreate` (accepts `name`, `company_name`, `target_role`, `role_name`, `drive_type`, `ctc_stipend_info`, `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates parent company and default `RoleTrack` (`is_triaged=True`, `tracking_mode="ELIGIBLE"`) |
+| `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` (filters `is_active == True`, serializes both `name` and `company_name`) |
+| `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological, filters `is_deleted == False`, returns 404 if company does not exist) |
 | `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` to child `RoleTrack`s) |
 | `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201) |
 | `DELETE` | `/companies/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes company `is_active=False` & cascades `is_deleted=True` to events) |
@@ -199,7 +205,7 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 #### Timeline Events — `/events`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (filters `Company.is_active == True` and `TimelineEvent.is_deleted == False`) |
+| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (LEFT OUTER JOIN on `RoleTrack` so company-level events are preserved; filters `Company.is_active == True` and `TimelineEvent.is_deleted == False`; serializes both `display_state` and `status`) |
 | `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201) |
 | `PATCH` | `/events/{id}/complete` | `?completed=true` | `TimelineEventResponse` |
 | `POST` | `/events/{id}/uncomplete` | — (alias `/reopen`) | `TimelineEventResponse` (resets `user_status=PENDING`, `completed_at=None`) |
@@ -212,8 +218,8 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 |---|---|---|---|
 | `GET` | `/triage/pending` | `?env=MAIN\|TEST` | `List[TriageItemResponse]` (`is_triaged == False`, newest first, includes `environment_type`) |
 | `GET` | `/triage` | `?env=MAIN\|TEST` | Alias to `/triage/pending` |
-| `POST` | `/triage/{id}` | `TriageActionPayload` | `TriageItemResponse` (sets `tracking_mode` & `is_triaged=True`) |
-| `POST` | `/triage/{id}/accept` | — | `TriageItemResponse` (convenience shortcut for `ELIGIBLE`) |
+| `POST` | `/triage/{id}` | `TriageActionPayload` | `TriageItemResponse` (sets `tracking_mode` & `is_triaged=True`, cascades `ELIGIBLE` to parent `Company`) |
+| `POST` | `/triage/{id}/accept` | — | `TriageItemResponse` (convenience shortcut for `ELIGIBLE`, cascades to parent `Company`) |
 | `POST` | `/triage/{id}/ignore` | — | `TriageItemResponse` (convenience shortcut for `IGNORED`) |
 
 #### System Settings — `/settings`
@@ -263,12 +269,13 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 `fetch_24h_backfill(client, entity) -> List[dict]`
 
 - Cutoff = `now(UTC) - 24h`
-- `client.iter_messages(entity, offset_date=cutoff, reverse=True)` — chronological order
-- Safety filter: drops any message with `date < cutoff` (edge cases)
-- Returns `[{index, label "[N]", id, text, date, timestamp, has_media}, …]`
+- Fetches recent messages backwards from now with defensive safety cap (`limit=200`), filtering `msg_date >= cutoff` (resolves Telethon `offset_date` + `reverse=True` bug).
+- Returns chronological payload matching live message contract: `[{index, label "[N]", id, text, raw_text, date, timestamp, has_media}, …]`
 
 ### 7.5 Listener (`listener.py`) & Two-Tier Ingestion
 `TelegramIngestionService`:
+
+- **Feed ID Caching & Task Tracking:** Caches `self.root_feed_ids` in memory to eliminate DB queries per event; tracks spawned `asyncio.Task` references in `self._background_tasks` with error logging callbacks.
 
 | Tier | Feeds / Target | Routing Logic |
 |---|---|---|
@@ -292,25 +299,28 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 | Type | Values |
 |---|---|
 | `ActionType` | `CREATE_EVENT`, `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, `REPLACE_FORM`, `STATUS_NOTE`, `NO_ACTION` |
-| `DriveType` | `FTE`, `INTERNSHIP`, `COMBINED` |
-| `AudienceScope` | `COHORT`, `INDIVIDUAL` |
+| `DriveType` | `FTE`, `INTERNSHIP`, `COMBINED` (default `"FTE"`) |
+| `AudienceScope` | `COHORT`, `INDIVIDUAL` (default `"COHORT"`) |
 
-`ExtractedEvent` fields: `action`, `role_name`, `drive_type`, `audience_scope`, `event_type`, `title`, `action_link`, `start_time`, `end_time`, `status_note`
+`ExtractedEvent` fields: `action`, `company_name` (optional), `role_name` (optional), `drive_type` (default `"FTE"`), `audience_scope` (default `"COHORT"`), `event_type`, `title` (optional, falls back to `event_type`), `action_link`, `start_time`, `end_time`, `status_note`.
 
-> **⚠ Schema Divergence vs MASTER_SPEC §4:** The current `ExtractedEvent` is a simplified Phase 4 schema. The spec's canonical `PlacementExtractionPayload` requires: `is_actionable`, `roles[]` (with `lifecycle_note`), `events[].event_category` (RESUME/IRIS/FORM/OA/GD/…), `events[].round_number`, `events[].is_form_replacement`, `events[].venue`. The extractor and dispatcher need a full schema migration to conform.
+> **⚠ Schema Divergence vs MASTER_SPEC §4:** The current `ExtractedEvent` is a simplified Phase 4 schema (with Phase 1 null-safety relaxations). The spec's canonical `PlacementExtractionPayload` requires: `is_actionable`, `roles[]` (with `lifecycle_note`), `events[].event_category` (RESUME/IRIS/FORM/OA/GD/…), `events[].round_number`, `events[].is_form_replacement`, `events[].venue`.
 
 ### 8.2 Prompt Builder (`ai/prompts.py`)
 `build_system_prompt(context: dict) -> str`
 
 Injections per call:
+- **Groq JSON Schema Compliance Header:** "You are an assistant that outputs valid JSON conforming to the requested schema."
 - **Current UTC timestamp** (formatted as day/date/time string)
 - **Company schedule state block** — event titles, types, deadlines, statuses
 - **6 operational rules** — INDIVIDUAL scope, REPLACE_FORM, EXTEND_DEADLINE, RESCHEDULE, STATUS_NOTE, NO_ACTION
 - **Verbatim JSON schema** — prevents hallucinated field names
 
-### 8.3 Extractor (`ai/extractor.py`)
+### 8.3 Extractor (`ai/extractor.py`) & Client (`ai/client.py`)
 `extract_placement_actions(raw_text, current_context) -> LLMExtractionResult`
 
+- Cached module-level `AsyncOpenAI` singleton via `get_ai_client()` for connection reuse
+- `timeout=30.0` on completions call
 - `response_format={"type": "json_object"}` — forces JSON output
 - `temperature=0.05` — near-deterministic
 - `max_tokens=1024`
@@ -323,16 +333,16 @@ Injections per call:
 1. Normalize text block from message list
 2. Resolve `Company` by `subchannel_id == chat_id`
 3. Build schedule context → inject into prompt
-4. Call `extract_placement_actions()`; fallback name resolution if subchannel unmapped
+4. Call `extract_placement_actions()`; fallback name resolution using subchannel ID via `crud.get_company_by_subchannel_id(db, chat_id)` if `company_name` is omitted by LLM (prevents duplicate company creation)
 5. Execute state machine per action (drop `INDIVIDUAL` scope first):
 
 | Action | CRUD Operation |
 |---|---|
 | `CREATE_EVENT` | `crud.create_custom_event()` |
 | `EXTEND_DEADLINE` | `crud.extend_event_deadline()` on best-match event |
-| `RESCHEDULE_EVENT` | `crud.extend_event_deadline()` (treated as deadline update) |
+| `RESCHEDULE_EVENT` | Updates both `start_time` and `end_time` on the matched target event |
 | `REPLACE_FORM` | `crud.replace_form_event()` → version+1, status→PENDING |
-| `STATUS_NOTE` | `UPDATE role_tracks SET latest_status_note=…` |
+| `STATUS_NOTE` | `UPDATE role_tracks SET latest_status_note=…` (falls back to primary track if role unmapped) |
 | `NO_ACTION` | No-op |
 
 ### 8.5 Lifespan Wiring (`app/main.py`)
@@ -379,7 +389,7 @@ Shutdown
 
 ```python
 CORSMiddleware(
-    allow_origins=["*"],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -394,7 +404,7 @@ CORSMiddleware(
 
 ## 11. Verification Scripts
 
-All scripts are self-contained and require no live credentials or running server:
+All scripts are self-contained and require no live credentials or running server (except `test_live_ingestion.py` which requires read-only session credentials):
 
 | Script | Coverage | DB |
 |---|---|---|
@@ -402,13 +412,19 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline extension/recovery | In-memory SQLite |
 | `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects |
 | `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM versioning, EXTEND_DEADLINE recovery, prompt context injection | In-memory SQLite |
+| `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, `/triage` HTTP endpoints | In-memory SQLite |
+| `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
+| `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
-Run any phase independently:
+Run regression suites:
 ```bash
 python verify_phase1.py
 python verify_phase2.py
 python verify_phase3.py
 python verify_phase4.py
+python verify_triage.py
+python verify_settings.py
+python scripts/test_live_ingestion.py
 ```
 
 ---
@@ -433,14 +449,14 @@ python verify_phase4.py
 | 5 | **Migrate `main_feed_msg_id` → array** | `models.py` | `BIGINT[]` in PostgreSQL; thread stitching requires tracking multiple message IDs |
 | 6 | **Unify `event_type` enum** | `models.py`, `ai/schemas.py` | Align `IRIS_DEADLINE/OA_WINDOW` naming with spec's `IRIS/OA/FORM/GD/RESUME` |
 | 7 | **Per-role `tracking_mode` on `RoleTrack`** | `models.py`, `crud.py` | ✅ **Resolved** — Migrated to `RoleTrack` with `is_triaged` & timeline query alignment. |
-| 8 | **Full LLM schema migration** | `ai/schemas.py`, `ai/prompts.py`, `ai/dispatcher.py` | Adopt `PlacementExtractionPayload` (§4 of MASTER_SPEC): `is_actionable`, `roles[]`, `events[].is_form_replacement`, `events[].round_number` |
+| 8 | **Full LLM schema migration** | `ai/schemas.py`, `ai/prompts.py`, `ai/dispatcher.py` | Phase 1 schema relaxed with optional defaults (`drive_type="FTE"`, `audience_scope="COHORT"`, nullable strings); full `PlacementExtractionPayload` (§4 of MASTER_SPEC) migration scheduled for PostgreSQL deployment. |
 
 ### P2 — Pipeline Completeness
 
 | # | Item | File(s) | Detail |
 |---|---|---|---|
 | 9 | **Recursive reply stitching (depth ≤ 6)** | `telegram/listener.py` | Current impl fetches only 1 level of `reply_to_msg_id` |
-| 10 | **Auto-join private channels** | `telegram/listener.py` | `_reconcile_and_backfill` needs `ImportChatInviteRequest` for `t.me/+` private links |
+| 10 | **Auto-join private channels** | `telegram/listener.py` | ✅ **Resolved** — Auto-joins via `ImportChatInviteRequest` (hashes) / `JoinChannelRequest` (usernames) and links SQLite `Company` record. |
 | 11 | **60s TCP heartbeat** | `app/main.py` | Background task pinging Telegram DC to reset half-open connections |
 | 12 | **`system_config` table & profile API** | `models.py`, `app/routers/settings.py` | ✅ **Resolved** — `GET /settings` and `PUT /settings` implemented with student profile and feed IDs. |
 | 13 | **FCM push notification worker** | `app/workers/notifier.py` | 60s polling: `PENDING` events ±2h or ±30min from `start_time` → FCM dispatch |

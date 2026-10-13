@@ -3,8 +3,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import crud, schemas
+from app import crud, models, schemas
 from app.database import get_db
+from sqlalchemy import select
 
 router = APIRouter(prefix="/companies", tags=["Companies"])
 
@@ -74,7 +75,14 @@ async def list_company_events(
     company_id: int,
     db: AsyncSession = Depends(get_db),
 ) -> List[schemas.TimelineEventResponse]:
-    """Return every timeline event scoped to one company, ordered chronologically."""
+    """Return every timeline event scoped to one company, ordered chronologically. Return 404 if not found."""
+    check_stmt = select(models.Company.id).where(models.Company.id == company_id)
+    res = await db.execute(check_stmt)
+    if res.scalars().first() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company {company_id} not found.",
+        )
     events = await crud.get_company_events(db, company_id)
     return [schemas.TimelineEventResponse.model_validate(e) for e in events]
 
