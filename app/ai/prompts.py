@@ -72,7 +72,15 @@ def build_system_prompt(context: Optional[dict] = None) -> str:
         indent=2,
     )
 
-    return f"""You are an assistant that outputs valid JSON conforming to the requested schema.
+    return f"""CRITICAL JSON FORMATTING RULES:
+1. You MUST generate ONLY a valid, single JSON object.
+2. Your response MUST start immediately with the character '{{' and end with '}}'.
+3. DO NOT include markdown code fences (e.g. ```json or ```).
+4. DO NOT include any explanatory text, preambles, or notes.
+5. If there are no actionable recruitment events or deadlines found in the text, you MUST output exactly:
+   {{"company_name": null, "actions": []}}
+
+You are an assistant that outputs valid JSON conforming to the requested schema.
 You are a placement-drive tracking assistant for NITK Surathkal.
 Your sole task is to extract structured placement actions from Telegram channel messages.
 Today is {now_str}.
