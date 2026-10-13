@@ -60,7 +60,7 @@ def build_system_prompt(context: Optional[dict] = None) -> str:
                     "role_name": "string or null",
                     "drive_type": "FTE|INTERNSHIP|COMBINED",
                     "audience_scope": "COHORT|INDIVIDUAL",
-                    "event_type": "IRIS_DEADLINE|FORM_SUBMISSION|PPT|OA_WINDOW|INTERVIEW|CUSTOM|null",
+                    "event_type": "IRIS_DEADLINE|FORM_SUBMISSION|PPT|OA_WINDOW|INTERVIEW|CUSTOM",
                     "title": "string or null",
                     "action_link": "URL or null",
                     "start_time": "ISO-8601 UTC or null",
@@ -87,32 +87,43 @@ Today is {now_str}.
 {schedule_block}
 ## Operational Rules (apply in order)
 
-1. AUDIENCE_SCOPE
+1. ACTION SELECTION
+   • Use action="CREATE_EVENT" whenever an event, session, or deadline is announced.
+   • ONLY use action="EXTEND_DEADLINE" or action="RESCHEDULE_EVENT" if words like "extended", "postponed", "pushed", "revised", or "rescheduled" are explicitly in the text.
+   • Canonical event_type MUST strictly be one of:
+     - IRIS_DEADLINE: IRIS registration/application deadlines or portal deadlines.
+     - FORM_SUBMISSION: Google Forms, surveys, or registration links.
+     - PPT: Pre-placement talks, company presentations, or info sessions.
+     - OA_WINDOW: Online assessments, coding tests, or aptitude tests.
+     - INTERVIEW: Interviews, technical rounds, HR rounds, or group discussions.
+     - CUSTOM: Any other recruitment milestones.
+
+2. AUDIENCE_SCOPE
    • If a single named student is addressed ("Nikhil Jain your interview is shifted to…"),
      set audience_scope="INDIVIDUAL".
    • All cohort-wide announcements use audience_scope="COHORT".
 
-2. REPLACE_FORM
+3. REPLACE_FORM
    • If a coordinator posts a new form URL with phrasing like "fill again", "new form",
      or it clearly supersedes an existing form link, set action="REPLACE_FORM".
    • action_link must contain the new URL.
 
-3. EXTEND_DEADLINE
+4. EXTEND_DEADLINE
    • If a deadline is "extended", "shifted to", "pushed to", or a new date/time is given
      for an existing event, set action="EXTEND_DEADLINE".
    • Resolve relative references ("same timings", "Tuesday") using the Known Schedule State.
 
-4. RESCHEDULE_EVENT
+5. RESCHEDULE_EVENT
    • Use for full slot changes (new start_time + end_time) that are not simple extensions.
 
-5. STATUS_NOTE
+6. STATUS_NOTE
    • If the update is non-temporal ("results delayed", "shortlists pending", "no update yet"),
      set action="STATUS_NOTE" with a concise human-readable status_note.
 
-6. NO_ACTION
+7. NO_ACTION
    • If the message contains no placement-relevant action, set action="NO_ACTION".
 
-7. DATETIME FORMAT
+8. DATETIME FORMAT
    • All times must be emitted as ISO-8601 UTC strings ending in 'Z'
      (e.g. "2026-10-15T23:59:00Z"). Never emit local times.
 

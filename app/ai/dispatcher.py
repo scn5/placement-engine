@@ -7,8 +7,8 @@ Entry point: process_and_dispatch(chat_id, context_header, messages, db)
 Called by the Telegram payload handler registered in app/main.py lifespan.
 """
 import logging
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -130,6 +130,37 @@ async def _find_matching_event(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_event_times(
+    extracted: ExtractedEvent,
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Normalize start and end times for temporal events.
+    - If both start_time and end_time are present, return (start_time, end_time).
+    - If only start_time is present:
+        • OA_WINDOW, PPT, INTERVIEW: end_time = start_time + 2 hours
+        • FORM_SUBMISSION, IRIS_DEADLINE, CUSTOM: end_time = start_time
+    - If only end_time is present:
+        • start_time = end_time
+    - If neither is present, return (None, None).
+    """
+    st = extracted.start_time
+    et = extracted.end_time
+
+    if st is not None and et is not None:
+        return st, et
+
+    if st is not None and et is None:
+        etype = (extracted.event_type or "").upper()
+        if etype in ("OA_WINDOW", "PPT", "INTERVIEW"):
+            return st, st + timedelta(hours=2)
+        else:
+            return st, st
+
+    if st is None and et is not None:
+        return et, et
+
+    return None, None
+
+
 async def _execute_action(
     db: AsyncSession,
     company: models.Company,
@@ -140,11 +171,14 @@ async def _execute_action(
     role_track = await _find_role_track(db, company.id, extracted.role_name)
     role_track_id = role_track.id if role_track else None
 
+    # Time normalization helper: applies to all temporal actions
+    norm_start, norm_end = _normalize_event_times(extracted)
+
     # ── CREATE_EVENT ────────────────────────────────────────────────────────
     if action == "CREATE_EVENT":
-        if not extracted.end_time:
+        if norm_end is None:
             logger.warning(
-                "CREATE_EVENT skipped for company=%s: no end_time extracted.",
+                "CREATE_EVENT skipped for company=%s: no end_time or start_time extracted.",
                 company.name,
             )
             return
@@ -157,8 +191,8 @@ async def _execute_action(
                 or f"{company.name} — {extracted.event_type or 'Event'}"
             ),
             action_link=extracted.action_link,
-            start_time=extracted.start_time,
-            end_time=extracted.end_time,
+            start_time=norm_start,
+            end_time=norm_end,
             is_custom=True,
         )
         new_ev = await crud.create_custom_event(db, event_in)
@@ -169,7 +203,7 @@ async def _execute_action(
 
     # ── EXTEND_DEADLINE ─────────────────────────────────────────────────────
     elif action == "EXTEND_DEADLINE":
-        if not extracted.end_time:
+        if norm_end is None:
             logger.warning(
                 "EXTEND_DEADLINE skipped for company=%s: no end_time.", company.name
             )
@@ -178,21 +212,39 @@ async def _execute_action(
             db, company.id, extracted.event_type, role_track_id
         )
         if target:
-            updated = await crud.extend_event_deadline(db, target.id, extracted.end_time)
+            updated = await crud.extend_event_deadline(db, target.id, norm_end)
             logger.info(
                 "EXTEND_DEADLINE: event=%s company=%s new_end=%s display=%s",
-                target.id, company.name, extracted.end_time,
+                target.id, company.name, norm_end,
                 updated.display_state if updated else "unknown",
             )
         else:
-            logger.warning(
-                "EXTEND_DEADLINE: no matching event for company=%s type=%s",
-                company.name, extracted.event_type,
+            logger.info(
+                "[DISPATCHER] No prior %s event found for %s. Falling back to CREATE_EVENT.",
+                extracted.event_type or "CUSTOM", company.name,
+            )
+            event_in = app_schemas.TimelineEventCreate(
+                company_id=company.id,
+                role_track_id=role_track_id,
+                event_type=extracted.event_type or "CUSTOM",
+                title=(
+                    extracted.title
+                    or f"{company.name} — {extracted.event_type or 'Event'}"
+                ),
+                action_link=extracted.action_link,
+                start_time=norm_start,
+                end_time=norm_end,
+                is_custom=True,
+            )
+            new_ev = await crud.create_custom_event(db, event_in)
+            logger.info(
+                "CREATE_EVENT (fallback from EXTEND_DEADLINE): id=%s company=%s type=%s",
+                new_ev.id, company.name, new_ev.event_type,
             )
 
     # ── RESCHEDULE_EVENT ────────────────────────────────────────────────────
     elif action == "RESCHEDULE_EVENT":
-        if not extracted.end_time:
+        if norm_end is None:
             logger.warning(
                 "RESCHEDULE_EVENT skipped for company=%s: no end_time.", company.name
             )
@@ -202,38 +254,84 @@ async def _execute_action(
         )
         if target:
             updated = await crud.reschedule_event(
-                db, target.id, extracted.end_time, extracted.start_time
+                db, target.id, norm_end, norm_start
             )
             logger.info(
                 "RESCHEDULE_EVENT: event=%s company=%s start=%s end=%s",
-                target.id, company.name, extracted.start_time, extracted.end_time,
+                target.id, company.name, norm_start, norm_end,
             )
         else:
-            logger.warning(
-                "RESCHEDULE_EVENT: no matching event for company=%s type=%s",
-                company.name, extracted.event_type,
+            logger.info(
+                "[DISPATCHER] No prior %s event found for %s. Falling back to CREATE_EVENT.",
+                extracted.event_type or "CUSTOM", company.name,
+            )
+            event_in = app_schemas.TimelineEventCreate(
+                company_id=company.id,
+                role_track_id=role_track_id,
+                event_type=extracted.event_type or "CUSTOM",
+                title=(
+                    extracted.title
+                    or f"{company.name} — {extracted.event_type or 'Event'}"
+                ),
+                action_link=extracted.action_link,
+                start_time=norm_start,
+                end_time=norm_end,
+                is_custom=True,
+            )
+            new_ev = await crud.create_custom_event(db, event_in)
+            logger.info(
+                "CREATE_EVENT (fallback from RESCHEDULE_EVENT): id=%s company=%s type=%s",
+                new_ev.id, company.name, new_ev.event_type,
             )
 
     # ── REPLACE_FORM ────────────────────────────────────────────────────────
     elif action == "REPLACE_FORM":
-        if not extracted.end_time or not extracted.action_link:
+        if norm_end is None:
             logger.warning(
-                "REPLACE_FORM skipped for company=%s: missing end_time or action_link.",
+                "REPLACE_FORM skipped for company=%s: missing end_time.",
                 company.name,
             )
             return
-        payload = app_schemas.ReplaceFormPayload(
-            new_form_link=extracted.action_link,
-            new_end_time=extracted.end_time,
-            title=extracted.title or "Google Form Submission",
+        form_type = extracted.event_type if (extracted.event_type and extracted.event_type != "CUSTOM") else "FORM_SUBMISSION"
+        target = await _find_matching_event(
+            db, company.id, form_type, role_track_id
         )
-        new_form = await crud.replace_form_event(
-            db, company.id, role_track_id, payload
-        )
-        logger.info(
-            "REPLACE_FORM: new event id=%s version=%s company=%s",
-            new_form.id, new_form.version, company.name,
-        )
+        if target and extracted.action_link:
+            payload = app_schemas.ReplaceFormPayload(
+                new_form_link=extracted.action_link,
+                new_end_time=norm_end,
+                title=extracted.title or "Google Form Submission",
+            )
+            new_form = await crud.replace_form_event(
+                db, company.id, role_track_id, payload
+            )
+            logger.info(
+                "REPLACE_FORM: new event id=%s version=%s company=%s",
+                new_form.id, new_form.version, company.name,
+            )
+        else:
+            logger.info(
+                "[DISPATCHER] No prior %s event found for %s. Falling back to CREATE_EVENT.",
+                form_type, company.name,
+            )
+            event_in = app_schemas.TimelineEventCreate(
+                company_id=company.id,
+                role_track_id=role_track_id,
+                event_type=form_type,
+                title=(
+                    extracted.title
+                    or f"{company.name} — {form_type}"
+                ),
+                action_link=extracted.action_link,
+                start_time=norm_start,
+                end_time=norm_end,
+                is_custom=True,
+            )
+            new_ev = await crud.create_custom_event(db, event_in)
+            logger.info(
+                "CREATE_EVENT (fallback from REPLACE_FORM): id=%s company=%s type=%s",
+                new_ev.id, company.name, new_ev.event_type,
+            )
 
     # ── STATUS_NOTE ─────────────────────────────────────────────────────────
     elif action == "STATUS_NOTE":

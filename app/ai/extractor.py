@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from app.ai.client import get_ai_client
 from app.ai.prompts import build_system_prompt
+from app.ai.rule_extractor import extract_actions_by_rules
 from app.ai.schemas import LLMExtractionResult
 from app.config import settings
 
@@ -59,9 +60,22 @@ async def extract_placement_actions(
                          (keys: company_name, company_id, events).
 
     Returns:
-        A validated LLMExtractionResult.  On any API or parse error the function
-        returns an empty LLMExtractionResult() instead of raising.
+        A validated LLMExtractionResult. On any API or parse error the function
+        attempts a deterministic regex rule fallback before returning empty.
     """
+    def _finalize_result(res: LLMExtractionResult) -> LLMExtractionResult:
+        if not res.actions:
+            rule_res = extract_actions_by_rules(raw_text)
+            if rule_res.actions:
+                logger.info(
+                    "[AI] LLM extracted 0 actions. Rule extractor fallback extracted %d action(s).",
+                    len(rule_res.actions),
+                )
+                if res.company_name and not rule_res.company_name:
+                    rule_res.company_name = res.company_name
+                return rule_res
+        return res
+
     system_prompt = build_system_prompt(current_context)
     if "You are an assistant that outputs valid JSON conforming to the requested schema." not in system_prompt:
         system_prompt = (
@@ -102,7 +116,7 @@ async def extract_placement_actions(
                 fallback_raw: str = (fallback_response.choices[0].message.content or "").strip()
                 if not fallback_raw:
                     logger.warning("LLM fallback returned an empty response.")
-                    return LLMExtractionResult()
+                    return _finalize_result(LLMExtractionResult())
 
                 cleaned = _clean_json_string(fallback_raw)
                 result = LLMExtractionResult.model_validate_json(cleaned)
@@ -111,14 +125,14 @@ async def extract_placement_actions(
                     result.company_name,
                     len(result.actions),
                 )
-                return result
+                return _finalize_result(result)
             except ValidationError as v_exc:
                 logger.error(
                     "LLM fallback output failed schema validation.\nContent: %s\nErrors: %s",
                     fallback_raw[:_LOG_TRUNCATE] if 'fallback_raw' in locals() else "",
                     v_exc,
                 )
-                return LLMExtractionResult()
+                return _finalize_result(LLMExtractionResult())
             except Exception as f_exc:
                 logger.error(
                     "LLM fallback API call or parsing failed for model=%s: %s",
@@ -126,7 +140,7 @@ async def extract_placement_actions(
                     f_exc,
                     exc_info=True,
                 )
-                return LLMExtractionResult()
+                return _finalize_result(LLMExtractionResult())
         else:
             logger.error(
                 "LLM API call failed with BadRequestError for model=%s: %s",
@@ -134,7 +148,7 @@ async def extract_placement_actions(
                 exc,
                 exc_info=True,
             )
-            return LLMExtractionResult()
+            return _finalize_result(LLMExtractionResult())
     except Exception as exc:
         logger.error(
             "LLM API call failed for model=%s: %s",
@@ -142,13 +156,13 @@ async def extract_placement_actions(
             exc,
             exc_info=True,
         )
-        return LLMExtractionResult()
+        return _finalize_result(LLMExtractionResult())
 
     raw_content: str = (response.choices[0].message.content or "").strip()
 
     if not raw_content:
         logger.warning("LLM returned an empty response.")
-        return LLMExtractionResult()
+        return _finalize_result(LLMExtractionResult())
 
     cleaned = _clean_json_string(raw_content)
 
@@ -159,18 +173,18 @@ async def extract_placement_actions(
             result.company_name,
             len(result.actions),
         )
-        return result
+        return _finalize_result(result)
     except ValidationError as exc:
         logger.error(
             "LLM output failed schema validation.\nContent: %s\nErrors: %s",
             raw_content[:_LOG_TRUNCATE],
             exc,
         )
-        return LLMExtractionResult()
+        return _finalize_result(LLMExtractionResult())
     except Exception as exc:
         logger.error(
             "Unexpected JSON parse error.\nContent: %s\nError: %s",
             raw_content[:_LOG_TRUNCATE],
             exc,
         )
-        return LLMExtractionResult()
+        return _finalize_result(LLMExtractionResult())
