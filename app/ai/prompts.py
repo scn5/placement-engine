@@ -8,8 +8,11 @@ The prompt is rebuilt on every LLM call so it always carries:
   • Strict schema rules    — minimises hallucinated field names.
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 def build_system_prompt(context: Optional[dict] = None) -> str:
@@ -22,8 +25,10 @@ def build_system_prompt(context: Optional[dict] = None) -> str:
             "events"        → List[dict] each with id, title, event_type,
                               end_time (ISO-8601), user_status
     """
-    now_utc = datetime.now(timezone.utc)
-    now_str = now_utc.strftime("%A, %d %B %Y %H:%M UTC")
+    now_ist = datetime.now(_IST)
+    now_str = now_ist.strftime("%A, %d %B %Y %I:%M %p IST (%Y-%m-%d)")
+    today_date = now_ist.strftime("%Y-%m-%d")
+    tomorrow_date = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # ── Known schedule injection ──────────────────────────────────────────────
     schedule_block = ""
@@ -63,8 +68,8 @@ def build_system_prompt(context: Optional[dict] = None) -> str:
                     "event_type": "IRIS_DEADLINE|FORM_SUBMISSION|PPT|OA_WINDOW|INTERVIEW|CUSTOM",
                     "title": "string or null",
                     "action_link": "URL or null",
-                    "start_time": "ISO-8601 UTC or null",
-                    "end_time": "ISO-8601 UTC or null",
+                    "start_time": "ISO-8601 with timezone (e.g. 2026-10-15T14:00:00+05:30) or null",
+                    "end_time": "ISO-8601 with timezone (e.g. 2026-10-15T23:59:59+05:30) or null",
                     "status_note": "string or null",
                 }
             ],
@@ -83,7 +88,7 @@ def build_system_prompt(context: Optional[dict] = None) -> str:
 You are an assistant that outputs valid JSON conforming to the requested schema.
 You are a placement-drive tracking assistant for NITK Surathkal.
 Your sole task is to extract structured placement actions from Telegram channel messages.
-Today is {now_str}.
+Today is {now_str}. All NITK campus announcements use Indian Standard Time (IST, UTC+05:30).
 {schedule_block}
 ## Operational Rules (apply in order)
 
@@ -117,15 +122,20 @@ Today is {now_str}.
    • Use for full slot changes (new start_time + end_time) that are not simple extensions.
 
 6. STATUS_NOTE
-   • If the update is non-temporal ("results delayed", "shortlists pending", "no update yet"),
+   • If the update is non-temporal ("results delayed", "shortlists pending", "no update yet", or criteria relaxation like "6.5+ cgpa students can apply"),
      set action="STATUS_NOTE" with a concise human-readable status_note.
 
 7. NO_ACTION
    • If the message contains no placement-relevant action, set action="NO_ACTION".
 
-8. DATETIME FORMAT
-   • All times must be emitted as ISO-8601 UTC strings ending in 'Z'
-     (e.g. "2026-10-15T23:59:00Z"). Never emit local times.
+8. DATETIME & RELATIVE DATE RESOLUTION (CRITICAL):
+   • Reference timestamp: Today is {now_str}.
+   • "today" -> calendar date {today_date} IST.
+   • "tonight" -> calendar date {today_date} at 23:59:59 IST.
+   • "tomorrow" -> calendar date {tomorrow_date} IST.
+   • Weekday names (e.g., "Monday", "Tuesday") refer to the next upcoming occurrence relative to today.
+   • Times without explicit timezone are in IST (UTC+05:30).
+   • Emitted datetimes MUST be ISO-8601 strings with timezone offset (e.g. "{today_date}T23:59:00+05:30" or in UTC ending with 'Z').
 
 ## Output Format (STRICT JSON — no markdown, no explanation)
 {schema_example}

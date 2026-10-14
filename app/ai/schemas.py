@@ -7,8 +7,12 @@ dispatcher. The LLM must emit JSON that validates against LLMExtractionResult.
 """
 from datetime import datetime
 from typing import List, Literal, Optional
+from zoneinfo import ZoneInfo
 
+from dateutil import parser as date_parser
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 # ---------------------------------------------------------------------------
 # Enum-style literals — used in ExtractedEvent and downstream dispatch logic
@@ -87,15 +91,37 @@ class ExtractedEvent(BaseModel):
             self.title = etype.replace("_", " ").title()
         return self
 
-    # All datetimes must be UTC-aware; the LLM is instructed to emit ISO-8601 + Z.
+    # Datetimes can be ISO strings or datetime objects; naive datetimes are anchored to IST.
     start_time: Optional[datetime] = Field(
         default=None,
-        description="Event start time in UTC (ISO-8601). None for point-in-time deadlines.",
+        description="Event start time in IST/UTC (ISO-8601). None for point-in-time deadlines.",
     )
     end_time: Optional[datetime] = Field(
         default=None,
-        description="Deadline / event end time in UTC (ISO-8601). Required for time-bound actions.",
+        description="Deadline / event end time in IST/UTC (ISO-8601). Required for time-bound actions.",
     )
+
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def parse_and_localize_datetime(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            if v.tzinfo is None:
+                return v.replace(tzinfo=_IST)
+            return v
+        if isinstance(v, str):
+            val = v.strip()
+            if not val or val.lower() in ("null", "none"):
+                return None
+            try:
+                dt = date_parser.parse(val)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_IST)
+                return dt
+            except Exception:
+                return None
+        return v
 
     status_note: Optional[str] = Field(
         default=None,

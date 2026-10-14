@@ -389,6 +389,7 @@ async def replace_form_event(
         event_type="FORM_SUBMISSION",
         title=payload.title or "Google Form Submission",
         action_link=payload.new_form_link,
+        start_time=payload.new_end_time,
         end_time=payload.new_end_time,
         user_status="PENDING",
         is_custom=True,

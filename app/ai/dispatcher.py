@@ -111,10 +111,13 @@ async def _find_matching_event(
     event_type: Optional[str],
     role_track_id: Optional[int],
 ) -> Optional[models.TimelineEvent]:
-    """Return the most recent event matching the given criteria."""
+    """Return the most recent active event matching the given criteria."""
     stmt = (
         select(models.TimelineEvent)
-        .where(models.TimelineEvent.company_id == company_id)
+        .where(
+            models.TimelineEvent.company_id == company_id,
+            models.TimelineEvent.is_deleted == False,
+        )
         .order_by(models.TimelineEvent.end_time.desc())
     )
     if event_type:
@@ -351,14 +354,11 @@ async def _execute_action(
             target_track = primary_res.scalars().first()
 
         if target_track:
-            await db.execute(
-                update(models.RoleTrack)
-                .where(models.RoleTrack.id == target_track.id)
-                .values(latest_status_note=extracted.status_note)
+            await crud.flag_for_retriage(
+                db, target_track.id, note=extracted.status_note
             )
-            await db.commit()
             logger.info(
-                "STATUS_NOTE: company=%s role=%s note=%r",
+                "STATUS_NOTE: flagged for retriage company=%s role=%s note=%r",
                 company.name, target_track.role_name, extracted.status_note,
             )
         else:
