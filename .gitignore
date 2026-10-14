@@ -11,6 +11,13 @@ ENV/
 *.session
 *.session-journal
 
+# SQLite databases & local dev stores
+*.db
+*.sqlite
+*.sqlite3
+dev.db
+placement.db
+
 # Bytecode and caches
 __pycache__/
 *.py[cod]
