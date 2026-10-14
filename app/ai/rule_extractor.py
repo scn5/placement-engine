@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 from app.ai.schemas import ExtractedEvent, LLMExtractionResult
 
 # IST is UTC+05:30
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 # Canonical event type regex patterns
 EVENT_PATTERNS = [

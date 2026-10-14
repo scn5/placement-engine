@@ -10,9 +10,8 @@ The prompt is rebuilt on every LLM call so it always carries:
 import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from zoneinfo import ZoneInfo
 
-_IST = ZoneInfo("Asia/Kolkata")
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 
 def build_system_prompt(context: Optional[dict] = None) -> str:

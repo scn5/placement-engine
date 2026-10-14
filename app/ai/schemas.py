@@ -5,14 +5,13 @@ Strict Pydantic v2 models for LLM structured extraction output.
 These schemas represent the contract between the prompt and the state-machine
 dispatcher. The LLM must emit JSON that validates against LLMExtractionResult.
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
-from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-_IST = ZoneInfo("Asia/Kolkata")
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 # ---------------------------------------------------------------------------
 # Enum-style literals — used in ExtractedEvent and downstream dispatch logic
