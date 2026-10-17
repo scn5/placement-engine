@@ -6,6 +6,7 @@ ENV/
 
 # Environment files and secrets
 .env
+.env.*
 *.env
 !.env.example
 *.session
@@ -13,6 +14,7 @@ ENV/
 
 # SQLite databases & local dev stores
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
 dev.db
