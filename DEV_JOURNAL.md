@@ -132,3 +132,31 @@ The Decision/Fix:
    - End-to-end `STATUS_NOTE` dispatch verifying DB write to `latest_status_note`.
    - `RESCHEDULE_EVENT` dispatch asserting update of both `start_time` and `end_time`.
 3. In `verify_triage.py`, made `test_fastapi_endpoints()` fully self-contained with isolated fixtures, asserted parent `Company.tracking_mode` promotion from `SILENT_TRACK` to `ELIGIBLE` upon accepting a role track, and tested both `POST /triage/{id}/accept` and `POST /triage/{id}/ignore` endpoints.
+
+[October 2026]: Pre-Interview State Machine Completion, Event Normalization & Fallbacks
+The Problem: Real-world Telegram campus announcements exhibit moving deadlines ("till 2pm" -> "extended to 11:59pm"), single timestamps ("OA at 5pm", "Deadline 9pm"), replacement form links, and eligibility criteria relaxations ("6.5+ CGPA now eligible"). The dispatcher previously risked dropping actions if no matching event existed in the database, failed to normalize single timestamps, and did not properly trigger re-triage on criteria relaxation.
+The Context/Why it failed: Coordinators frequently post updates for events not previously captured by the listener, or announce events with only a start time or only an end time. If `_find_matching_event` returned `None`, mutations like `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, and `REPLACE_FORM` silently aborted without creating the event.
+The Decision/Fix: Fully completed and hardened the canonical Pre-Interview State Engine (`app/ai/dispatcher.py` and `app/crud.py`):
+1. Event Fallback Architecture: `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, and `REPLACE_FORM` now seamlessly fall back to `crud.create_custom_event` when no existing active event matches in the database.
+2. Canonical Time Normalization (`_normalize_event_times`): Live events (`OA_WINDOW`, `PPT`, `INTERVIEW`) with only `start_time` default to `end_time = start_time + 2 hours`. Deadlines (`FORM_SUBMISSION`, `IRIS_DEADLINE`, `CUSTOM`) with only one timestamp set `start_time = end_time = timestamp`.
+3. Soft-Delete Filtering: `_find_matching_event` strictly filters `models.TimelineEvent.is_deleted == False`, avoiding ghost matches against soft-deleted records.
+4. Form Replacement Supercedence: `REPLACE_FORM` calls `crud.replace_form_event()`, inserting a versioned entry (`version = max_version + 1`), setting both `start_time` and `end_time` to `new_end_time`, updating `action_link`, and forcefully resetting `user_status = "PENDING"`.
+5. Criteria Relaxation & Re-Triage: `STATUS_NOTE` calls `crud.flag_for_retriage()`, updating `latest_status_note` and resetting `is_triaged = False` strictly if `tracking_mode == "SILENT_TRACK"`, resurfacing the drive in the mobile Triage Hub without disrupting accepted or ignored tracks.
+
+[October 2026]: Tribal Knowledge 1 — Windows tzdata Crash & Zero-Dependency Native IST Timezone
+The Problem: Using `zoneinfo.ZoneInfo("Asia/Kolkata")` crashed fatally on Windows environments with `ZoneInfoNotFoundError: 'No time zone found with key Asia/Kolkata'`.
+The Context/Why it failed: Windows does not ship with standard IANA zoneinfo databases. Without the third-party `tzdata` package installed, `zoneinfo` lookup fails on startup or extraction validation.
+The Decision/Fix: Replaced `ZoneInfo("Asia/Kolkata")` across `app/ai/prompts.py`, `app/ai/schemas.py`, and `app/ai/rule_extractor.py` with standard library `_IST = timezone(timedelta(hours=5, minutes=30), name="IST")`. Because Indian Standard Time is strictly fixed at UTC+05:30 with zero Daylight Saving Time, this native definition is 100% deterministic, cross-platform safe, and immune to missing system timezone files. Additionally added `tzdata>=2024.1` as a defensive dependency in `requirements.txt`.
+
+[October 2026]: Tribal Knowledge 2 — Groq Token Headroom (max_tokens=4096) & Dual-Tier Fallback Extraction
+The Problem: Groq extraction calls failed with HTTP 400 `json_validate_failed` or `EOF while parsing a string` when parsing long or multi-action announcements.
+The Context/Why it failed: Setting `max_tokens=1024` caused Groq LPU inference to truncate output mid-string when emitting multi-event JSON payloads. When token limits cut off the output before the closing `}`, both Pydantic and JSON parsers crashed.
+The Decision/Fix:
+1. Increased `max_tokens=4096` in `app/ai/extractor.py` on both the primary completions call and the fallback retry.
+2. Implemented an in-flight fallback parser that retries on `json_validate_failed` without `json_object` schema constraints and uses regex to extract the first valid JSON block while stripping markdown code fences.
+3. Added `app/ai/rule_extractor.py` as a deterministic regex fallback that parses canonical relative IST recruitment announcements ("tomorrow 9pm", "today by 11:59 PM", "OA window 8-10am") if the LLM produces 0 actions or fails inference.
+
+[October 2026]: Tribal Knowledge 3 — Test Database Hygiene & In-Memory SQLite Isolation (:memory:)
+The Problem: Test fixtures running against local database files polluted the `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting production timeline feeds.
+The Context/Why it failed: Sharing `dev.db` between unit tests and the live server allowed mock data to persist and be served to mobile clients connecting to the backend.
+The Decision/Fix: Enforced that all test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) strictly bind to isolated `sqlite+aiosqlite:///:memory:` engines. Created `scripts/clean_test_data.py` as an administrative hygiene tool to purge test records from `MAIN` and maintain pristine separation between `MAIN` and `TEST` environments.

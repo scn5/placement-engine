@@ -1,7 +1,32 @@
 # PROJECT_STATE.md — Placement Engine Backend
-**Last Updated:** 2026-10-02 | **Version:** 0.4.0 | **Branch:** `main`
+**Last Updated:** 2026-10-20 | **Version:** 1.0.0 (Pre-Interview State Engine Complete) | **Branch:** `main`
 
 > Single source of truth for the backend's operational status, architecture, and immediate backlog. Cross-referenced against `MASTER_SPEC.md` and `PRODUCT REQUIREMENTS DOCUMENT.md`.
+
+---
+
+## 0. Tribal Knowledge & Critical Engineering Invariants
+
+> [!IMPORTANT]
+> The following rules were forged from real-world runtime edge cases during live campus testing. Every engineer and AI agent operating in this repository **must** adhere strictly to these invariants:
+
+1. **Timezone Representation (Zero-Dependency Native UTC+05:30 IST)**:
+   - **Rule:** Timezones MUST be defined using standard library `datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")`.
+   - **Why:** On Windows machines, `zoneinfo.ZoneInfo("Asia/Kolkata")` crashes fatally with `ZoneInfoNotFoundError: 'No time zone found with key Asia/Kolkata'` if the Python environment lacks the `tzdata` package. Because Indian Standard Time does not observe Daylight Saving Time (strictly fixed at UTC+05:30 year-round), the native `datetime.timezone` constructor provides 100% deterministic, cross-platform stability with zero external dependency risks.
+   - **Enforcement:** Enforced in `app/ai/prompts.py`, `app/ai/schemas.py`, and `app/ai/rule_extractor.py`. In addition, `tzdata>=2024.1` is pinned defensively in `requirements.txt`.
+
+2. **Groq AI Extraction Headroom (`max_tokens=4096`) & Dual-Tier Fallback Architecture**:
+   - **Rule:** Both the primary and fallback LLM completions in `app/ai/extractor.py` MUST specify `max_tokens=4096` (never default or 1024), and extraction MUST follow a multi-tier fallback hierarchy.
+   - **Why:** Complex campus announcements containing multiple concurrent actions or long eligibility updates produce large JSON payloads. Setting `max_tokens=1024` or lower causes Groq to truncate generation mid-stream, tripping JSON parser errors (`EOF while parsing a string` / `json_validate_failed`).
+   - **Multi-Tier Fallback Structure:**
+     1. **Tier 1 (Structured Groq Inference):** `temperature=0.0`, `response_format={"type": "json_object"}` with strict JSON formatting constraints in `build_system_prompt()`.
+     2. **Tier 2 (In-Flight Fallback Completion):** Triggered on `json_validate_failed` or `APIError`. Retries without schema constraints, strips markdown code fences (` ```json `), and extracts the first valid JSON substring via regex.
+     3. **Tier 3 (Deterministic Regex Fallback — `rule_extractor.py`):** If the LLM produces 0 actions or fails inference for messages containing unambiguous temporal keywords ("tomorrow 9pm", "today by 11:59 PM", "OA window"), regex patterns extract the event type and normalize IST timestamps into structured events.
+
+3. **Test Feed Isolation & In-Memory SQLite Requirement (`:memory:`)**:
+   - **Rule:** All test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) MUST strictly bind to isolated in-memory databases (`sqlite+aiosqlite:///:memory:`) and override `app.database.engine`.
+   - **Why:** Running tests against local disk files (`dev.db`) causes test fixtures to pollute the real `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting state for live Telegram listeners and mobile clients.
+   - **Enforcement:** All database-touching verification suites bind `:memory:`. In addition, `scripts/clean_test_data.py` exists as a production hygiene utility to purge any stray test records from `MAIN`.
 
 ---
 
@@ -310,40 +335,49 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 `build_system_prompt(context: dict) -> str`
 
 Injections per call:
-- **Groq JSON Schema Compliance Header:** "You are an assistant that outputs valid JSON conforming to the requested schema."
-- **Current UTC timestamp** (formatted as day/date/time string)
-- **Company schedule state block** — event titles, types, deadlines, statuses
-- **6 operational rules** — INDIVIDUAL scope, REPLACE_FORM, EXTEND_DEADLINE, RESCHEDULE, STATUS_NOTE, NO_ACTION
-- **Verbatim JSON schema** — prevents hallucinated field names
+- **Groq JSON Schema Compliance Header:** Strict formatting constraints requiring pure JSON output without markdown fences.
+- **Current IST Timestamp & Anchoring:** Dynamic Indian Standard Time timestamp generated via native `_IST = timezone(timedelta(hours=5, minutes=30), name="IST")`.
+- **Relative Date Resolution Rules:** Explicit resolution rules converting "today" (calendar date in IST), "tonight" (23:59:59 IST), "tomorrow", and upcoming weekday names relative to today.
+- **Company Schedule State Block:** Current event titles, types, deadlines, and statuses to allow resolving "same timings", "shifted by 2 hours", etc.
+- **Strict Operational Rules:** Action selection criteria for `CREATE_EVENT`, `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, `REPLACE_FORM`, `STATUS_NOTE`, and `NO_ACTION`.
+- **Verbatim JSON Schema:** Injected schema template preventing hallucinated field names.
 
-### 8.3 Extractor (`ai/extractor.py`) & Client (`ai/client.py`)
+### 8.3 Extractor (`ai/extractor.py`) & Fallback Extractor (`ai/rule_extractor.py`)
 `extract_placement_actions(raw_text, current_context) -> LLMExtractionResult`
 
 - Cached module-level `AsyncOpenAI` singleton via `get_ai_client()` for connection reuse
 - `timeout=30.0` on completions call
 - `response_format={"type": "json_object"}` — forces JSON output
-- `temperature=0.05` — near-deterministic
-- `max_tokens=1024`
-- Falls back to `LLMExtractionResult()` (empty) on API error, `ValidationError`, or empty response — **never raises**
+- `temperature=0.0` — deterministic extraction
+- `max_tokens=4096` — ensures full token headroom avoiding mid-JSON truncation (`EOF while parsing a string`)
+- **Dual-Tier Fallback Architecture:**
+  1. *In-flight Fallback:* If Groq returns 400 `json_validate_failed` or invalid JSON, re-requests without schema enforcement and extracts JSON with code-fence stripping.
+  2. *Secondary Deterministic Regex Fallback (`rule_extractor.py`):* If the LLM produces 0 actions or fails inference for messages containing clear recruitment temporal keywords ("tomorrow 9pm", "today by 11:59 PM", "OA window 8-10am"), deterministic regex patterns extract event types and IST timestamps directly into structured actions.
+- Falls back to `LLMExtractionResult()` (empty) on unrecoverable error — **never raises**
 
-### 8.4 Dispatcher (`ai/dispatcher.py`)
+### 8.4 Dispatcher & Pre-Interview State Engine (`ai/dispatcher.py`)
 `process_and_dispatch(chat_id, context_header, messages, db)`
 
-**5-step pipeline:**
-1. Normalize text block from message list
-2. Resolve `Company` by `subchannel_id == chat_id`
-3. Build schedule context → inject into prompt
-4. Call `extract_placement_actions()`; fallback name resolution using subchannel ID via `crud.get_company_by_subchannel_id(db, chat_id)` if `company_name` is omitted by LLM (prevents duplicate company creation)
-5. Execute state machine per action (drop `INDIVIDUAL` scope first):
+**Fully Hardened 5-Step Pipeline:**
+1. Normalize text block from message list.
+2. Resolve `Company` by `subchannel_id == chat_id`, falling back to LLM-extracted name or subchannel mapping.
+3. Build schedule context → inject into prompt.
+4. Call `extract_placement_actions()` with automated fallback chain.
+5. Execute pre-interview state machine mutations per action (silently dropping `INDIVIDUAL` scope):
 
-| Action | CRUD Operation |
+| Action | State Machine Transition & Fallback |
 |---|---|
-| `CREATE_EVENT` | `crud.create_custom_event()` |
-| `EXTEND_DEADLINE` | `crud.extend_event_deadline()` on best-match event |
-| `RESCHEDULE_EVENT` | Updates both `start_time` and `end_time` on the matched target event |
-| `REPLACE_FORM` | `crud.replace_form_event()` → version+1, status→PENDING |
-| `STATUS_NOTE` | `UPDATE role_tracks SET latest_status_note=…` (falls back to primary track if role unmapped) |
-| `NO_ACTION` | No-op |
+| `CREATE_EVENT` | Normalizes start/end times (`_normalize_event_times`) and invokes `crud.create_custom_event()`. |
+| `EXTEND_DEADLINE` | Queries `_find_matching_event` (filtering `is_deleted == False`). If found, updates deadline via `crud.extend_event_deadline()`. **Fallback:** If no prior event exists, falls back seamlessly to `CREATE_EVENT`. |
+| `RESCHEDULE_EVENT` | Queries `_find_matching_event` (filtering `is_deleted == False`). If found, updates both `start_time` and `end_time` via `crud.reschedule_event()`. **Fallback:** If no prior event exists, falls back seamlessly to `CREATE_EVENT`. |
+| `REPLACE_FORM` | If a prior form event exists and `action_link` is present, calls `crud.replace_form_event()` to increment `version = max_version + 1`, update `action_link`, set both `start_time` and `end_time` to `new_end_time`, and reset `user_status = "PENDING"`. **Fallback:** If no prior event exists, falls back to `CREATE_EVENT` with `event_type="FORM_SUBMISSION"`. |
+| `STATUS_NOTE` | Criteria Relaxation / Re-Triage trigger: calls `crud.flag_for_retriage(db, target_track.id, note=extracted.status_note)`. Persists `latest_status_note` and resets `is_triaged = False` strictly if `tracking_mode == "SILENT_TRACK"`. |
+| `NO_ACTION` | No-op. |
+
+**Temporal Normalization Rules (`_normalize_event_times`):**
+- *Live events* (`OA_WINDOW`, `PPT`, `INTERVIEW`): If only `start_time` is present, defaults `end_time = start_time + 2 hours`.
+- *Deadlines* (`FORM_SUBMISSION`, `IRIS_DEADLINE`, `CUSTOM`): If only one timestamp is present, sets `start_time = end_time = timestamp`.
+- *Start/End present:* Preserves exact bounds.
 
 ### 8.5 Lifespan Wiring (`app/main.py`)
 ```python
@@ -431,13 +465,17 @@ python scripts/test_live_ingestion.py
 
 ## 12. Immediate Backlog (Spec Conformance Gaps)
 
-### P0 — Blocking Mobile Client (All Resolved)
+### P0 — Core Pre-Interview State Machine & Mobile Contract (All Resolved & Hardened)
 
 | # | Item | File(s) | Status / Detail |
 |---|---|---|---|
 | 1 | **Implement `/triage` router** | `app/routers/triage.py` | ✅ **Resolved** — `GET /triage/pending`, `POST /triage/{id}`, `/accept`, `/ignore`, and conditional re-triage. |
 | — | **Atomic Company Creation** | `app/crud.py`, `app/schemas.py` | ✅ **Resolved** — `POST /companies/` creates default `RoleTrack` atomically with role metadata. |
 | — | **Enriched Timeline & Events** | `app/schemas.py`, `app/routers/companies.py` | ✅ **Resolved** — `TimelineEventResponse` enriched with `company_name`, `drive_type`, `status`; `GET /companies/{id}/events` implemented. |
+| — | **Pre-Interview State Engine** | `app/ai/dispatcher.py`, `app/crud.py` | ✅ **Resolved & Hardened** — Canonical time normalization (live events +2h, deadlines same timestamp), non-existent event fallbacks (`EXTEND_DEADLINE`/`RESCHEDULE_EVENT`/`REPLACE_FORM` → `CREATE_EVENT`), form replacement versioning with PENDING reset, soft-delete filtering, and criteria relaxation re-triage via `crud.flag_for_retriage()`. |
+| — | **Zero-Dependency IST Timezone** | `app/ai/prompts.py`, `app/ai/schemas.py` | ✅ **Resolved** — Native UTC+05:30 `timezone` representation eliminating Windows `tzdata` crashes. |
+| — | **Dual-Tier AI Extraction & Fallbacks**| `app/ai/extractor.py`, `app/ai/rule_extractor.py` | ✅ **Resolved** — `max_tokens=4096`, in-flight fallback parser, and deterministic regex IST fallback parser. |
+| — | **Database Isolation & Sanitization** | `verify_*.py`, `scripts/clean_test_data.py` | ✅ **Resolved** — Test suites isolated to `:memory:` SQLite; `dev.db` untracked from Git; clean test isolation verified. |
 
 ### P1 — Schema Conformance
 
@@ -476,12 +514,11 @@ python scripts/test_live_ingestion.py
 ## 13. Git Log (Recent)
 
 ```
-6de368c feat: Phase 1-4 complete — untrack __pycache__
-4bda32f feat: complete Phase 4 LLM extraction pipeline and state-machine dispatcher
-3513aa8 feat: complete Phase 3 Telegram ingestion engine with passing tests
-8dbf50d feat: complete Phase 2 CRUD operations and REST API routers with passing tests
-5f99623 chore: add root .gitignore
-b45a9f6 feat: initialize placement-engine backend with Phase 1 models and schemas
+3533cb9 chore: strengthen gitignore rules
+09cbaa5 chore(git): scrub dev.db from index, update .gitignore, add .env.example and production README
+fbcd333 fix(tz): use cross-platform UTC+05:30 IST definition and add tzdata dependency
+e850a9c feat(pre-interview): implement master spec time normalization, ist anchoring, form replacement, and test feed isolation
+e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
 
 ---
