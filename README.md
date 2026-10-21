@@ -2,7 +2,10 @@
 
 > **Autonomous AI-driven campus recruitment scribe and schedule tracker for NITK Surathkal.**
 
-The **Placement Engine** is a high-reliability, single-tenant backend service that monitors official Telegram placement channels, auto-joins company-specific subchannels, extracts structured timeline events via Groq LPU inference (`openai/gpt-oss-20b`), and manages a real-time pre-interview recruitment state machine.
+The **Placement Engine** is a single-tenant backend service that monitors official Telegram placement channels, auto-joins company-specific subchannels, extracts structured timeline events via Groq LPU inference (`openai/gpt-oss-20b`), and manages a pre-interview recruitment state machine.
+
+> [!WARNING]
+> **Status: pre-production.** A verified review (2026-10-21) found silent-failure gaps in ingestion, extraction and storage, and no API authentication. See `PROJECT_STATE.md` §0.2 for the list and §12 for the remediation plan in progress.
 
 ---
 
@@ -23,7 +26,7 @@ The **Placement Engine** is a high-reliability, single-tenant backend service th
                       │  • Groq LPU: openai/gpt-oss-20b        │
                       │  • IST (+05:30) Temporal Anchoring     │
                       │  • Schedule Context Injection          │
-                      │  • Strict JSON Schema Validation       │
+                      │  • JSON-object mode + Pydantic checks  │
                       └──────────────────┬─────────────────────┘
                                          │ Structured Actions
                                          ▼
@@ -38,7 +41,7 @@ The **Placement Engine** is a high-reliability, single-tenant backend service th
                                          ▼
                       ┌────────────────────────────────────────┐
                       │ React Native Mobile Command Center     │
-                      │ (Expo SDK 51 / iOS & Android)          │
+                      │ (Expo SDK 57 / Android)                │
                       └────────────────────────────────────────┘
 ```
 
@@ -54,13 +57,13 @@ The **Placement Engine** is a high-reliability, single-tenant backend service th
 2. **AI Structured Extraction Engine**:
    - Uses **`openai/gpt-oss-20b`** hosted on Groq for ultra-low latency inference.
    - Prompt injected with real-time **Indian Standard Time (IST, UTC+05:30)** anchoring and known company schedules.
-   - Automatic fallback to regex-based IST temporal extraction on unstructured bursts.
+   - Automatic fallback to regex-based IST temporal extraction on unstructured bursts. ⚠ *Under revision: verified to create wrong events and to fire on valid empty LLM results; removal planned in Phase 0.5.*
 
 3. **Pre-Interview State Machine**:
    - **Event Lifecycle**: Point-in-time deadlines (`IRIS_DEADLINE`, `FORM_SUBMISSION`) and duration events (`OA_WINDOW`, `PPT`, `INTERVIEW`, `CUSTOM`).
-   - **Form Versioning (`REPLACE_FORM`)**: When coordinators post updated Google Forms, the engine archives previous versions, increments `version`, updates deadlines, and forcefully resets `user_status = PENDING`.
-   - **Criteria Relaxation Re-Triage**: If cutoffs are lowered or branches added, updates `latest_status_note` and triggers re-triage only if the role track is currently in `SILENT_TRACK`.
-   - **Feed Isolation**: Incoming events are tagged with `environment_type = 'MAIN' | 'TEST'`, guaranteeing zero sandbox clutter in production timelines.
+   - **Form Versioning (`REPLACE_FORM`)**: When coordinators post updated Google Forms, the engine inserts a new version (`version` + 1) with the new link and deadline and `user_status = PENDING`. ⚠ *The previous version currently stays visible; hiding superseded forms is planned.*
+   - **Criteria Relaxation Re-Triage**: Applies only to `SILENT_TRACK` roles and only proposes re-triage — it never changes the tracking mode. `IGNORED` is a terminal, human-only status. See the binding invariants in `PROJECT_STATE.md` §0.1. ⚠ *Today every status note re-triages SILENT_TRACK roles; the relaxation-only rule lands in Phase 0.5.*
+   - **Feed Isolation**: Companies carry `environment_type = 'MAIN' | 'TEST'` and the timeline, companies and triage queries filter by it. ⚠ *Name-based company lookups during extraction do not filter by environment yet (gap H5).*
 
 ---
 
@@ -107,7 +110,7 @@ placement-engine/
 
 ### 1. Prerequisites
 
-- **Python 3.11+** (Python 3.12 / 3.14 compatible)
+- **Python 3.12+** — production targets 3.12; the local dev venv currently runs 3.14, so keep code 3.12-compatible
 - **PostgreSQL** (Dockerized or managed) OR **SQLite** (local development)
 - **Telegram API Credentials** (`api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org/apps))
 - **Groq API Key** (from [console.groq.com](https://console.groq.com))
@@ -145,12 +148,14 @@ cp .env.example .env
 | `APP_ENV` | Runtime environment (`development` / `production`) | `development` |
 | `TELEGRAM_API_ID` | Telegram API ID from my.telegram.org | `0` |
 | `TELEGRAM_API_HASH` | Telegram API Hash from my.telegram.org | `""` |
-| `TELEGRAM_SESSION_NAME`| Name of local session file | `placement_session` |
+| `TELEGRAM_SESSION_NAME`| Name of local session file (used when no session string is set) | `placement_session` |
+| `TELEGRAM_SESSION_STRING`| Optional Telethon `StringSession`; takes precedence over the file | `""` |
 | `TELEGRAM_PHONE` | Your Telegram phone number for initial authentication | `""` |
 | `MAIN_FEED_CHANNEL_ID` | Production Telegram broadcast channel ID | `None` |
 | `TEST_FEED_CHANNEL_ID` | Sandbox Telegram test channel ID | `None` |
 | `DEBOUNCE_DELAY_SECONDS`| Buffer window for message bursts | `90.0` |
-| `GROQ_API_KEY` | Groq API Key for extraction LLM | `""` |
+| `GROQ_API_KEY` / `LLM_API_KEY` | API key for the extraction LLM (`LLM_API_KEY` wins if both are set) | `""` |
+| `LLM_BASE_URL` | OpenAI-compatible endpoint | `https://api.groq.com/openai/v1` |
 | `LLM_MODEL` | LLM model identifier | `openai/gpt-oss-20b` |
 
 ### 4. Authenticate Telegram Client
@@ -167,6 +172,9 @@ Follow the interactive prompt to enter the SMS or in-app login code and 2FA pass
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+> [!WARNING]
+> With `TELEGRAM_API_ID` set, the server connects your **live** Telegram session, processes the configured feeds and auto-joins invite links. For API-only work, set `TELEGRAM_API_ID=0` for that process only — don't edit `.env`.
 Interactive OpenAPI documentation will be accessible at:
 - **Swagger UI**: `http://localhost:8000/docs`
 - **ReDoc**: `http://localhost:8000/redoc`
@@ -175,7 +183,7 @@ Interactive OpenAPI documentation will be accessible at:
 
 ## Verification & Testing
 
-The repository includes comprehensive automated verification suites that execute against in-memory SQLite instances to validate end-to-end behavior without mutating local or production databases:
+The repository includes verification suites that run against in-memory SQLite with the LLM and Telegram mocked. ⚠ `verify_phase3.py` does not yet bind an in-memory engine (it can read the configured database; fix in Phase 0.2), and no suite contains realistic multi-sentence announcements yet.
 
 ```bash
 # Run all verification suites:
@@ -191,17 +199,18 @@ python verify_settings.py # Student profile settings API
 
 ## Database Maintenance
 
-To purge legacy sandbox records and maintain strict isolation between `MAIN` and `TEST` environments:
-
-```bash
-python scripts/clean_test_data.py
-```
+> [!CAUTION]
+> **Do not run `scripts/clean_test_data.py` against real data.** It *hard-deletes* every `MAIN` company whose name merely contains `test`, `dummy`, `fallback`, `mock` or `acme` (e.g. "Latest updates…", Testbook, Acme Solar). A TEST-only, dry-run-by-default version is planned for Phase 0.6.
 
 ---
 
 ## Production Deployment
 
 ### Docker Deployment
+
+> [!CAUTION]
+> **Superseded — do not build this.** There is no `.dockerignore`, so `COPY . .` would bake `.env`, `placement_session.session`, `dev.db` and the local venv into image layers. It also uses Python 3.11 while production targets 3.12, and it runs Telethon inside the API process. The hardened multi-stage image (API and worker containers, secrets on mounted volumes) is part of Phase 1.
+
 ```dockerfile
 FROM python:3.11-slim
 
@@ -219,4 +228,4 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
-Use the assigned Cloudflare HTTPS URL as the backend URL in the mobile **Command Center**.
+Use the assigned Cloudflare HTTPS URL as the backend URL in the mobile **Command Center**. Quick-tunnel URLs change on every restart, and the API has no authentication yet. Production will use a named tunnel on an owned domain plus a shared API key (Phases 0.6 and 1).

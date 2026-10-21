@@ -1,7 +1,8 @@
 # PROJECT_STATE.md — Placement Engine Backend
-**Last Updated:** 2026-10-20 | **Version:** 1.0.0 (Pre-Interview State Engine Complete) | **Branch:** `main`
+**Last Updated:** 2026-10-22 | **Version:** 1.0.0 — **Status: pre-production** (verified gaps in §0.2; remediation "Phase 0 — stop silent losses" in progress) | **Branch:** `feature/phase-0-stop-losses`
 
 > Single source of truth for the backend's operational status, architecture, and immediate backlog. Cross-referenced against `MASTER_SPEC.md` and `PRODUCT REQUIREMENTS DOCUMENT.md`.
+> **The code is the source of truth.** Every status claim in this file was re-verified against the code on 2026-10-22; intended-but-unbuilt behaviour belongs in `MASTER_SPEC.md`, not here.
 
 ---
 
@@ -14,6 +15,7 @@
    - **Rule:** Timezones MUST be defined using standard library `datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")`.
    - **Why:** On Windows machines, `zoneinfo.ZoneInfo("Asia/Kolkata")` crashes fatally with `ZoneInfoNotFoundError: 'No time zone found with key Asia/Kolkata'` if the Python environment lacks the `tzdata` package. Because Indian Standard Time does not observe Daylight Saving Time (strictly fixed at UTC+05:30 year-round), the native `datetime.timezone` constructor provides 100% deterministic, cross-platform stability with zero external dependency risks.
    - **Enforcement:** Enforced in `app/ai/prompts.py`, `app/ai/schemas.py`, and `app/ai/rule_extractor.py`. In addition, `tzdata>=2024.1` is pinned defensively in `requirements.txt`.
+   - **⚠ Storage gap (verified 2026-10-21):** SQLite's `DateTime(timezone=True)` drops the offset *without converting*. LLM/app writes persist IST wall-clock, `rule_extractor` writes persist UTC, and `display_state` reads everything back as UTC — so IST-written deadlines turn MISSED 5.5 h late. Fix: a `UTCDateTime` column type in Phase 0.2 (gap H1).
 
 2. **Groq AI Extraction Headroom (`max_tokens=4096`) & Dual-Tier Fallback Architecture**:
    - **Rule:** Both the primary and fallback LLM completions in `app/ai/extractor.py` MUST specify `max_tokens=4096` (never default or 1024), and extraction MUST follow a multi-tier fallback hierarchy.
@@ -22,11 +24,56 @@
      1. **Tier 1 (Structured Groq Inference):** `temperature=0.0`, `response_format={"type": "json_object"}` with strict JSON formatting constraints in `build_system_prompt()`.
      2. **Tier 2 (In-Flight Fallback Completion):** Triggered on `json_validate_failed` or `APIError`. Retries without schema constraints, strips markdown code fences (` ```json `), and extracts the first valid JSON substring via regex.
      3. **Tier 3 (Deterministic Regex Fallback — `rule_extractor.py`):** If the LLM produces 0 actions or fails inference for messages containing unambiguous temporal keywords ("tomorrow 9pm", "today by 11:59 PM", "OA window"), regex patterns extract the event type and normalize IST timestamps into structured events.
+   - **⚠ Tier 3 is under revision — do not extend it (verified 2026-10-21).** It also fires when the LLM *validly* returns zero actions (the prompt asks for `{"actions": []}` on non-actionable text), and it was verified to create wrong events: "Round 2 of the OA is tomorrow at 5pm" → 02:00; "OA on 25th October at 5 PM" → today 17:00; a defaulter-list message → a FORM deadline (defeats PRD Workflow 6). Removal is scheduled for Phase 0.5, with failed batches retried instead. Unverified hypothesis: gpt-oss-20b is a reasoning model whose reasoning tokens count against `max_tokens`, which may be the real cause of the original truncation.
 
 3. **Test Feed Isolation & In-Memory SQLite Requirement (`:memory:`)**:
    - **Rule:** All test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) MUST strictly bind to isolated in-memory databases (`sqlite+aiosqlite:///:memory:`) and override `app.database.engine`.
    - **Why:** Running tests against local disk files (`dev.db`) causes test fixtures to pollute the real `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting state for live Telegram listeners and mobile clients.
-   - **Enforcement:** All database-touching verification suites bind `:memory:`. In addition, `scripts/clean_test_data.py` exists as a production hygiene utility to purge any stray test records from `MAIN`.
+   - **Enforcement:** `verify_phase2.py`, `verify_phase4.py`, `verify_triage.py` and `verify_settings.py` bind `:memory:`. **Exception (verified):** `verify_phase3.py` binds no test engine, and its listener tests reach the configured database through `_is_known_subchannel` (reads only) — patched in Phase 0.2.
+   - **⚠ Do not run `scripts/clean_test_data.py` against real data:** it *hard-deletes* every `MAIN` company whose name merely contains `test`, `dummy`, `fallback`, `mock` or `acme` (e.g. "Latest updates…", Testbook, Acme Solar). Fix scheduled for Phase 0.6.
+
+---
+
+## 0.1 Tracking-Status Invariants (binding — set by the owner, 2026-10-22)
+
+> [!IMPORTANT]
+> These rules override `MASTER_SPEC.md` §3 where they differ (a matching MASTER_SPEC edit is pending owner approval). Implementation lands in Phases 0.3–0.5; until then the code does **not** yet enforce items 2, 3, 4, 5, 6 (note kinds) and 9.
+
+1. **IGNORED is a terminal, human-only status.** No automated path (dispatcher, re-triage, linking, backfill, catch-up) may set or clear it on a company or role. Only the Companies-screen toggle — `PATCH /companies/{id}/tracking` — moves a company out of IGNORED. Setting IGNORED via the Triage "Discard" action is allowed (explicit user action).
+2. A company is **effectively IGNORED** when its company-level mode is IGNORED or every one of its role tracks is IGNORED. Discarding the last role in Triage syncs the company to IGNORED. A multi-role company with any role still tracked keeps ingesting.
+3. **Ingestion gate:** messages from an effectively-IGNORED or soft-deleted company's channel are dropped at the router — no pre-filter, no LLM call, no backfill/catch-up reads, no ledger rows. Main-feed posts attributed to such a company apply no mutations. The dispatcher re-checks before every write.
+4. **Un-ignore** (via the PATCH above) resumes ingestion with a bounded 24-hour backfill — not a replay of everything missed.
+5. Triage endpoints **refuse to change an IGNORED role** (HTTP 409).
+6. **Criteria relaxation applies only to SILENT_TRACK.** Status notes are classified `CRITERIA_RELAXATION` or `GENERAL`. Only `CRITERIA_RELAXATION` on a SILENT_TRACK role re-opens it in Triage (`is_triaged=false`) as a proposal; `tracking_mode` is never changed automatically (no auto-promotion). `GENERAL` notes only update the note text. For ELIGIBLE roles a note never re-opens Triage, while timeline events, cards and (future) push notifications continue normally.
+7. **No eligibility matching:** CGPA/branch are never collected or sent to the LLM; the model only detects *that* criteria were relaxed.
+8. **SILENT_TRACK:** ingestion continues; nothing appears on the Timeline; no reminders (future) — only the relaxation proposal.
+9. An explicit company-level `PATCH /companies/{id}/tracking` marks all of that company's roles triaged (`is_triaged=true`).
+
+---
+
+## 0.2 Known Gaps (verified review, 2026-10-21)
+
+Verified by reading the code; items marked † were also reproduced by executing the pure function or an in-memory database. "Fix" refers to the remediation plan in §12.
+
+| ID | Gap | Evidence | Fix |
+|---|---|---|---|
+| C1 | No reminder path end-to-end: no backend scheduler or push code; the app never schedules local alarms and never sends its push token. | `command-center/src/services/notifications.ts` (`scheduleEventReminders` unused) | Next phase |
+| C2 † | Pre-filter drops real announcements: "ok/okay/noted/thanks" *anywhere* → drop; plurals, "tomorrow/tonight", "GD", "venue" aren't signals. 8 of 9 realistic samples dropped. | `app/telegram/pre_filter.py:53-102` | 0.4 |
+| C3 | A root-feed post containing an invite link is only joined — its own text (roles, CTC, deadlines) never reaches the LLM; the company gets the channel title, "Default Role", FTE. | `app/telegram/listener.py:285-294`, `app/crud.py:530-551` | 0.4 |
+| C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | 0.3–0.4 |
+| C5 † | Regex fallback invents wrong events and fires on valid empty LLM results (see Tribal Knowledge #2). | `app/ai/extractor.py:66-77`, `app/ai/rule_extractor.py` | 0.5 |
+| C6 | Auto-join resolves any `t.me/<name>`: a person/bot username creates a company plus a 24 h backfill of the private DM history (sent to the LLM); permalinks join foreign channels; the private-hash fallback re-resolves the hash as a username. | `app/telegram/listener.py:40-47,363-366,376,425-435` | 0.4 |
+| C7 | No authentication on any route; CORS reflects any origin with credentials. | `app/main.py:145-151` | 0.6 |
+| H1 † | Mixed IST/UTC wall-clock storage in SQLite (see Tribal Knowledge #1). | `app/models.py:145-158` | 0.2 |
+| H2 | Message post times never reach the LLM; relative dates resolve against processing time (wrong for backfill, midnight, catch-up). | `app/ai/dispatcher.py:407-417`, `app/ai/prompts.py:90,130-137` | 0.5 |
+| H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | 0.4–0.5 |
+| H4 | Weak update targeting: match = latest event of the same type; EXTEND moves only `end_time`; REPLACE_FORM leaves the old form visible; deleted events are fed to the LLM and resurrect; no CANCELLED/TBA. | `dispatcher.py:57-62,108-128`, `crud.py:347-400` | 0.5 (partial) |
+| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | 0.2, 0.5 |
+| H6 | Profile unused: INDIVIDUAL messages dropped even when addressed to the user; defaulter, slot and shortlist logic unimplemented. | `dispatcher.py:497-503` | Next phase |
+| H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | 0.2 |
+| H8 | Telethon runs inside the API process: >1 worker or two hosts on one session → `AUTH_KEY_DUPLICATED`; the listener task is unsupervised; `/health` always reports healthy. | `app/main.py:48-113,159-161` | 0.3 |
+| H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | 0.6, Phase 1 |
+| M1–M7 | No per-action rollback; every STATUS_NOTE re-triages; the company toggle leaves `is_triaged=false`; the debouncer has no max-wait; Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
 
 ---
 
@@ -36,13 +83,13 @@
 |---|---|
 | **Project Name** | Placement Command Center — Backend Engine |
 | **Repo** | `scn5/placement-engine` |
-| **Runtime** | Python 3.14, FastAPI 0.111+, Uvicorn |
-| **Local Bind** | `0.0.0.0:8080` |
-| **Public Exposure** | Cloudflare Quick Tunnel (`cloudflared`) → HTTPS endpoint consumed by `command-center` Android app |
-| **DB (dev)** | SQLite via `aiosqlite` (`./dev.db`) |
-| **DB (target)** | PostgreSQL (Dockerized, OCI Always Free VM) |
-| **LLM Endpoint** | `openai/gpt-oss-20b` via OpenAI-compatible base URL (Groq LPU) |
-| **Tenancy** | Strictly single-tenant — no auth layer, no multi-user scope |
+| **Runtime** | Local venv: Python 3.14.3, FastAPI 0.141, Uvicorn 0.54 (unpinned — see §3). Production image: **Python 3.12** — code must stay 3.12-compatible |
+| **Local Bind** | `0.0.0.0:8000` (README / CLAUDE.md commands; earlier sessions used `8080`) |
+| **Public Exposure** | Today: Cloudflare Quick Tunnel (URL changes on every restart). Planned: named tunnel on an owned domain + shared API key |
+| **DB (dev)** | SQLite via `aiosqlite` (`./dev.db`, git-ignored, never committed). Contents on 2026-10-22: TEST data only (4 companies, 4 "Default Role" tracks, 9 events created 2026-10-13/14) |
+| **DB (target)** | Chosen at VM provisioning: PostgreSQL (OCI A1 ARM) or SQLite (1 GB micro); schema kept portable |
+| **LLM Endpoint** | `openai/gpt-oss-20b` via OpenAI-compatible base URL (Groq LPU), `json_object` response mode (not JSON-schema) |
+| **Tenancy** | Strictly single-tenant, no multi-user scope. **No auth layer today** (gap C7); a single shared API key is planned (Phase 0.6) |
 
 ---
 
@@ -54,8 +101,8 @@ placement-engine/
 ├── .env.example                  # Safe credential template (committed)
 ├── .gitignore                    # Excludes venv/, *.env, __pycache__, *.log
 ├── requirements.txt              # Pinned dependencies
-├── MASTER_SPEC.md                # System architecture & DB schema source of truth
-├── PRODUCT REQUIREMENTS DOCUMENT.md
+├── AGENTS.md, README.md          # Agent rules / setup guide (MASTER_SPEC.md and the PRD live at the workspace root, outside this repo)
+├── placement_session.session     # Live Telethon file session (git-ignored; used when TELEGRAM_SESSION_STRING is empty)
 ├── verify_phase1.py              # Schema & model smoke tests (no DB required)
 ├── verify_phase2.py              # CRUD & router tests (in-memory SQLite)
 ├── verify_phase3.py              # Telegram ingestion mock suite
@@ -63,7 +110,9 @@ placement-engine/
 ├── verify_triage.py              # Triage Hub & role tracking regression suite
 ├── verify_settings.py            # Settings API & SystemConfig regression suite
 ├── scripts/
-│   └── test_live_ingestion.py    # Non-interactive live preflight & safety audit
+│   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
+│   ├── login_telegram.py         # Interactive login → placement_session.session (also prints a session string — removal in 0.6)
+│   └── clean_test_data.py        # ⚠ substring-matching HARD delete — see Tribal Knowledge #3
 ├── dev.db                        # Local SQLite database (git-ignored)
 │
 └── app/
@@ -95,8 +144,9 @@ placement-engine/
         ├── client.py             # AsyncOpenAI factory (cached singleton)
         ├── schemas.py            # LLM extraction Pydantic models (relaxed defaults)
         ├── prompts.py            # System prompt builder (UTC + context injection)
-        ├── extractor.py          # LLM inference + ValidationError fallback + timeout
-        └── dispatcher.py        # State-machine CRUD executor
+        ├── extractor.py          # LLM inference + fallback chain + timeout
+        ├── rule_extractor.py     # Regex fallback (⚠ verified harmful — removal in 0.5)
+        └── dispatcher.py         # State-machine CRUD executor
 ```
 
 ---
@@ -115,6 +165,10 @@ placement-engine/
 | `python-dotenv` | ≥ 1.0.1 | `.env` file support |
 | `telethon` | ≥ 1.36.0 | Telegram MTProto client |
 | `openai` | ≥ 1.30.0 | AsyncOpenAI client (OpenAI-compatible endpoint) |
+| `python-dateutil`, `tzdata`, `httpx`, `greenlet` | see `requirements.txt` | Date parsing, tz data, ASGI test client, SQLAlchemy async |
+
+> [!NOTE]
+> These are lower bounds — **nothing is pinned**. Installed in the local venv on 2026-10-22: fastapi 0.141.1, starlette 1.7.0, sqlalchemy 2.1.1, pydantic 2.13.5, openai 3.20.0, telethon 1.45.0, uvicorn 0.54.0, asyncpg 0.31.0, aiosqlite 0.22.1. A hashed lock file (compiled for Python 3.12) is planned for Phase 1.
 
 ---
 
@@ -124,16 +178,17 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://...` | Override to `sqlite+aiosqlite:///./dev.db` in dev |
+| `DATABASE_URL` | `postgresql+asyncpg://...` (⚠ contains a placeholder credential literal — removal in 0.3) | Override to `sqlite+aiosqlite:///./dev.db` in dev |
 | `APP_ENV` | `development` | Environment label |
 | `TELEGRAM_API_ID` | `0` | MTProto App ID (0 = listener disabled) |
 | `TELEGRAM_API_HASH` | `""` | MTProto App Hash |
-| `TELEGRAM_SESSION_STRING` | `""` | Telethon `StringSession` token (no disk file) |
+| `TELEGRAM_SESSION_NAME` | `placement_session` | File session used when `TELEGRAM_SESSION_STRING` is empty |
+| `TELEGRAM_SESSION_STRING` | `""` | Telethon `StringSession` token; takes precedence over the file session |
 | `TELEGRAM_PHONE` | `None` | Used for interactive first-auth only |
-| `MAIN_FEED_CHANNEL_ID` | `None` | Production placement channel ID |
+| `MAIN_FEED_CHANNEL_ID` / `TEST_FEED_CHANNEL_ID` | `None` | Root feeds (merged with `system_config` values at boot) |
 | `DEBOUNCE_DELAY_SECONDS` | `90.0` | Sliding window before batch dispatch |
-| `LLM_API_KEY` | `""` | Bearer token for LLM endpoint |
-| `LLM_BASE_URL` | `None` | Override for Groq / OpenRouter / local vLLM |
+| `LLM_API_KEY` / `GROQ_API_KEY` | `""` | Bearer token for the LLM endpoint (`LLM_API_KEY` wins) |
+| `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | Override for OpenRouter / local vLLM |
 | `LLM_MODEL` | `openai/gpt-oss-20b` | Model identifier |
 
 > **Dev `.env`** uses `DATABASE_URL=sqlite+aiosqlite:///./dev.db` and `TELEGRAM_API_ID=0`, so the server starts fully without Telegram credentials.
@@ -147,11 +202,11 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 |---|---|---|
 | `id` | Integer PK | Auto-increment |
 | `name` | String(255) | Display name |
-| `normalized_name` | String(255) UNIQUE | Lowercase stripped; lookup key |
+| `normalized_name` | String(255) UNIQUE | Lowercase stripped; lookup key. Globally unique today (blocks the same name in MAIN and TEST); `(normalized_name, environment_type)` planned in 0.2 |
 | `environment_type` | String(16) | `MAIN` \| `TEST` (default `MAIN`) |
-| `main_feed_msg_id` | BigInteger | Single-ID current impl (spec calls for array) |
+| `main_feed_msg_id` | BigInteger | Single-ID column — **never written by any code path** (no thread stitching yet) |
 | `subchannel_id` | BigInteger UNIQUE | Telegram channel ID for routing |
-| `tracking_mode` | String(32) | `ELIGIBLE` \| `SILENT_TRACK` \| `IGNORED` |
+| `tracking_mode` | String(32) | `ELIGIBLE` \| `SILENT_TRACK` \| `IGNORED` — legacy company-level mode; can drift from role-level modes (see §0.1 invariant 2) |
 | `is_active` | Boolean | Soft-delete flag |
 | `is_custom` | Boolean | Manual entry vs Telegram-discovered |
 | `created_at` | DateTime(tz) | UTC default |
@@ -188,7 +243,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `end_time` | DateTime(tz) NOT NULL | Deadline — drives all state logic |
 | `user_status` | String(32) | `PENDING` \| `COMPLETED` |
 | `completed_at` | DateTime(tz) | Timestamp of user completion |
-| `is_custom` | Boolean | Manual vs auto-ingested |
+| `is_custom` | Boolean | **Currently always `True`** — `crud.create_custom_event` hardcodes it, including for LLM-created events; not a reliable provenance flag |
 | `is_deleted` | Boolean | Soft-delete flag (`default=False`) |
 | `version` | Integer | Form replacement counter |
 | `created_at` | DateTime(tz) | |
@@ -200,7 +255,7 @@ user_status=PENDING  + end_time < now  → "MISSED"           (Red badge)
 user_status=COMPLETED + end_time > now → "COMPLETED_ACTIVE" (Green badge)
 user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 ```
-> SQLite tz-naïve datetime coercion is handled in `display_state` via `.replace(tzinfo=timezone.utc)`.
+> ⚠ `display_state` coerces SQLite's naive datetimes with `.replace(tzinfo=timezone.utc)`, which is wrong for rows written with an IST offset (gap H1). Replaced by the `UTCDateTime` column type in Phase 0.2.
 
 > **⚠ Schema Gap vs MASTER_SPEC:** `event_type` currently uses Phase 2 naming (`OA_WINDOW`, `IRIS_DEADLINE`) while spec/LLM schema uses `event_category` with values `OA`, `IRIS`, `FORM`, `GD`, etc. Needs a unified enum before the extractor can write to DB.
 > **⚠ Schema Gap:** `round_number` (INTEGER) is absent — required for state-aware OA/Interview round counting.
@@ -211,6 +266,8 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 ## 6. REST API Endpoints
 
 ### 6.1 Registered Routes
+
+> ⚠ No route requires authentication (gap C7).
 
 #### Meta
 | Method | Path | Description |
@@ -223,7 +280,7 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 | `POST` | `/companies/` | `CompanyCreate` (accepts `name`, `company_name`, `target_role`, `role_name`, `drive_type`, `ctc_stipend_info`, `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates parent company and default `RoleTrack` (`is_triaged=True`, `tracking_mode="ELIGIBLE"`) |
 | `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` (filters `is_active == True`, serializes both `name` and `company_name`) |
 | `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological, filters `is_deleted == False`, returns 404 if company does not exist) |
-| `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` to child `RoleTrack`s) |
+| `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` to child `RoleTrack`s; does not set `is_triaged` — invariant 9, fix in 0.5) |
 | `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201) |
 | `DELETE` | `/companies/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes company `is_active=False` & cascades `is_deleted=True` to events) |
 
@@ -265,9 +322,9 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 ## 7. Telegram Ingestion Pipeline (`app/telegram/`)
 
 ### 7.1 Client (`client.py`)
-- `create_telegram_client()` → `TelegramClient` using `StringSession`
-- Session token lives in `TELEGRAM_SESSION_STRING` env var — **no `.session` files on disk**
-- `flood_sleep_threshold=60` — auto-sleeps on `FloodWaitError` up to 60s
+- `create_telegram_client()` → `TelegramClient` using `StringSession` when `TELEGRAM_SESSION_STRING` is set, **otherwise the file session** `placement_session.session` (present on disk, git-ignored; created by `scripts/login_telegram.py`)
+- Built without `catch_up`: updates missed while disconnected are not replayed (gap C4)
+- `flood_sleep_threshold=60` — auto-sleeps on `FloodWaitError` up to 60 s; longer waits raise, and a join that hits one is dropped
 
 > **Activation gate:** Listener only starts if `settings.TELEGRAM_API_ID != 0`. The dev `.env` sets `TELEGRAM_API_ID=0`, so the server boots cleanly without credentials.
 
@@ -282,6 +339,8 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 5. No match in `_SIGNAL_RE` (dates, times, "deadline", "form", "oa", "interview", "iris", "ppt", "ctc", "shortlist", "http", …) → **DROP**
 6. Otherwise → **KEEP**
 
+> ⚠ Step 4 matches chatter words *anywhere* in the message and step 5 lacks common signals; verified to drop 8 of 9 realistic announcements (gap C2). Messages with link previews survive only because `has_media` also counts `MessageMediaWebPage`.
+
 ### 7.3 Debouncer (`debouncer.py`)
 `ChannelDebouncer` — one instance per process, keyed by `chat_id`.
 
@@ -289,6 +348,7 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 - **On fire:** Buffer is popped, messages sorted by `date` ASC, `callback(chat_id, messages)` awaited
 - **`flush_all()`:** Force-dispatches all pending buffers on graceful shutdown
 - **Zero unhandled exceptions:** Callback errors are caught and logged; task cancellation uses explicit `try/except CancelledError`
+- ⚠ No maximum wait (a busy chat can postpone dispatch indefinitely); the slot is popped before the callback runs, so two dispatches for one chat can overlap (gap H3); buffers are lost on restart (gap C4)
 
 ### 7.4 Backfill (`backfill.py`)
 `fetch_24h_backfill(client, entity) -> List[dict]`
@@ -296,6 +356,7 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 - Cutoff = `now(UTC) - 24h`
 - Fetches recent messages backwards from now with defensive safety cap (`limit=200`), filtering `msg_date >= cutoff` (resolves Telethon `offset_date` + `reverse=True` bug).
 - Returns chronological payload matching live message contract: `[{index, label "[N]", id, text, raw_text, date, timestamp, has_media}, …]`
+- ⚠ Triggered after every successful link, including re-posts of an already-linked invite (gap H3); all ≤200 messages go to the LLM in one call
 
 ### 7.5 Listener (`listener.py`) & Two-Tier Ingestion
 `TelegramIngestionService`:
@@ -314,6 +375,7 @@ user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 
 > **⚠ Spec Gap:** Recursive reply fetching (depth ≤ 6) is not implemented — only single-level parent stitching exists. This affects deeply threaded announcements.
 > **⚠ Spec Gap:** 60-second TCP heartbeat job (DC keep-alive) is not implemented.
+> **⚠ Verified gaps:** when a root-feed post contains an invite link, its own text is never extracted (C3); public `t.me/<name>` links are resolved and joined without checking that the entity is a channel, and the 24 h backfill bypasses the `is_private` guard (C6). Edits are re-processed as new text with no message provenance (H3).
 
 ---
 
@@ -342,6 +404,8 @@ Injections per call:
 - **Strict Operational Rules:** Action selection criteria for `CREATE_EVENT`, `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, `REPLACE_FORM`, `STATUS_NOTE`, and `NO_ACTION`.
 - **Verbatim JSON Schema:** Injected schema template preventing hallucinated field names.
 
+> ⚠ Per-message post timestamps are not injected, so relative dates resolve against processing time (gap H2). The schedule block appears only when the company is already resolved — never for main-feed posts — includes soft-deleted events, and carries no event IDs (gaps H4, H5). The user profile (`system_config`) is never injected (gap H6).
+
 ### 8.3 Extractor (`ai/extractor.py`) & Fallback Extractor (`ai/rule_extractor.py`)
 `extract_placement_actions(raw_text, current_context) -> LLMExtractionResult`
 
@@ -355,10 +419,12 @@ Injections per call:
   2. *Secondary Deterministic Regex Fallback (`rule_extractor.py`):* If the LLM produces 0 actions or fails inference for messages containing clear recruitment temporal keywords ("tomorrow 9pm", "today by 11:59 PM", "OA window 8-10am"), deterministic regex patterns extract event types and IST timestamps directly into structured actions.
 - Falls back to `LLMExtractionResult()` (empty) on unrecoverable error — **never raises**
 
+> ⚠ An empty result means the batch is gone: nothing is retried later (gap C4). The regex tier is under revision (gap C5, Tribal Knowledge #2).
+
 ### 8.4 Dispatcher & Pre-Interview State Engine (`ai/dispatcher.py`)
 `process_and_dispatch(chat_id, context_header, messages, db)`
 
-**Fully Hardened 5-Step Pipeline:**
+**5-Step Pipeline** (verified defects: H3–H6, M1, M2 — see §0.2):
 1. Normalize text block from message list.
 2. Resolve `Company` by `subchannel_id == chat_id`, falling back to LLM-extracted name or subchannel mapping.
 3. Build schedule context → inject into prompt.
@@ -373,6 +439,8 @@ Injections per call:
 | `REPLACE_FORM` | If a prior form event exists and `action_link` is present, calls `crud.replace_form_event()` to increment `version = max_version + 1`, update `action_link`, set both `start_time` and `end_time` to `new_end_time`, and reset `user_status = "PENDING"`. **Fallback:** If no prior event exists, falls back to `CREATE_EVENT` with `event_type="FORM_SUBMISSION"`. |
 | `STATUS_NOTE` | Criteria Relaxation / Re-Triage trigger: calls `crud.flag_for_retriage(db, target_track.id, note=extracted.status_note)`. Persists `latest_status_note` and resets `is_triaged = False` strictly if `tracking_mode == "SILENT_TRACK"`. |
 | `NO_ACTION` | No-op. |
+
+> ⚠ Verified behaviour (2026-10-21): `EXTEND_DEADLINE` updates only `end_time` (point deadlines keep the old `start_time`); `REPLACE_FORM` inserts a new version and leaves the previous form visible; `STATUS_NOTE` re-triages on *any* note, not only criteria relaxations (conflicts with §0.1 invariant 6); INDIVIDUAL-scope actions are dropped even when addressed to the user; a failed action is not rolled back, so later actions in the same batch can fail.
 
 **Temporal Normalization Rules (`_normalize_event_times`):**
 - *Live events* (`OA_WINDOW`, `PPT`, `INTERVIEW`): If only `start_time` is present, defaults `end_time = start_time + 2 hours`.
@@ -402,8 +470,8 @@ Startup
   ├─ 1. create_all() → Bootstrap DB schema (SQLite dev / PostgreSQL prod)
   │
   ├─ 2. [if TELEGRAM_API_ID != 0]
-  │      ├─ create_telegram_client() → StringSession
-  │      ├─ client.start()
+  │      ├─ create_telegram_client() → StringSession or file session
+  │      ├─ client.connect() + is_user_authorized()   (non-interactive)
   │      ├─ TelegramIngestionService.register_handlers()
   │      ├─ set_payload_handler(_payload_handler → dispatcher)
   │      └─ asyncio.create_task(client.run_until_disconnected())
@@ -416,6 +484,8 @@ Shutdown
   ├─ client.disconnect()
   └─ engine.dispose()
 ```
+
+> ⚠ Step 1 also runs two `ALTER TABLE` statements inside the same transaction with errors suppressed — harmless on SQLite, but on PostgreSQL it would roll back the whole schema (gap H7). Replaced by Alembic in Phase 0.2. Telethon shares this process (gap H8); the API/worker split is Phase 0.3.
 
 ---
 
@@ -430,8 +500,9 @@ CORSMiddleware(
 )
 ```
 
-- Bound on `0.0.0.0:8080` locally
-- Exposed publicly via `cloudflared tunnel --url http://localhost:8080`
+- ⚠ No authentication, and the origin regex reflects any origin with credentials (gap C7). React Native clients don't need CORS — removal planned in 0.6.
+- Bound on `0.0.0.0:8000` locally (earlier sessions used 8080)
+- Exposed publicly via `cloudflared tunnel --url http://localhost:8000` (quick tunnel: the URL changes on every restart)
 - HTTPS termination at Cloudflare edge — satisfies Android API 28+ cleartext restrictions
 
 ---
@@ -444,11 +515,13 @@ All scripts are self-contained and require no live credentials or running server
 |---|---|---|
 | `verify_phase1.py` | ORM model instantiation, all 4 `display_state` branches, Pydantic schema round-trip | None |
 | `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline recovery, HTTP router tests (`POST /companies/` mobile contract, `GET /companies/{id}/events` 200/404, timeline `?env=MAIN\|TEST` isolation, complete/uncomplete) | In-memory SQLite |
-| `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects |
+| `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects — ⚠ no in-memory engine; listener tests read the configured DB (patch in 0.2) |
 | `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM, EXTEND_DEADLINE, prompt context injection, dirty subchannel payloads (missing company/drive), e2e CREATE_EVENT, e2e STATUS_NOTE, RESCHEDULE_EVENT start/end updates | In-memory SQLite |
 | `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
 | `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
+
+> ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
 
 Run regression suites:
 ```bash
@@ -465,17 +538,31 @@ python scripts/test_live_ingestion.py
 
 ## 12. Immediate Backlog (Spec Conformance Gaps)
 
-### P0 — Core Pre-Interview State Machine & Mobile Contract (All Resolved & Hardened)
+### Remediation plan — Phase 0 "stop silent losses" (approved 2026-10-22, branch `feature/phase-0-stop-losses`)
+
+| Item | Scope | Status |
+|---|---|---|
+| 0.1 | Docs truth pass (this revision) | ✅ Done — pending owner review |
+| 0.2 | Schema foundation: Alembic baseline, `UTCDateTime`, env-scoped company uniqueness, `message_ledger` / `worker_status` tables, SQLite pragmas | ⏳ Next |
+| 0.3 | API / worker process split; feed refresh, catch-up and retry loops | Planned |
+| 0.4 | Ingestion: pre-filter, invite-post extraction, join policy, debouncer, IGNORED ingestion gate | Planned |
+| 0.5 | Extraction & dispatch: post timestamps, event IDs, regex-tier removal, invariants 1–9 | Planned |
+| 0.6 | API key, CORS removal, secret hygiene, `.dockerignore` | Planned |
+| 0.7 | Frontend: API-key pairing, needs-review pill, Telegram deep links | Planned |
+
+Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN feed) follows Phase 0.
+
+### P0 — Core Pre-Interview State Machine & Mobile Contract (delivered; verified defects listed in §0.2)
 
 | # | Item | File(s) | Status / Detail |
 |---|---|---|---|
 | 1 | **Implement `/triage` router** | `app/routers/triage.py` | ✅ **Resolved** — `GET /triage/pending`, `POST /triage/{id}`, `/accept`, `/ignore`, and conditional re-triage. |
 | — | **Atomic Company Creation** | `app/crud.py`, `app/schemas.py` | ✅ **Resolved** — `POST /companies/` creates default `RoleTrack` atomically with role metadata. |
 | — | **Enriched Timeline & Events** | `app/schemas.py`, `app/routers/companies.py` | ✅ **Resolved** — `TimelineEventResponse` enriched with `company_name`, `drive_type`, `status`; `GET /companies/{id}/events` implemented. |
-| — | **Pre-Interview State Engine** | `app/ai/dispatcher.py`, `app/crud.py` | ✅ **Resolved & Hardened** — Canonical time normalization (live events +2h, deadlines same timestamp), non-existent event fallbacks (`EXTEND_DEADLINE`/`RESCHEDULE_EVENT`/`REPLACE_FORM` → `CREATE_EVENT`), form replacement versioning with PENDING reset, soft-delete filtering, and criteria relaxation re-triage via `crud.flag_for_retriage()`. |
+| — | **Pre-Interview State Engine** | `app/ai/dispatcher.py`, `app/crud.py` | ⚠ **Delivered with verified defects (H3, H4, M1, M2)** — Canonical time normalization (live events +2h, deadlines same timestamp), non-existent event fallbacks (`EXTEND_DEADLINE`/`RESCHEDULE_EVENT`/`REPLACE_FORM` → `CREATE_EVENT`), form replacement versioning with PENDING reset, soft-delete filtering, and criteria relaxation re-triage via `crud.flag_for_retriage()`. |
 | — | **Zero-Dependency IST Timezone** | `app/ai/prompts.py`, `app/ai/schemas.py` | ✅ **Resolved** — Native UTC+05:30 `timezone` representation eliminating Windows `tzdata` crashes. |
-| — | **Dual-Tier AI Extraction & Fallbacks**| `app/ai/extractor.py`, `app/ai/rule_extractor.py` | ✅ **Resolved** — `max_tokens=4096`, in-flight fallback parser, and deterministic regex IST fallback parser. |
-| — | **Database Isolation & Sanitization** | `verify_*.py`, `scripts/clean_test_data.py` | ✅ **Resolved** — Test suites isolated to `:memory:` SQLite; `dev.db` untracked from Git; clean test isolation verified. |
+| — | **Dual-Tier AI Extraction & Fallbacks**| `app/ai/extractor.py`, `app/ai/rule_extractor.py` | ⚠ **Partly** — `max_tokens=4096` and the in-flight JSON fallback stay; the regex tier was verified harmful (C5) and is removed in 0.5. |
+| — | **Database Isolation & Sanitization** | `verify_*.py`, `scripts/clean_test_data.py` | ⚠ **Mostly** — four suites bind `:memory:`; `verify_phase3.py` does not (fix in 0.2). `dev.db` was never committed (git history verified 2026-10-21). |
 
 ### P1 — Schema Conformance
 
@@ -494,7 +581,7 @@ python scripts/test_live_ingestion.py
 | # | Item | File(s) | Detail |
 |---|---|---|---|
 | 9 | **Recursive reply stitching (depth ≤ 6)** | `telegram/listener.py` | Current impl fetches only 1 level of `reply_to_msg_id` |
-| 10 | **Auto-join private channels** | `telegram/listener.py` | ✅ **Resolved** — Auto-joins via `ImportChatInviteRequest` (hashes) / `JoinChannelRequest` (usernames) and links SQLite `Company` record. |
+| 10 | **Auto-join private channels** | `telegram/listener.py` | ✅ **Resolved** — Auto-joins via `ImportChatInviteRequest` (hashes) / `JoinChannelRequest` (usernames) and links SQLite `Company` record. ⚠ Join scope is unsafe (C6) — fix in 0.4. |
 | 11 | **60s TCP heartbeat** | `app/main.py` | Background task pinging Telegram DC to reset half-open connections |
 | 12 | **`system_config` table & profile API** | `models.py`, `app/routers/settings.py` | ✅ **Resolved** — `GET /settings` and `PUT /settings` implemented with student profile and feed IDs. |
 | 13 | **FCM push notification worker** | `app/workers/notifier.py` | 60s polling: `PENDING` events ±2h or ±30min from `start_time` → FCM dispatch |
@@ -514,12 +601,15 @@ python scripts/test_live_ingestion.py
 ## 13. Git Log (Recent)
 
 ```
+78a7f21 docs: finalize project state and tribal knowledge for handoff
 3533cb9 chore: strengthen gitignore rules
 09cbaa5 chore(git): scrub dev.db from index, update .gitignore, add .env.example and production README
 fbcd333 fix(tz): use cross-platform UTC+05:30 IST definition and add tzdata dependency
 e850a9c feat(pre-interview): implement master spec time normalization, ist anchoring, form replacement, and test feed isolation
 e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
+
+> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`.
 
 ---
 
@@ -530,10 +620,13 @@ e9a894e feat(ecosystem): fallback extend to create, normalize event times, add i
 .\venv\Scripts\Activate.ps1
 
 # Start server
-uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 # Expose via Cloudflare tunnel (separate terminal)
-cloudflared tunnel --url http://localhost:8080
+cloudflared tunnel --url http://localhost:8000
 ```
 
-> Swagger UI available at `http://localhost:8080/docs` during development.
+> Swagger UI available at `http://localhost:8000/docs` during development.
+
+> [!WARNING]
+> With `TELEGRAM_API_ID` set, starting the server connects the **live personal session**, processes the configured feeds and auto-joins invite links. For API-only work, override it for that process only (PowerShell: `$env:TELEGRAM_API_ID="0"`) — never by editing `.env`.

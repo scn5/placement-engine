@@ -1,7 +1,7 @@
 # AGENT RULES: PLACEMENT ENGINE (BACKEND)
 
 ## 1. Core Framework Constraints
-* **Runtime:** Python 3.14. 
+* **Runtime:** Code must run on **Python 3.12** (the production image is `python:3.12-slim`). The local dev venv is 3.14, so avoid 3.13+/3.14-only syntax and standard-library APIs — notably unquoted forward-reference annotations that only work under 3.14's deferred annotation evaluation.
 * **Framework:** FastAPI >= 0.111.0. All endpoint functions must be `async def`.
 * **Validation:** Pydantic V2. Use `model_validate()` and `model_dump()`. Do NOT use deprecated V1 methods like `parse_obj()` or `dict()`.
 
@@ -12,7 +12,11 @@
 
 ## 3. External Integrations
 * **Telethon:** The Telegram ingestion listener runs on `asyncio`. Ensure no blocking synchronous code (like `time.sleep` or heavy synchronous CPU bounds) is executed inside the event handlers, as this drops MTProto keep-alives.
-* **LLM Engine:** Use the `openai` Python SDK configured with a custom `base_url` for Groq. Always pass `response_format={"type": "json_object"}`.
+* **LLM Engine:** Use the `openai` Python SDK configured with a custom `base_url` for Groq. Pass `response_format={"type": "json_object"}` until Phase 0.5 evaluates Groq's strict `json_schema` mode for gpt-oss-20b. Never add a regex or heuristic extraction fallback that writes events — failed extractions must be retried, not guessed (see `PROJECT_STATE.md` §0.2 gap C5).
 
 ## 4. Tenancy & Auth
-* **Single Tenant:** Do not build multi-user authentication, JWT middleware, or user tables. This system belongs to a single user. Trust the incoming requests from the paired frontend.
+* **Single Tenant:** Do not build multi-user authentication, JWT middleware, or user tables. This system belongs to a single user. The only authentication is one shared API key (`X-API-Key`) set when the app is paired — planned for Phase 0.6; today no route is authenticated.
+
+## 5. Binding Domain Rules
+* **Tracking-status invariants:** `PROJECT_STATE.md` §0.1 is binding. In short: `IGNORED` is a terminal, human-only status (only `PATCH /companies/{id}/tracking` reverses it, and its channel is not processed); criteria relaxation only *proposes* re-triage for `SILENT_TRACK` roles and never changes `tracking_mode`; CGPA/branch are never given to the automation.
+* **Telegram safety:** Never run code against the live session from tests or agent sessions; mock Telethon instead. Never start the server with `TELEGRAM_API_ID` set — use a process-level `TELEGRAM_API_ID=0` override and never edit `.env`. Auto-join may only follow the join policy (planned `app/telegram/join_policy.py`): never person/bot profiles, permalinks or the root feeds.

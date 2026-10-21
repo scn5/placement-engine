@@ -160,3 +160,17 @@ The Decision/Fix:
 The Problem: Test fixtures running against local database files polluted the `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting production timeline feeds.
 The Context/Why it failed: Sharing `dev.db` between unit tests and the live server allowed mock data to persist and be served to mobile clients connecting to the backend.
 The Decision/Fix: Enforced that all test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) strictly bind to isolated `sqlite+aiosqlite:///:memory:` engines. Created `scripts/clean_test_data.py` as an administrative hygiene tool to purge test records from `MAIN` and maintain pristine separation between `MAIN` and `TEST` environments.
+
+[October 2026]: Principal Engineering Review, Documentation Corrections & Tracking-Status Invariants (2026-10-22)
+The Problem: A read-only architectural review (2026-10-21) found that several status claims in this journal and in PROJECT_STATE.md did not match the code, and that ingestion, extraction and storage fail silently in ways the verification suites never exercised.
+The Context/Why it failed: Documentation recorded intended behaviour rather than verified behaviour. The verify_* suites mock the LLM and contain no realistic multi-sentence announcements, so spec gaps and regressions passed as green.
+The Decision/Fix:
+1. Corrected claims (the code is the source of truth; earlier entries are kept as written):
+   - "[September 2026] Missed In-Place Schedule Modifications": edits are re-extracted as new text. No message provenance exists (no message-id column or lookup), so an edit can create a duplicate event rather than update the original.
+   - "[October 2026] Tribal Knowledge 2": the regex tier also runs when the LLM validly returns zero actions, and was verified to create wrong events ("Round 2 of the OA is tomorrow at 5pm" → 02:00; "OA on 25th October at 5 PM" → today 17:00; a defaulter-list message → a FORM deadline). It is scheduled for removal in Phase 0.5.
+   - "[October 2026] Tribal Knowledge 3": verify_phase3.py binds no in-memory engine and reads the configured database through `_is_known_subchannel` (fix in Phase 0.2). dev.db was never committed; commit 09cbaa5 only added ignore rules. `scripts/clean_test_data.py` hard-deletes MAIN companies by substring match and must not be run against real data until Phase 0.6.
+   - Sessions: when TELEGRAM_SESSION_STRING is empty, the client uses the file session `placement_session.session` (present on disk, git-ignored); "no .session files on disk" was inaccurate.
+   - Storage: SQLite drops datetime offsets without converting, so IST- and UTC-written rows coexist and `display_state` mis-reads IST rows by 5.5 h (reproduced on an in-memory database).
+2. Recorded the verified defects as PROJECT_STATE.md §0.2 (Known Gaps C1–C7, H1–H9, M1–M7).
+3. Recorded the owner-defined tracking-status invariants as PROJECT_STATE.md §0.1: IGNORED is a terminal, human-only status whose channels are not processed (only `PATCH /companies/{id}/tracking` can reverse it, followed by a bounded 24-hour backfill); criteria relaxation applies only to SILENT_TRACK and only proposes re-triage — never auto-promotion; CGPA/branch are never given to the automation.
+4. Started the approved remediation plan "Phase 0 — stop silent losses" on branch `feature/phase-0-stop-losses`. Production will use Python 3.12, so code must stay 3.12-compatible.
