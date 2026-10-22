@@ -31,10 +31,16 @@ _TestSession = async_sessionmaker(
 )
 _db_module.engine = _test_engine
 _db_module.AsyncSessionLocal = _TestSession
+_db_module.install_sqlite_pragmas(_test_engine)  # enforce foreign keys like production
+
+import warnings
 
 from app.main import app
-from app.models import Base
+from app.models import Base, NaiveDatetimeWarning
 from app.database import get_db
+
+# Every datetime handed to the ORM must be timezone-aware.
+warnings.simplefilter("error", NaiveDatetimeWarning)
 
 async def verify():
     print("🚀 Running Phase 5 (Settings API) Verification Suite...\n")

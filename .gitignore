@@ -15,6 +15,9 @@ ENV/
 # SQLite databases & local dev stores
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.bak
 *.sqlite
 *.sqlite3
 dev.db

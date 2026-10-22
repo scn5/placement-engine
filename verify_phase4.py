@@ -36,12 +36,19 @@ _TestSession = async_sessionmaker(
 )
 _db_module.engine = _test_engine
 _db_module.AsyncSessionLocal = _TestSession
+_db_module.install_sqlite_pragmas(_test_engine)  # enforce foreign keys like production
 
 # Now safe to import application modules
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.models import Base, Company, RoleTrack, TimelineEvent
+import warnings
+
+from app.models import Base, Company, NaiveDatetimeWarning, RoleTrack, TimelineEvent
+
+# Every datetime handed to the ORM must be timezone-aware.
+warnings.simplefilter("error", NaiveDatetimeWarning)
+
 from app.ai.schemas import (
     ActionType,
     AudienceScope,

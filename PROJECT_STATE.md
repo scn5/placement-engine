@@ -15,7 +15,7 @@
    - **Rule:** Timezones MUST be defined using standard library `datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")`.
    - **Why:** On Windows machines, `zoneinfo.ZoneInfo("Asia/Kolkata")` crashes fatally with `ZoneInfoNotFoundError: 'No time zone found with key Asia/Kolkata'` if the Python environment lacks the `tzdata` package. Because Indian Standard Time does not observe Daylight Saving Time (strictly fixed at UTC+05:30 year-round), the native `datetime.timezone` constructor provides 100% deterministic, cross-platform stability with zero external dependency risks.
    - **Enforcement:** Enforced in `app/ai/prompts.py`, `app/ai/schemas.py`, and `app/ai/rule_extractor.py`. In addition, `tzdata>=2024.1` is pinned defensively in `requirements.txt`.
-   - **⚠ Storage gap (verified 2026-10-21):** SQLite's `DateTime(timezone=True)` drops the offset *without converting*. LLM/app writes persist IST wall-clock, `rule_extractor` writes persist UTC, and `display_state` reads everything back as UTC — so IST-written deadlines turn MISSED 5.5 h late. Fix: a `UTCDateTime` column type in Phase 0.2 (gap H1).
+   - **⚠ Storage gap (verified 2026-10-21):** SQLite's `DateTime(timezone=True)` drops the offset *without converting*. LLM/app writes persist IST wall-clock, `rule_extractor` writes persist UTC, and `display_state` reads everything back as UTC — so IST-written deadlines turn MISSED 5.5 h late. **✅ Fixed in Phase 0.2:** every datetime column now uses the `UTCDateTime` type (stored as UTC, read back as aware UTC), and API inputs must carry an offset (`AwareDatetime`). Times shown to the LLM are converted back to IST.
 
 2. **Groq AI Extraction Headroom (`max_tokens=4096`) & Dual-Tier Fallback Architecture**:
    - **Rule:** Both the primary and fallback LLM completions in `app/ai/extractor.py` MUST specify `max_tokens=4096` (never default or 1024), and extraction MUST follow a multi-tier fallback hierarchy.
@@ -29,7 +29,7 @@
 3. **Test Feed Isolation & In-Memory SQLite Requirement (`:memory:`)**:
    - **Rule:** All test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) MUST strictly bind to isolated in-memory databases (`sqlite+aiosqlite:///:memory:`) and override `app.database.engine`.
    - **Why:** Running tests against local disk files (`dev.db`) causes test fixtures to pollute the real `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting state for live Telegram listeners and mobile clients.
-   - **Enforcement:** `verify_phase2.py`, `verify_phase4.py`, `verify_triage.py` and `verify_settings.py` bind `:memory:`. **Exception (verified):** `verify_phase3.py` binds no test engine, and its listener tests reach the configured database through `_is_known_subchannel` (reads only) — patched in Phase 0.2.
+   - **Enforcement:** Since Phase 0.2, every database-touching suite (`verify_phase2/3/4.py`, `verify_triage.py`, `verify_settings.py`, `verify_schema.py`) binds `:memory:`; `verify_phase3.py` was patched (it used to read the configured database through `_is_known_subchannel`). All suites also enable SQLite foreign keys and turn `NaiveDatetimeWarning` into an error.
    - **⚠ Do not run `scripts/clean_test_data.py` against real data:** it *hard-deletes* every `MAIN` company whose name merely contains `test`, `dummy`, `fallback`, `mock` or `acme` (e.g. "Latest updates…", Testbook, Acme Solar). Fix scheduled for Phase 0.6.
 
 ---
@@ -64,13 +64,13 @@ Verified by reading the code; items marked † were also reproduced by executing
 | C5 † | Regex fallback invents wrong events and fires on valid empty LLM results (see Tribal Knowledge #2). | `app/ai/extractor.py:66-77`, `app/ai/rule_extractor.py` | 0.5 |
 | C6 | Auto-join resolves any `t.me/<name>`: a person/bot username creates a company plus a 24 h backfill of the private DM history (sent to the LLM); permalinks join foreign channels; the private-hash fallback re-resolves the hash as a username. | `app/telegram/listener.py:40-47,363-366,376,425-435` | 0.4 |
 | C7 | No authentication on any route; CORS reflects any origin with credentials. | `app/main.py:145-151` | 0.6 |
-| H1 † | Mixed IST/UTC wall-clock storage in SQLite (see Tribal Knowledge #1). | `app/models.py:145-158` | 0.2 |
+| H1 † | Mixed IST/UTC wall-clock storage in SQLite (see Tribal Knowledge #1). | `app/models.py:145-158` | ✅ 0.2 |
 | H2 | Message post times never reach the LLM; relative dates resolve against processing time (wrong for backfill, midnight, catch-up). | `app/ai/dispatcher.py:407-417`, `app/ai/prompts.py:90,130-137` | 0.5 |
 | H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | 0.4–0.5 |
 | H4 | Weak update targeting: match = latest event of the same type; EXTEND moves only `end_time`; REPLACE_FORM leaves the old form visible; deleted events are fed to the LLM and resurrect; no CANCELLED/TBA. | `dispatcher.py:57-62,108-128`, `crud.py:347-400` | 0.5 (partial) |
-| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | 0.2, 0.5 |
+| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | Uniqueness ✅ 0.2; lookups 0.5 |
 | H6 | Profile unused: INDIVIDUAL messages dropped even when addressed to the user; defaulter, slot and shortlist logic unimplemented. | `dispatcher.py:497-503` | Next phase |
-| H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | 0.2 |
+| H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | ✅ 0.2 (Alembic; live-PG run is the first Phase 1 step) |
 | H8 | Telethon runs inside the API process: >1 worker or two hosts on one session → `AUTH_KEY_DUPLICATED`; the listener task is unsupervised; `/health` always reports healthy. | `app/main.py:48-113,159-161` | 0.3 |
 | H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | 0.6, Phase 1 |
 | M1–M7 | No per-action rollback; every STATUS_NOTE re-triages; the company toggle leaves `is_triaged=false`; the debouncer has no max-wait; Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
@@ -86,7 +86,7 @@ Verified by reading the code; items marked † were also reproduced by executing
 | **Runtime** | Local venv: Python 3.14.3, FastAPI 0.141, Uvicorn 0.54 (unpinned — see §3). Production image: **Python 3.12** — code must stay 3.12-compatible |
 | **Local Bind** | `0.0.0.0:8000` (README / CLAUDE.md commands; earlier sessions used `8080`) |
 | **Public Exposure** | Today: Cloudflare Quick Tunnel (URL changes on every restart). Planned: named tunnel on an owned domain + shared API key |
-| **DB (dev)** | SQLite via `aiosqlite` (`./dev.db`, git-ignored, never committed). Contents on 2026-10-22: TEST data only (4 companies, 4 "Default Role" tracks, 9 events created 2026-10-13/14) |
+| **DB (dev)** | SQLite via `aiosqlite` (`./dev.db`, git-ignored, never committed). Recreated empty on 2026-10-23 by `alembic upgrade head` (Phase 0.2 cold start). The previous file — TEST data only (4 companies, 4 "Default Role" tracks, 9 events) — is kept as `dev.db.pre-phase0.bak` (git-ignored) |
 | **DB (target)** | Chosen at VM provisioning: PostgreSQL (OCI A1 ARM) or SQLite (1 GB micro); schema kept portable |
 | **LLM Endpoint** | `openai/gpt-oss-20b` via OpenAI-compatible base URL (Groq LPU), `json_object` response mode (not JSON-schema) |
 | **Tenancy** | Strictly single-tenant, no multi-user scope. **No auth layer today** (gap C7); a single shared API key is planned (Phase 0.6) |
@@ -100,7 +100,8 @@ placement-engine/
 ├── .env                          # Local dev secrets (git-ignored)
 ├── .env.example                  # Safe credential template (committed)
 ├── .gitignore                    # Excludes venv/, *.env, __pycache__, *.log
-├── requirements.txt              # Pinned dependencies
+├── requirements.txt              # Dependency lower bounds (no lock file yet)
+├── alembic.ini, alembic/         # Schema migrations (env.py reads DATABASE_URL; versions/0001_baseline_schema.py)
 ├── AGENTS.md, README.md          # Agent rules / setup guide (MASTER_SPEC.md and the PRD live at the workspace root, outside this repo)
 ├── placement_session.session     # Live Telethon file session (git-ignored; used when TELEGRAM_SESSION_STRING is empty)
 ├── verify_phase1.py              # Schema & model smoke tests (no DB required)
@@ -109,6 +110,7 @@ placement-engine/
 ├── verify_phase4.py              # LLM extraction & dispatch mock suite
 ├── verify_triage.py              # Triage Hub & role tracking regression suite
 ├── verify_settings.py            # Settings API & SystemConfig regression suite
+├── verify_schema.py              # Alembic baseline, UTC storage & constraint suite (Phase 0.2)
 ├── scripts/
 │   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
 │   ├── login_telegram.py         # Interactive login → placement_session.session (also prints a session string — removal in 0.6)
@@ -158,6 +160,7 @@ placement-engine/
 | `fastapi` | ≥ 0.111.0 | ASGI web framework |
 | `uvicorn[standard]` | ≥ 0.30.0 | ASGI server + hot-reload |
 | `sqlalchemy` | ≥ 2.0.30 | ORM, async engine (`select`/`update`/`returning`) |
+| `alembic` | ≥ 1.20.1 | Schema migrations (since Phase 0.2) and the startup revision check |
 | `asyncpg` | ≥ 0.29.0 | PostgreSQL async driver (prod) |
 | `aiosqlite` | ≥ 0.20.0 | SQLite async driver (dev + tests) |
 | `pydantic` | ≥ 2.7.0 | Schema validation, `model_validate_json` |
@@ -197,19 +200,22 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 
 ## 5. ORM Models (`app/models.py`)
 
+> The schema is owned by Alembic (`alembic/versions/0001_baseline_schema.py`, Phase 0.2); the app never creates or alters tables. Every datetime column uses the `UTCDateTime` type: values are converted to UTC before writing and always read back as aware UTC (SQLite stores the UTC wall-clock; PostgreSQL uses `TIMESTAMP WITH TIME ZONE`). A naive datetime is assumed to be UTC and raises `NaiveDatetimeWarning` — an error in every verify suite. Constraint and index names follow `NAMING_CONVENTION` in `app/database.py`.
+
 ### 5.1 `Company`
 | Column | Type | Notes |
 |---|---|---|
 | `id` | Integer PK | Auto-increment |
 | `name` | String(255) | Display name |
-| `normalized_name` | String(255) UNIQUE | Lowercase stripped; lookup key. Globally unique today (blocks the same name in MAIN and TEST); `(normalized_name, environment_type)` planned in 0.2 |
+| `normalized_name` | String(255), indexed | Lowercase stripped; lookup key. **Unique per environment** — `UNIQUE (normalized_name, environment_type)` since 0.2, so MAIN and TEST may share a name. ⚠ Extraction-time name lookups still ignore the environment until 0.5 |
 | `environment_type` | String(16) | `MAIN` \| `TEST` (default `MAIN`) |
 | `main_feed_msg_id` | BigInteger | Single-ID column — **never written by any code path** (no thread stitching yet) |
+| `invite_token` | String(128), indexed | Invite hash or public username the subchannel was joined from — added in 0.2, written from 0.4 |
 | `subchannel_id` | BigInteger UNIQUE | Telegram channel ID for routing |
 | `tracking_mode` | String(32) | `ELIGIBLE` \| `SILENT_TRACK` \| `IGNORED` — legacy company-level mode; can drift from role-level modes (see §0.1 invariant 2) |
 | `is_active` | Boolean | Soft-delete flag |
 | `is_custom` | Boolean | Manual entry vs Telegram-discovered |
-| `created_at` | DateTime(tz) | UTC default |
+| `created_at` | UTCDateTime | UTC default |
 
 **Relationships:** `role_tracks` (cascade delete), `timeline_events` (cascade delete)
 
@@ -227,8 +233,9 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `is_triaged` | Boolean | `False` = pending in Triage Hub |
 | `lifecycle_status` | String(64) | `APPLICATION_WINDOW` \| `INTERVIEWS` \| … |
 | `latest_status_note` | Text | Non-temporal status (e.g. "Shortlists delayed") |
-| `created_at` | DateTime(tz) | UTC default |
-| `updated_at` | DateTime(tz) | Auto-updated on write |
+| `latest_note_kind` | String(32) | `CRITERIA_RELAXATION` \| `GENERAL` — added in 0.2, written from 0.5 (only relaxations may re-open a SILENT_TRACK role, invariant 6) |
+| `created_at` | UTCDateTime | UTC default |
+| `updated_at` | UTCDateTime | Auto-updated on write |
 
 ### 5.3 `TimelineEvent`
 | Column | Type | Notes |
@@ -239,14 +246,16 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `event_type` | String(64) | `IRIS_DEADLINE` \| `FORM_SUBMISSION` \| `PPT` \| `OA_WINDOW` \| `INTERVIEW` \| `CUSTOM` |
 | `title` | String(255) | Human-readable label |
 | `action_link` | Text | Form URL, OA portal, etc. |
-| `start_time` | DateTime(tz) | Optional event start |
-| `end_time` | DateTime(tz) NOT NULL | Deadline — drives all state logic |
+| `start_time` | UTCDateTime | Optional event start |
+| `end_time` | UTCDateTime NOT NULL | Deadline — drives all state logic |
 | `user_status` | String(32) | `PENDING` \| `COMPLETED` |
-| `completed_at` | DateTime(tz) | Timestamp of user completion |
+| `completed_at` | UTCDateTime | Timestamp of user completion |
 | `is_custom` | Boolean | **Currently always `True`** — `crud.create_custom_event` hardcodes it, including for LLM-created events; not a reliable provenance flag |
 | `is_deleted` | Boolean | Soft-delete flag (`default=False`) |
 | `version` | Integer | Form replacement counter |
-| `created_at` | DateTime(tz) | |
+| `needs_review` / `review_reason` | Boolean / Text | Uncertain extractions are kept but flagged for the user (recall-first) — added in 0.2, written from 0.5 |
+| `source_chat_id` / `source_message_id` | BigInteger | Telegram message that last created or updated the event (provenance, deep links); composite index `ix_timeline_events_source` — added in 0.2, written from 0.4/0.5 |
+| `created_at` | UTCDateTime | |
 
 **Computed Property — `display_state`:**
 ```
@@ -255,7 +264,21 @@ user_status=PENDING  + end_time < now  → "MISSED"           (Red badge)
 user_status=COMPLETED + end_time > now → "COMPLETED_ACTIVE" (Green badge)
 user_status=COMPLETED + end_time < now → "COMPLETED_EXPIRED"(Grey badge)
 ```
-> ⚠ `display_state` coerces SQLite's naive datetimes with `.replace(tzinfo=timezone.utc)`, which is wrong for rows written with an IST offset (gap H1). Replaced by the `UTCDateTime` column type in Phase 0.2.
+> ✅ Since 0.2, `display_state` compares against an aware UTC `end_time` (`UTCDateTime`), so an IST deadline flips to MISSED at the right instant. The old naive→UTC coercion, which mis-read IST-written rows by 5.5 h (gap H1), is gone.
+
+### 5.4 `MessageLedger` (`message_ledger`, added in 0.2 — used from 0.3/0.4)
+One row per processed Telegram message: idempotency, the catch-up cursor (max `message_id` per chat) and retry scheduling.
+
+| Column | Type | Notes |
+|---|---|---|
+| `chat_id`, `message_id` | BigInteger, composite PK | One row per message |
+| `status` | String(16) | `DONE` \| `FAILED` \| `SKIPPED` (check constraint) |
+| `reason` | Text | Skip reason or last error |
+| `attempts`, `next_attempt_at` | Integer, UTCDateTime | Retry scheduling; index `ix_message_ledger_retry (status, next_attempt_at)` |
+| `processed_at` | UTCDateTime | Last update |
+
+### 5.5 `WorkerStatus` (`worker_status`, added in 0.2 — used from 0.3)
+Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker and read by the API's status endpoint: `telegram_state`, `last_update_at`, `last_llm_ok_at`, `last_error`, `catchup_at`, `heartbeat_at`.
 
 > **⚠ Schema Gap vs MASTER_SPEC:** `event_type` currently uses Phase 2 naming (`OA_WINDOW`, `IRIS_DEADLINE`) while spec/LLM schema uses `event_category` with values `OA`, `IRIS`, `FORM`, `GD`, etc. Needs a unified enum before the extractor can write to DB.
 > **⚠ Schema Gap:** `round_number` (INTEGER) is absent — required for state-aware OA/Interview round counting.
@@ -467,7 +490,7 @@ Each handler call opens an **isolated `AsyncSession`** — decoupled from HTTP r
 ```
 Startup
   │
-  ├─ 1. create_all() → Bootstrap DB schema (SQLite dev / PostgreSQL prod)
+  ├─ 1. assert_schema_current() → refuse to start unless the DB is at the Alembic head
   │
   ├─ 2. [if TELEGRAM_API_ID != 0]
   │      ├─ create_telegram_client() → StringSession or file session
@@ -485,7 +508,7 @@ Shutdown
   └─ engine.dispose()
 ```
 
-> ⚠ Step 1 also runs two `ALTER TABLE` statements inside the same transaction with errors suppressed — harmless on SQLite, but on PostgreSQL it would roll back the whole schema (gap H7). Replaced by Alembic in Phase 0.2. Telethon shares this process (gap H8); the API/worker split is Phase 0.3.
+> ✅ Since Phase 0.2 the app never creates or alters tables: `alembic upgrade head` owns the schema, and startup fails with a clear message when the database isn't at the head revision (the old `create_all` + suppressed `ALTER`s, gap H7, are gone). ⚠ Telethon still shares this process (gap H8) until the Phase 0.3 API/worker split.
 
 ---
 
@@ -515,13 +538,15 @@ All scripts are self-contained and require no live credentials or running server
 |---|---|---|
 | `verify_phase1.py` | ORM model instantiation, all 4 `display_state` branches, Pydantic schema round-trip | None |
 | `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline recovery, HTTP router tests (`POST /companies/` mobile contract, `GET /companies/{id}/events` 200/404, timeline `?env=MAIN\|TEST` isolation, complete/uncomplete) | In-memory SQLite |
-| `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects — ⚠ no in-memory engine; listener tests read the configured DB (patch in 0.2) |
+| `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects + in-memory SQLite (patched in 0.2) |
 | `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM, EXTEND_DEADLINE, prompt context injection, dirty subchannel payloads (missing company/drive), e2e CREATE_EVENT, e2e STATUS_NOTE, RESCHEDULE_EVENT start/end updates | In-memory SQLite |
 | `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
 | `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
+| `verify_schema.py` | Alembic upgrade → downgrade → upgrade + drift check, startup revision check, UTC round-trip, IST deadline flips to MISSED on time, naive-datetime policy, per-environment name uniqueness, foreign keys, ledger/status constraints | In-memory SQLite |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
 > ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
+> Since 0.2, every suite enforces SQLite foreign keys (as PostgreSQL does) and turns naive datetimes into errors (`NaiveDatetimeWarning`).
 
 Run regression suites:
 ```bash
@@ -542,8 +567,8 @@ python scripts/test_live_ingestion.py
 
 | Item | Scope | Status |
 |---|---|---|
-| 0.1 | Docs truth pass (this revision) | ✅ Done — pending owner review |
-| 0.2 | Schema foundation: Alembic baseline, `UTCDateTime`, env-scoped company uniqueness, `message_ledger` / `worker_status` tables, SQLite pragmas | ⏳ Next |
+| 0.1 | Docs truth pass; root spec edits approved and applied 2026-10-23 | ✅ Done — reviewed |
+| 0.2 | Schema foundation: Alembic baseline, `UTCDateTime`, env-scoped company uniqueness, `message_ledger` / `worker_status` tables, SQLite pragmas | ✅ Done — pending owner review |
 | 0.3 | API / worker process split; feed refresh, catch-up and retry loops | Planned |
 | 0.4 | Ingestion: pre-filter, invite-post extraction, join policy, debouncer, IGNORED ingestion gate | Planned |
 | 0.5 | Extraction & dispatch: post timestamps, event IDs, regex-tier removal, invariants 1–9 | Planned |
@@ -562,7 +587,7 @@ Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN fee
 | — | **Pre-Interview State Engine** | `app/ai/dispatcher.py`, `app/crud.py` | ⚠ **Delivered with verified defects (H3, H4, M1, M2)** — Canonical time normalization (live events +2h, deadlines same timestamp), non-existent event fallbacks (`EXTEND_DEADLINE`/`RESCHEDULE_EVENT`/`REPLACE_FORM` → `CREATE_EVENT`), form replacement versioning with PENDING reset, soft-delete filtering, and criteria relaxation re-triage via `crud.flag_for_retriage()`. |
 | — | **Zero-Dependency IST Timezone** | `app/ai/prompts.py`, `app/ai/schemas.py` | ✅ **Resolved** — Native UTC+05:30 `timezone` representation eliminating Windows `tzdata` crashes. |
 | — | **Dual-Tier AI Extraction & Fallbacks**| `app/ai/extractor.py`, `app/ai/rule_extractor.py` | ⚠ **Partly** — `max_tokens=4096` and the in-flight JSON fallback stay; the regex tier was verified harmful (C5) and is removed in 0.5. |
-| — | **Database Isolation & Sanitization** | `verify_*.py`, `scripts/clean_test_data.py` | ⚠ **Mostly** — four suites bind `:memory:`; `verify_phase3.py` does not (fix in 0.2). `dev.db` was never committed (git history verified 2026-10-21). |
+| — | **Database Isolation & Sanitization** | `verify_*.py`, `scripts/clean_test_data.py` | ✅ **Resolved (Phase 0.2)** — every database-touching suite binds `:memory:` (`verify_phase3.py` patched). `dev.db` was never committed (git history verified 2026-10-21). |
 
 ### P1 — Schema Conformance
 
@@ -593,7 +618,7 @@ Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN fee
 |---|---|---|---|
 | 15 | **`Dockerfile`** | `Dockerfile` | Multi-stage build; Uvicorn entry on port 8080 |
 | 16 | **`docker-compose.yml`** | `docker-compose.yml` | Services: `api` + `postgres:16`; named volume for DB persistence |
-| 17 | **Alembic migrations** | `alembic/` | Replace `create_all()` lifespan call with versioned migration runner |
+| 17 | **Alembic migrations** | `alembic/` | ✅ **Resolved (Phase 0.2)** — baseline revision `0001`; the app only verifies the revision at startup |
 | 18 | **Switch `DATABASE_URL` to PostgreSQL** | `.env` (prod) | `asyncpg` driver; `BIGINT[]` array types only available in PostgreSQL |
 
 ---
@@ -618,6 +643,9 @@ e9a894e feat(ecosystem): fallback extend to create, normalize event times, add i
 ```bash
 # Activate venv
 .\venv\Scripts\Activate.ps1
+
+# Apply schema migrations (required: the server refuses to start otherwise)
+python -m alembic upgrade head
 
 # Start server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

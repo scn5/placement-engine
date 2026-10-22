@@ -3,7 +3,8 @@ app/main.py
 FastAPI application entry-point — Phase 4 update.
 
 Lifespan sequence:
-  1. Bootstrap PostgreSQL schema (create_all).
+  1. Verify the database is at the Alembic head revision (the schema itself is
+     created and migrated only by `alembic upgrade head`).
   2. Optionally start Telethon ingestion engine (requires TELEGRAM_API_ID).
   3. Wire telegram_service.set_payload_handler → dispatcher.process_and_dispatch.
   4. On shutdown: flush debounce buffers, cancel background task, disconnect client.
@@ -17,8 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import AsyncSessionLocal, engine
-from app.models import Base  # noqa: F401 — registers all ORM models
+from app.database import AsyncSessionLocal, assert_schema_current, engine
 from app.routers import companies, events, triage
 from app.routers import settings as settings_router
 
@@ -27,18 +27,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # ── 1. Database schema bootstrap ──────────────────────────────────────
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        with suppress(Exception):
-            await conn.exec_driver_sql(
-                "ALTER TABLE companies ADD COLUMN environment_type VARCHAR(16) NOT NULL DEFAULT 'MAIN'"
-            )
-        with suppress(Exception):
-            await conn.exec_driver_sql(
-                "ALTER TABLE timeline_events ADD COLUMN is_deleted BOOLEAN DEFAULT 0"
-            )
-    logger.info("Database schema ready.")
+    # ── 1. Database schema check (Alembic owns the schema) ─────────────────
+    await assert_schema_current()
+    logger.info("Database schema is at the Alembic head revision.")
 
     # ── 2. Telegram ingestion engine (optional) ────────────────────────────
     tg_client = None

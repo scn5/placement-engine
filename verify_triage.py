@@ -38,11 +38,17 @@ _TestSession = async_sessionmaker(
 )
 _db_module.engine = _test_engine
 _db_module.AsyncSessionLocal = _TestSession
+_db_module.install_sqlite_pragmas(_test_engine)  # enforce foreign keys like production
 
 from sqlalchemy import select
+import warnings
+
 from app import crud, models, schemas
-from app.models import Base
+from app.models import Base, NaiveDatetimeWarning
 from app.routers.triage import flag_for_retriage
+
+# Every datetime handed to the ORM must be timezone-aware.
+warnings.simplefilter("error", NaiveDatetimeWarning)
 
 
 def utc(offset_days: float = 0.0) -> datetime:

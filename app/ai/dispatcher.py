@@ -20,6 +20,8 @@ from app.ai.schemas import ExtractedEvent, LLMExtractionResult
 
 logger = logging.getLogger(__name__)
 
+_IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+
 
 # ---------------------------------------------------------------------------
 # Company resolution
@@ -69,8 +71,9 @@ async def _build_context(
                 "id": e.id,
                 "title": e.title,
                 "event_type": e.event_type,
+                # Stored as UTC; shown to the LLM in IST like the announcements.
                 "end_time": (
-                    e.end_time.isoformat()
+                    e.end_time.astimezone(_IST).isoformat()
                     if e.end_time
                     else "unknown"
                 ),

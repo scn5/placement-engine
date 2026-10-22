@@ -99,6 +99,7 @@ placement-engine/
 │   ├── clean_test_data.py      # Cleans test/sandbox records from MAIN environment
 │   ├── login_telegram.py       # CLI interactive MTProto session authenticator
 │   └── test_live_ingestion.py  # Live sandbox integration harness
+├── alembic/                    # Schema migrations (config in alembic.ini; target = DATABASE_URL)
 ├── requirements.txt            # Production Python dependencies
 ├── .env.example                # Environment variable reference
 └── verify_*.py                 # Phase verification and test suites
@@ -170,6 +171,9 @@ Follow the interactive prompt to enter the SMS or in-app login code and 2FA pass
 ### 5. Start Backend Server
 
 ```bash
+# Create / migrate the schema first — the server refuses to start otherwise
+python -m alembic upgrade head
+
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -183,7 +187,7 @@ Interactive OpenAPI documentation will be accessible at:
 
 ## Verification & Testing
 
-The repository includes verification suites that run against in-memory SQLite with the LLM and Telegram mocked. ⚠ `verify_phase3.py` does not yet bind an in-memory engine (it can read the configured database; fix in Phase 0.2), and no suite contains realistic multi-sentence announcements yet.
+The repository includes verification suites that run against in-memory SQLite with the LLM and Telegram mocked. Every suite enforces foreign keys and treats naive datetimes as errors. ⚠ No suite contains realistic multi-sentence announcements yet.
 
 ```bash
 # Run all verification suites:
@@ -193,6 +197,7 @@ python verify_phase3.py   # Two-tier Telegram ingestion & debouncer
 python verify_phase4.py   # LLM structured extraction & state-machine actions
 python verify_triage.py   # Triage hub, criteria relaxation, and role tracking
 python verify_settings.py # Student profile settings API
+python verify_schema.py   # Alembic migrations, UTC storage and database constraints
 ```
 
 ---

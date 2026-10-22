@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +19,9 @@ class TimelineEventCreate(TimelineEventBase):
     company_id: int
     role_track_id: Optional[int] = None
     is_custom: bool = False
+    # Inputs must carry a UTC offset; a naive time would otherwise be read as UTC.
+    start_time: Optional[AwareDatetime] = None
+    end_time: AwareDatetime
 
 
 class TimelineEventResponse(TimelineEventBase):
@@ -150,12 +153,12 @@ class ToggleTrackingPayload(BaseModel):
 
 
 class ExtendDeadlinePayload(BaseModel):
-    new_end_time: datetime
+    new_end_time: AwareDatetime
 
 
 class ReplaceFormPayload(BaseModel):
     new_form_link: str
-    new_end_time: datetime
+    new_end_time: AwareDatetime
     title: Optional[str] = "Google Form Submission"
 
 

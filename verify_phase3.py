@@ -17,6 +17,37 @@ from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
+# Patch DB engine BEFORE importing app modules (same pattern as Phase 2/4):
+# the listener reads companies through app.database (e.g. _is_known_subchannel),
+# so it must never reach the configured database.
+# ---------------------------------------------------------------------------
+import warnings
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+import app.database as _db_module
+
+_test_engine = create_async_engine(
+    "sqlite+aiosqlite:///:memory:",
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
+_TestSession = async_sessionmaker(
+    bind=_test_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+)
+_db_module.engine = _test_engine
+_db_module.AsyncSessionLocal = _TestSession
+_db_module.install_sqlite_pragmas(_test_engine)  # enforce foreign keys like production
+
+from app.models import Base, NaiveDatetimeWarning
+
+# Every datetime handed to the ORM must be timezone-aware.
+warnings.simplefilter("error", NaiveDatetimeWarning)
+
+# ---------------------------------------------------------------------------
 # Import application modules under test
 # ---------------------------------------------------------------------------
 from app.telegram.pre_filter import should_filter_noise
@@ -305,6 +336,10 @@ async def test_listener_payload_handler() -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    # Bootstrap schema in the in-memory database
+    async with _test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     print("\nRunning Phase 3 verification suite…\n")
 
     await test_pre_filter()
@@ -314,6 +349,7 @@ async def main() -> None:
     await test_reply_to_stitching()
     await test_listener_payload_handler()
 
+    await _test_engine.dispose()
     print("\n✅ Phase 3 Telegram Ingestion Engine Verified Successfully!")
 
 

@@ -1,10 +1,14 @@
 import sys
+import warnings
 from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine, get_db
 from app.main import app
-from app.models import Company, RoleTrack, TimelineEvent
+from app.models import Company, NaiveDatetimeWarning, RoleTrack, TimelineEvent
+
+# Every datetime handed to the ORM must be timezone-aware.
+warnings.simplefilter("error", NaiveDatetimeWarning)
 from app.schemas import (
     CompanyCreate,
     CompanyResponse,
