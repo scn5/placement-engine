@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from sqlalchemy import and_, false, func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -552,6 +552,56 @@ async def link_or_create_subchannel_company(
     await db.commit()
     await db.refresh(new_company)
     return new_company
+
+
+def _ingestible_company_filters(environments: Iterable[str]) -> list:
+    """Companies whose channel the ingestion worker may read (PROJECT_STATE §0.1
+    invariants 2–3): active, in an ingested environment, and not effectively
+    IGNORED — i.e. not IGNORED at company level, and not every role IGNORED."""
+    has_roles = (
+        select(models.RoleTrack.id)
+        .where(models.RoleTrack.company_id == models.Company.id)
+        .exists()
+    )
+    has_tracked_role = (
+        select(models.RoleTrack.id)
+        .where(
+            models.RoleTrack.company_id == models.Company.id,
+            models.RoleTrack.tracking_mode != "IGNORED",
+        )
+        .exists()
+    )
+    return [
+        models.Company.is_active == True,  # noqa: E712
+        models.Company.environment_type.in_(list(environments)),
+        models.Company.tracking_mode != "IGNORED",
+        or_(~has_roles, has_tracked_role),
+    ]
+
+
+async def get_ingestible_subchannel_ids(
+    db: AsyncSession, environments: Iterable[str]
+) -> set[int]:
+    """Subchannel IDs of every company the worker may read."""
+    result = await db.execute(
+        select(models.Company.subchannel_id).where(
+            models.Company.subchannel_id.is_not(None),
+            *_ingestible_company_filters(environments),
+        )
+    )
+    return {int(chat_id) for chat_id in result.scalars().all()}
+
+
+async def is_company_ingestible(
+    db: AsyncSession, company_id: int, environments: Iterable[str]
+) -> bool:
+    result = await db.execute(
+        select(models.Company.id).where(
+            models.Company.id == company_id,
+            *_ingestible_company_filters(environments),
+        )
+    )
+    return result.first() is not None
 
 
 async def get_company_by_subchannel_id(

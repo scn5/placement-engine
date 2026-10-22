@@ -76,6 +76,20 @@ class ChannelDebouncer:
         for chat_id in list(self._slots.keys()):
             await self.flush(chat_id, callback)
 
+    def pending_ids(self, chat_id: int) -> set:
+        """Message ids currently buffered for *chat_id* (not yet dispatched)."""
+        slot = self._slots.get(chat_id)
+        return {m.get("id") for m in slot["messages"]} if slot else set()
+
+    async def discard(self, chat_id: int) -> int:
+        """Drop *chat_id*'s buffer without dispatching it; returns how many
+        messages were discarded."""
+        slot = self._slots.pop(chat_id, None)
+        if not slot:
+            return 0
+        await self._cancel_slot_timer(slot)
+        return len(slot["messages"])
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

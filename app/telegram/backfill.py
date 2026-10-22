@@ -27,6 +27,35 @@ def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+async def fetch_messages_since(
+    client: "TelegramClient",
+    entity,
+    min_id: int = 0,
+    max_age: timedelta = timedelta(hours=_BACKFILL_WINDOW_HOURS),
+    limit: int = 200,
+) -> list:
+    """Raw messages newer than *min_id* and younger than *max_age*, oldest first.
+
+    Used by the worker's catch-up; the messages are routed through the listener
+    like live events. Telethon iterates newest-first, so the scan stops at the
+    first message older than the cutoff.
+    """
+    cutoff = datetime.now(timezone.utc) - max_age
+    found = []
+    async for message in client.iter_messages(entity, min_id=min_id, limit=limit):
+        msg_date = _to_utc(getattr(message, "date", None))
+        if msg_date is None or msg_date < cutoff:
+            break
+        found.append(message)
+    if len(found) == limit:
+        logger.warning(
+            "Catch-up for entity=%s hit the %d-message cap; older messages after id %s were not fetched",
+            getattr(entity, "id", entity), limit, min_id,
+        )
+    found.reverse()
+    return found
+
+
 async def fetch_24h_backfill(client: "TelegramClient", entity) -> List[dict]:
     """Fetch the last 24 hours of messages from *entity* in chronological order.
 

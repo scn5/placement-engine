@@ -88,13 +88,15 @@ placement-engine/
 │   │   ├── backfill.py         # 24-hour message backfill for newly joined channels
 │   │   ├── client.py           # Telethon client factory
 │   │   ├── debouncer.py        # In-memory sliding window debouncer
+│   │   ├── ledger.py           # Per-message outcomes, catch-up cursor, retry backoff
 │   │   ├── listener.py         # Central two-tier Telegram event router
 │   │   └── pre_filter.py       # Rule-based chatter and noise gate
 │   ├── config.py               # Pydantic BaseSettings application configuration
 │   ├── crud.py                 # Async database queries and state-machine transitions
 │   ├── database.py             # SQLAlchemy 2.0 async engine and session factory
-│   ├── main.py                 # FastAPI application lifespan & payload bridge
-│   └── models.py               # Declarative SQLAlchemy ORM models
+│   ├── main.py                 # FastAPI application (API only)
+│   ├── models.py               # Declarative SQLAlchemy ORM models
+│   └── worker.py               # Ingestion worker: Telethon, dispatcher bridge, catch-up/retry/heartbeat loops
 ├── scripts/
 │   ├── clean_test_data.py      # Cleans test/sandbox records from MAIN environment
 │   ├── login_telegram.py       # CLI interactive MTProto session authenticator
@@ -168,17 +170,25 @@ python scripts/login_telegram.py
 ```
 Follow the interactive prompt to enter the SMS or in-app login code and 2FA password. This creates `placement_session.session`.
 
-### 5. Start Backend Server
+### 5. Start the API and the Ingestion Worker
+
+The backend runs as two processes: the **API** (no Telegram code) and the **ingestion worker**, which is the only process that talks to Telegram.
 
 ```bash
-# Create / migrate the schema first — the server refuses to start otherwise
+# Create / migrate the schema first — both processes refuse to start otherwise
 python -m alembic upgrade head
 
+# API
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Ingestion worker (separate terminal) — exactly ONE per Telegram session
+python -m app.worker
 ```
 
 > [!WARNING]
-> With `TELEGRAM_API_ID` set, the server connects your **live** Telegram session, processes the configured feeds and auto-joins invite links. For API-only work, set `TELEGRAM_API_ID=0` for that process only — don't edit `.env`.
+> With `TELEGRAM_API_ID` set, **the worker** connects your **live** Telegram session, processes the feeds listed in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins invite links found there. Never run two workers on the same session — Telegram revokes it. To keep a worker offline, set `TELEGRAM_API_ID=0` for that process only; don't edit `.env`.
+>
+> Worker exit codes: `0` disabled or stopped cleanly, `1` listener stopped (safe to restart), `2` session unauthorized/revoked (re-run `scripts/login_telegram.py`).
 Interactive OpenAPI documentation will be accessible at:
 - **Swagger UI**: `http://localhost:8000/docs`
 - **ReDoc**: `http://localhost:8000/redoc`
@@ -198,6 +208,7 @@ python verify_phase4.py   # LLM structured extraction & state-machine actions
 python verify_triage.py   # Triage hub, criteria relaxation, and role tracking
 python verify_settings.py # Student profile settings API
 python verify_schema.py   # Alembic migrations, UTC storage and database constraints
+python verify_worker.py   # Ingestion worker, ledger, catch-up and retries (Telegram fully mocked)
 ```
 
 ---

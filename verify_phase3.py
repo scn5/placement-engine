@@ -18,8 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # Patch DB engine BEFORE importing app modules (same pattern as Phase 2/4):
-# the listener reads companies through app.database (e.g. _is_known_subchannel),
-# so it must never reach the configured database.
+# the listener reads companies and writes the message ledger through
+# app.database, so it must never reach the configured database.
 # ---------------------------------------------------------------------------
 import warnings
 

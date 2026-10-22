@@ -29,7 +29,17 @@ def create_telegram_client() -> TelegramClient:
     If TELEGRAM_SESSION_STRING is set in .env, uses StringSession.
     Otherwise uses the local SQLite session file at PROJECT_ROOT / TELEGRAM_SESSION_NAME
     (e.g. `placement_session.session` created by `scripts/login_telegram.py`).
+
+    Refuses to build a client while Telegram is disabled (TELEGRAM_API_ID=0 or no
+    API hash): even constructing one loads the live session's auth key, and
+    connect() would reach Telegram's servers.
     """
+    if not settings.telegram_enabled:
+        raise RuntimeError(
+            "Telegram is disabled (TELEGRAM_API_ID=0 or TELEGRAM_API_HASH empty); "
+            "refusing to create a client."
+        )
+
     session: Union[StringSession, str]
     if settings.TELEGRAM_SESSION_STRING:
         session = StringSession(settings.TELEGRAM_SESSION_STRING)

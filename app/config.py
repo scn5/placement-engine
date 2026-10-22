@@ -1,14 +1,17 @@
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ENVIRONMENTS = {"MAIN", "TEST"}
 
 
 class Settings(BaseSettings):
-    # Database
-    DATABASE_URL: str = "postgresql+asyncpg://antitele:StrongPasswordHere123!@localhost:5432/anti_tele_db"
+    # Database — production must set DATABASE_URL explicitly.
+    DATABASE_URL: str = "sqlite+aiosqlite:///./dev.db"
     APP_ENV: str = "development"
 
-    # Telegram MTProto credentials
+    # Telegram MTProto credentials (TELEGRAM_API_ID=0 disables the ingestion worker)
     TELEGRAM_API_ID: int = 0
     TELEGRAM_API_HASH: str = ""
     TELEGRAM_SESSION_NAME: str = "placement_session"
@@ -18,9 +21,22 @@ class Settings(BaseSettings):
     # Channel routing
     MAIN_FEED_CHANNEL_ID: Optional[int] = None
     TEST_FEED_CHANNEL_ID: Optional[int] = None
+    # Feeds the worker reads, comma-separated. Defaults to TEST only, so a
+    # development machine never processes the real feed by accident;
+    # production sets "MAIN,TEST".
+    INGEST_ENVIRONMENTS: str = "TEST"
 
     # Debounce window (seconds); reduce to 0.1 in test suites
     DEBOUNCE_DELAY_SECONDS: float = 90.0
+
+    # Ingestion worker loops (seconds / hours)
+    CONFIG_REFRESH_SECONDS: float = 60.0
+    CATCHUP_INTERVAL_SECONDS: float = 900.0
+    CATCHUP_MAX_AGE_HOURS: float = 72.0
+    RETRY_POLL_SECONDS: float = 60.0
+    HEARTBEAT_SECONDS: float = 30.0
+    # Optional dead-man's-switch URL, pinged every 5 minutes while Telegram is connected.
+    DEADMAN_URL: Optional[str] = None
 
     # LLM inference (OpenAI-compatible endpoint)
     LLM_API_KEY: str = ""
@@ -29,6 +45,25 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "openai/gpt-oss-20b"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @field_validator("INGEST_ENVIRONMENTS")
+    @classmethod
+    def _validate_environments(cls, value: str) -> str:
+        envs = sorted({part.strip().upper() for part in value.split(",") if part.strip()})
+        unknown = set(envs) - _ENVIRONMENTS
+        if not envs or unknown:
+            raise ValueError(
+                f"INGEST_ENVIRONMENTS must list MAIN and/or TEST, got {value!r}"
+            )
+        return ",".join(envs)
+
+    @property
+    def ingest_environments(self) -> frozenset[str]:
+        return frozenset(self.INGEST_ENVIRONMENTS.split(","))
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.TELEGRAM_API_ID) and bool(self.TELEGRAM_API_HASH)
 
 
 settings = Settings()
