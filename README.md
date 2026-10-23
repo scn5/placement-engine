@@ -50,9 +50,9 @@ The **Placement Engine** is a single-tenant backend service that monitors offici
 ## Key Capabilities
 
 1. **Two-Tier Telegram Ingestion**:
-   - **Tier 1 (Root Feeds)**: Monitors designated broadcast feeds (`MAIN` and `TEST`) for company announcement threads and private/public invite links (`t.me/+...` or `t.me/...`).
-   - **Tier 2 (Company Subchannels)**: Automatically requests to join detected subchannels, initializes them into `SILENT_TRACK` mode, runs a 24-hour backfill bootstrap, and registers them in the dynamic monitoring pool.
-   - **Debouncing & Pre-Filtering**: Filters coordinator chatter/emojis and buffers multi-part messages over a sliding window (default: 90 seconds) to feed coherent blocks to the LLM.
+   - **Tier 1 (Root Feeds)**: Monitors the designated broadcast channels (`MAIN` and `TEST`) for company announcements and invite links (`t.me/+...` or `t.me/<channel>`). An invite post is extracted together with its company.
+   - **Tier 2 (Company Subchannels)**: Joins linked channels under a strict join policy (channels and supergroups only — never persons, bots, permalinks or approval-only invites), creates the company in `SILENT_TRACK` mode for Triage, runs a 24-hour backfill, and monitors it. In supergroups only admins' posts count.
+   - **Debouncing**: Every message with visible text is kept (reactions are ignored). Multi-part messages are buffered over a sliding window (default 90 s, at most 120 s) and sent to the LLM in batches of up to 40.
 
 2. **AI Structured Extraction Engine**:
    - Uses **`openai/gpt-oss-20b`** hosted on Groq for ultra-low latency inference.
@@ -85,17 +85,19 @@ placement-engine/
 │   │   ├── settings.py         # Student profile and system config API
 │   │   └── triage.py           # Pending triage hub accept/ignore endpoints
 │   ├── telegram/
-│   │   ├── backfill.py         # 24-hour message backfill for newly joined channels
+│   │   ├── backfill.py         # Bounded message fetch for catch-up and the 24-hour backfill
 │   │   ├── client.py           # Telethon client factory
 │   │   ├── debouncer.py        # In-memory sliding window debouncer
+│   │   ├── join_policy.py      # Which invite links are followed and which chats may be joined
 │   │   ├── ledger.py           # Per-message outcomes, catch-up cursor, retry backoff
 │   │   ├── listener.py         # Central two-tier Telegram event router
-│   │   └── pre_filter.py       # Rule-based chatter and noise gate
+│   │   └── pre_filter.py       # Skips only messages with no visible text
 │   ├── config.py               # Pydantic BaseSettings application configuration
 │   ├── crud.py                 # Async database queries and state-machine transitions
 │   ├── database.py             # SQLAlchemy 2.0 async engine and session factory
 │   ├── main.py                 # FastAPI application (API only)
 │   ├── models.py               # Declarative SQLAlchemy ORM models
+│   ├── sources.py              # Where a message batch came from (listener → dispatcher)
 │   └── worker.py               # Ingestion worker: Telethon, dispatcher bridge, catch-up/retry/heartbeat loops
 ├── scripts/
 │   ├── clean_test_data.py      # Cleans test/sandbox records from MAIN environment
@@ -154,9 +156,10 @@ cp .env.example .env
 | `TELEGRAM_SESSION_NAME`| Name of local session file (used when no session string is set) | `placement_session` |
 | `TELEGRAM_SESSION_STRING`| Optional Telethon `StringSession`; takes precedence over the file | `""` |
 | `TELEGRAM_PHONE` | Your Telegram phone number for initial authentication | `""` |
-| `MAIN_FEED_CHANNEL_ID` | Production Telegram broadcast channel ID | `None` |
+| `MAIN_FEED_CHANNEL_ID` | Production Telegram broadcast channel ID (`-100…`; groups, persons and bots are refused) | `None` |
 | `TEST_FEED_CHANNEL_ID` | Sandbox Telegram test channel ID | `None` |
 | `DEBOUNCE_DELAY_SECONDS`| Buffer window for message bursts | `90.0` |
+| `DEBOUNCE_MAX_WAIT_SECONDS`| Longest a busy chat's buffer waits before it is sent | `120.0` |
 | `GROQ_API_KEY` / `LLM_API_KEY` | API key for the extraction LLM (`LLM_API_KEY` wins if both are set) | `""` |
 | `LLM_BASE_URL` | OpenAI-compatible endpoint | `https://api.groq.com/openai/v1` |
 | `LLM_MODEL` | LLM model identifier | `openai/gpt-oss-20b` |
@@ -186,7 +189,7 @@ python -m app.worker
 ```
 
 > [!WARNING]
-> With `TELEGRAM_API_ID` set, **the worker** connects your **live** Telegram session, processes the feeds listed in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins invite links found there. Never run two workers on the same session — Telegram revokes it. To keep a worker offline, set `TELEGRAM_API_ID=0` for that process only; don't edit `.env`.
+> With `TELEGRAM_API_ID` set, **the worker** connects your **live** Telegram session, processes the feeds listed in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins the channel invite links posted there, under the join policy. Never run two workers on the same session — Telegram revokes it. To keep a worker offline, set `TELEGRAM_API_ID=0` for that process only; don't edit `.env`.
 >
 > Worker exit codes: `0` disabled or stopped cleanly, `1` listener stopped (safe to restart), `2` session unauthorized/revoked (re-run `scripts/login_telegram.py`).
 Interactive OpenAPI documentation will be accessible at:
@@ -209,6 +212,7 @@ python verify_triage.py   # Triage hub, criteria relaxation, and role tracking
 python verify_settings.py # Student profile settings API
 python verify_schema.py   # Alembic migrations, UTC storage and database constraints
 python verify_worker.py   # Ingestion worker, ledger, catch-up and retries (Telegram fully mocked)
+python verify_ingestion.py # Join policy, invite posts, edits/reactions, supergroups, debouncer limits
 ```
 
 ---

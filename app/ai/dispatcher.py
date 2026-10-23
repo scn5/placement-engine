@@ -3,8 +3,8 @@ app/ai/dispatcher.py
 State-machine dispatcher: resolves Company, builds context, calls the LLM
 extractor, then executes the appropriate CRUD mutations per extracted action.
 
-Entry point: process_and_dispatch(chat_id, context_header, messages, db)
-Called by the Telegram payload handler registered in app/main.py lifespan.
+Entry point: process_and_dispatch(chat_id, context_header, messages, db, ...)
+Called by the ingestion worker's payload handler (app/worker.py).
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -17,6 +17,7 @@ from app import crud, models
 from app import schemas as app_schemas
 from app.ai import extractor
 from app.ai.schemas import ExtractedEvent, LLMExtractionResult
+from app.sources import SubchannelLink
 
 logger = logging.getLogger(__name__)
 
@@ -396,15 +397,23 @@ async def process_and_dispatch(
     context_header: str,
     messages: List[dict],
     db: AsyncSession,
+    company_id: Optional[int] = None,
+    subchannel: Optional[SubchannelLink] = None,
 ) -> None:
     """Pipeline entry point called by the Telegram payload handler.
 
     Steps:
       1. Normalize the raw message block into a single text string.
-      2. Resolve Company by subchannel_id; fall back to LLM-extracted name.
+      2. Resolve the company. A company known from the source is authoritative
+         for every action: *company_id* (a reply to, or re-post of, its invite
+         post) or the channel an invite post just joined (*subchannel*).
+         Otherwise: by subchannel_id, falling back to the LLM-extracted name.
       3. Build current schedule context for prompt temporal injection.
-      4. Run LLM extraction → LLMExtractionResult.
-      5. Execute state-machine mutations, silently dropping INDIVIDUAL-scope events.
+      4. Run LLM extraction → LLMExtractionResult; an invite post's channel is
+         linked to the extracted company name, else to the channel title.
+      5. Execute state-machine mutations, silently dropping INDIVIDUAL-scope
+         events. Nothing is changed for an IGNORED or deleted company
+         (PROJECT_STATE §0.1 invariant 3).
     """
     # ── 1. Normalize text ───────────────────────────────────────────────────
     parts = []
@@ -419,8 +428,24 @@ async def process_and_dispatch(
         logger.debug("Empty text block for chat_id=%s — skipping.", chat_id)
         return
 
-    # ── 2. Resolve company by subchannel_id ─────────────────────────────────
-    company: Optional[models.Company] = await _find_company_by_subchannel(db, chat_id)
+    # ── 2. Resolve company ──────────────────────────────────────────────────
+    authoritative = company_id is not None or subchannel is not None
+    company: Optional[models.Company]
+    if company_id is not None:
+        company = await db.get(models.Company, company_id)
+        if company is None:
+            logger.warning("Company id=%s for chat_id=%s no longer exists — skipping.", company_id, chat_id)
+            return
+    elif subchannel is not None:
+        company = await crud.get_company_by_subchannel_id(db, subchannel.chat_id)
+    else:
+        company = await _find_company_by_subchannel(db, chat_id)
+
+    if company is not None and not await crud.is_company_trackable(db, company.id):
+        logger.info(
+            "Skipped chat_id=%s: company=%s is IGNORED or deleted.", chat_id, company.name
+        )
+        return
 
     # ── 3. Build schedule context (before LLM call so context is current) ───
     current_context = await _build_context(db, company)
@@ -430,8 +455,27 @@ async def process_and_dispatch(
         text_block, current_context
     )
 
+    # An invite post's channel is linked to the company the post is about.
+    if subchannel is not None and company is None:
+        company, newly_linked = await crud.link_or_create_subchannel_company(
+            db,
+            subchannel_id=subchannel.chat_id,
+            company_name=llm_result.company_name or subchannel.title,
+            environment_type=subchannel.environment,
+            fallback_name=subchannel.title,
+            invite_token=subchannel.invite_token,
+            main_feed_msg_id=subchannel.main_feed_msg_id,
+        )
+        logger.info(
+            "Linked subchannel_id=%s to company=%s (env=%s, newly linked=%s)",
+            subchannel.chat_id, company.name, company.environment_type, newly_linked,
+        )
+        if not await crud.is_company_trackable(db, company.id):
+            logger.info("Company=%s is IGNORED or deleted: its invite post changes nothing.", company.name)
+            return
+
     # Fallback name resolution or creation if subchannel isn't mapped yet
-    if company is None and llm_result.company_name:
+    if not authoritative and company is None and llm_result.company_name:
         company = await _find_company_by_name(db, llm_result.company_name)
         if company is not None:
             if company.subchannel_id is None and context_header in ("subchannel", "backfill"):
@@ -507,7 +551,9 @@ async def process_and_dispatch(
 
         target_company = company
         extracted_comp_name = getattr(extracted, "company_name", None)
-        if extracted_comp_name:
+        if authoritative:
+            pass  # the source's company, whatever name the LLM used
+        elif extracted_comp_name:
             resolved = await _find_company_by_name(db, extracted_comp_name)
             if resolved:
                 target_company = resolved
@@ -520,6 +566,13 @@ async def process_and_dispatch(
             logger.warning(
                 "Company unresolved for action=%s chat_id=%s — skipping.",
                 extracted.action, chat_id,
+            )
+            continue
+
+        if not await crud.is_company_trackable(db, target_company.id):
+            logger.info(
+                "Dropped action=%s for company=%s: IGNORED or deleted.",
+                extracted.action, target_company.name,
             )
             continue
 

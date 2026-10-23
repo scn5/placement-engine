@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     # Debounce window (seconds); reduce to 0.1 in test suites
     DEBOUNCE_DELAY_SECONDS: float = 90.0
+    # A busy chat is flushed at most this long after its first buffered message.
+    DEBOUNCE_MAX_WAIT_SECONDS: float = 120.0
 
     # Ingestion worker loops (seconds / hours)
     CONFIG_REFRESH_SECONDS: float = 60.0

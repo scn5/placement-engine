@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from sqlalchemy import and_, false, func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -495,48 +495,86 @@ async def link_or_create_subchannel_company(
     subchannel_id: int,
     company_name: str,
     environment_type: str = "MAIN",
-) -> models.Company:
-    """Link an auto-joined subchannel to an existing company by subchannel_id or normalized name,
-    or create a new company in SILENT_TRACK mode with an untriaged (is_triaged=False) RoleTrack."""
+    *,
+    fallback_name: Optional[str] = None,
+    invite_token: Optional[str] = None,
+    main_feed_msg_id: Optional[int] = None,
+) -> Tuple[models.Company, bool]:
+    """Link a joined subchannel to its company; returns (company, newly_linked).
+
+    1. A company already linked to this channel is returned as is — its
+       environment is never changed.
+    2. Otherwise *company_name*, then *fallback_name* (the channel title), is
+       matched against active companies of the same environment that have no
+       channel yet; a match is linked.
+    3. Otherwise a SILENT_TRACK company with an untriaged default role is
+       created under the first free name, or "<name> (<channel id>)" if every
+       name is taken by a company that has its own channel.
+
+    Linking never changes tracking_mode: a match that is IGNORED stays IGNORED
+    (PROJECT_STATE §0.1 invariant 1). *invite_token* and *main_feed_msg_id*
+    record the invite post, so a re-post is recognised and replies to it are
+    attributed to the company.
+    """
     env = (environment_type or "MAIN").strip().upper()
     if env not in ("MAIN", "TEST"):
         env = "MAIN"
 
-    # 1. Existing company matching subchannel_id
-    res = await db.execute(
-        select(models.Company).where(models.Company.subchannel_id == subchannel_id)
-    )
-    existing = res.scalars().first()
-    if existing:
-        if existing.environment_type != env:
-            existing.environment_type = env
-            await db.commit()
-            await db.refresh(existing)
-        return existing
+    def remember_invite(company: models.Company) -> None:
+        if invite_token:
+            company.invite_token = invite_token
+        if main_feed_msg_id is not None:
+            company.main_feed_msg_id = main_feed_msg_id
 
-    # 2. Existing company matching normalized name
-    norm = company_name.strip().lower()
-    res = await db.execute(
-        select(models.Company).where(models.Company.normalized_name == norm)
-    )
-    matched = res.scalars().first()
-    if matched:
-        matched.subchannel_id = subchannel_id
-        matched.environment_type = env
+    # 1. Existing company matching subchannel_id
+    existing = await get_company_by_subchannel_id(db, subchannel_id)
+    if existing:
+        remember_invite(existing)
         await db.commit()
-        await db.refresh(matched)
-        return matched
+        await db.refresh(existing)
+        return existing, False
+
+    # 2. An active company of that name in this environment without a channel
+    names = []
+    for candidate in (company_name, fallback_name):
+        candidate = (candidate or "").strip()
+        if candidate and candidate.lower() not in [n.lower() for n in names]:
+            names.append(candidate)
+    if not names:
+        names.append(f"Subchannel {subchannel_id}")
+
+    create_as: Optional[str] = None
+    for name in names:
+        res = await db.execute(
+            select(models.Company).where(
+                models.Company.normalized_name == name.lower(),
+                models.Company.environment_type == env,
+            )
+        )
+        matched = res.scalars().first()
+        if matched is None:
+            create_as = name
+            break
+        if matched.is_active and matched.subchannel_id is None:
+            matched.subchannel_id = subchannel_id
+            remember_invite(matched)
+            await db.commit()
+            await db.refresh(matched)
+            return matched, True
+        # Taken: deleted, or linked to another channel (e.g. a second drive).
+    if create_as is None:
+        create_as = f"{names[-1]} ({subchannel_id})"
 
     # 3. Create new Company in SILENT_TRACK mode
-    display_name = company_name.strip() or f"Subchannel {subchannel_id}"
     new_company = models.Company(
-        name=display_name,
-        normalized_name=norm or f"subchannel_{subchannel_id}",
+        name=create_as,
+        normalized_name=create_as.lower(),
         subchannel_id=subchannel_id,
         tracking_mode="SILENT_TRACK",
         environment_type=env,
         is_custom=False,
     )
+    remember_invite(new_company)
     db.add(new_company)
     await db.flush()
 
@@ -551,7 +589,50 @@ async def link_or_create_subchannel_company(
     db.add(role_track)
     await db.commit()
     await db.refresh(new_company)
-    return new_company
+    return new_company, True
+
+
+async def get_company_by_invite_token(
+    db: AsyncSession, invite_token: str, environment_type: str
+) -> Optional[models.Company]:
+    """The company whose subchannel was joined from *invite_token* in this environment."""
+    result = await db.execute(
+        select(models.Company).where(
+            models.Company.invite_token == invite_token,
+            models.Company.environment_type == environment_type,
+            models.Company.subchannel_id.is_not(None),
+        )
+    )
+    return result.scalars().first()
+
+
+async def get_company_by_main_feed_post(
+    db: AsyncSession, environment_type: str, main_feed_msg_id: int
+) -> Optional[models.Company]:
+    """The company whose invite was posted as *main_feed_msg_id* in this
+    environment's root feed (each environment has one root feed), or None if
+    no single company was."""
+    result = await db.execute(
+        select(models.Company).where(
+            models.Company.main_feed_msg_id == main_feed_msg_id,
+            models.Company.environment_type == environment_type,
+        ).limit(2)
+    )
+    matches = result.scalars().all()
+    return matches[0] if len(matches) == 1 else None
+
+
+async def record_invite_post(
+    db: AsyncSession, company_id: int, invite_token: str, main_feed_msg_id: int
+) -> None:
+    """Remember the latest invite post of a company: replies to it are
+    attributed to the company."""
+    await db.execute(
+        update(models.Company)
+        .where(models.Company.id == company_id)
+        .values(invite_token=invite_token, main_feed_msg_id=main_feed_msg_id)
+    )
+    await db.commit()
 
 
 def _ingestible_company_filters(environments: Iterable[str]) -> list:
@@ -602,6 +683,12 @@ async def is_company_ingestible(
         )
     )
     return result.first() is not None
+
+
+async def is_company_trackable(db: AsyncSession, company_id: int) -> bool:
+    """Active and not effectively IGNORED, in any environment: the dispatcher's
+    re-check before it changes anything for a company (invariant 3)."""
+    return await is_company_ingestible(db, company_id, ("MAIN", "TEST"))
 
 
 async def get_company_by_subchannel_id(

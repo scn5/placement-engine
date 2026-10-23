@@ -6,11 +6,13 @@ Records whether each Telegram message was processed (DONE), dropped on purpose
 (SKIPPED) or failed (FAILED), so the worker can:
   • skip messages it already handled (catch-up, backfill, retries),
   • find where to resume each chat after downtime (the cursor),
-  • retry failed messages with backoff instead of losing them.
+  • retry failed messages with backoff instead of losing them,
+  • tell a real edit from an update that leaves the text unchanged (a
+    reaction, a view count): each row keeps a hash of the text it handled.
 """
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Set
+from typing import Awaitable, Callable, Dict, Iterable, List, Mapping, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -71,13 +73,20 @@ async def _upsert(
                     raise
 
 
+def _set_hash(row: MessageLedger, content_hashes: Optional[Mapping[int, str]]) -> None:
+    if content_hashes and row.message_id in content_hashes:
+        row.content_hash = content_hashes[row.message_id]
+
+
 async def record(
     chat_id: int,
     message_ids: Iterable[int],
     status: str,
     reason: Optional[str] = None,
+    content_hashes: Optional[Mapping[int, str]] = None,
 ) -> None:
-    """Record DONE or SKIPPED outcomes; clears any pending retry."""
+    """Record DONE or SKIPPED outcomes; clears any pending retry.
+    *content_hashes* maps message id → hash of the text that was handled."""
 
     def apply(row: MessageLedger) -> None:
         row.status = status
@@ -85,12 +94,20 @@ async def record(
         row.attempts = 0
         row.next_attempt_at = None
         row.processed_at = _utc_now()
+        _set_hash(row, content_hashes)
 
     await _upsert(chat_id, message_ids, apply)
 
 
-async def record_failure(chat_id: int, message_ids: Iterable[int], error: str) -> None:
-    """Record a failed attempt and schedule the next one with backoff. After
+async def record_failure(
+    chat_id: int,
+    message_ids: Iterable[int],
+    error: str,
+    not_before: Optional[timedelta] = None,
+    content_hashes: Optional[Mapping[int, str]] = None,
+) -> None:
+    """Record a failed attempt and schedule the next one with backoff, or after
+    *not_before* if that is later (e.g. a Telegram flood wait). After
     MAX_ATTEMPTS consecutive failures the row stays FAILED with no next attempt."""
 
     def apply(row: MessageLedger) -> None:
@@ -99,8 +116,12 @@ async def record_failure(chat_id: int, message_ids: Iterable[int], error: str) -
         row.attempts = failures
         row.reason = error[:_REASON_LIMIT]
         row.processed_at = _utc_now()
+        _set_hash(row, content_hashes)
         if failures < MAX_ATTEMPTS:
-            row.next_attempt_at = _utc_now() + retry_delay(failures)
+            delay = retry_delay(failures)
+            if not_before is not None and not_before > delay:
+                delay = not_before
+            row.next_attempt_at = _utc_now() + delay
         else:
             row.next_attempt_at = None
             logger.error(
@@ -120,19 +141,20 @@ async def cursor(chat_id: int) -> Optional[int]:
         return result.scalar()
 
 
-async def known_ids(chat_id: int, message_ids: Iterable[int]) -> Set[int]:
-    """Which of *message_ids* already have an outcome recorded."""
+async def recorded_hashes(chat_id: int, message_ids: Iterable[int]) -> Dict[int, Optional[str]]:
+    """The *message_ids* that already have an outcome recorded, mapped to the
+    hash of the text that was handled (None for rows written before hashes)."""
     ids = list(set(message_ids))
     if not ids:
-        return set()
+        return {}
     async with database.AsyncSessionLocal() as db:
         result = await db.execute(
-            select(MessageLedger.message_id).where(
+            select(MessageLedger.message_id, MessageLedger.content_hash).where(
                 MessageLedger.chat_id == chat_id,
                 MessageLedger.message_id.in_(ids),
             )
         )
-        return set(result.scalars().all())
+        return {int(message_id): content_hash for message_id, content_hash in result.all()}
 
 
 async def due_retries(limit: int = 200) -> Dict[int, List[int]]:
@@ -154,11 +176,11 @@ async def due_retries(limit: int = 200) -> Dict[int, List[int]]:
         return due
 
 
-async def safely(write: Callable[..., Awaitable[None]], *args) -> None:
+async def safely(write: Callable[..., Awaitable[None]], *args, **kwargs) -> None:
     """Run a ledger write without letting a database error escape into the
     Telegram event loop. A missed write only means a message may be fetched
     and processed again (at-least-once), never lost."""
     try:
-        await write(*args)
+        await write(*args, **kwargs)
     except Exception:
         logger.exception("Ledger write failed (%s)", getattr(write, "__name__", write))

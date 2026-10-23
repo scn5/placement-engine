@@ -276,6 +276,9 @@ class MessageLedger(Base):
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime(), nullable=True)
+    # SHA-256 of the message text that was handled: an edit whose text hashes the
+    # same (e.g. Telegram re-sending a message after a reaction) is not re-processed.
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     processed_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )

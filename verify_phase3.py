@@ -50,9 +50,10 @@ warnings.simplefilter("error", NaiveDatetimeWarning)
 # ---------------------------------------------------------------------------
 # Import application modules under test
 # ---------------------------------------------------------------------------
-from app.telegram.pre_filter import should_filter_noise
+from app.config import settings
+from app.telegram.pre_filter import EMPTY, skip_reason
 from app.telegram.debouncer import ChannelDebouncer
-from app.telegram.backfill import fetch_24h_backfill
+from app.telegram.backfill import fetch_messages_since
 from app.telegram.listener import TelegramIngestionService, _build_message_dict
 
 
@@ -87,50 +88,39 @@ def _make_event(chat_id: int, message: SimpleNamespace) -> SimpleNamespace:
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — Pre-filter: noise gate determinism
+# Test 1 — Pre-filter: only messages without visible text are skipped
 # ---------------------------------------------------------------------------
 
 async def test_pre_filter() -> None:
-    # ── Should DROP ──
-    cases_drop = [
-        # Empty / whitespace
-        (None, False, "None text"),
-        ("", False, "empty string"),
-        ("   ", False, "whitespace only"),
-        # Too short
-        ("ok", False, "too short"),
-        # Admin SPOC chatter
-        ("Rudrash kumar -> send phone number", False, "SPOC send phone"),
-        ("dm me", False, "dm me"),
-        ("ping me", False, "ping me"),
-        ("thanks", False, "thanks"),
-        # No recruitment signals whatsoever
-        ("Hey everyone, good morning!", False, "generic greeting"),
-        ("Please check your mails.", False, "vague mail reminder"),
+    # ── Skipped: no visible text at all (media without a caption included) ──
+    cases_skip = [
+        (None, "None text"),
+        ("", "empty string"),
+        ("   \n\t ", "whitespace only"),
+        ("\u200b\u200d\ufeff", "zero-width characters only"),
+        ("\u3164", "Hangul filler (a blank-looking message)"),
     ]
-    for text, has_media, label in cases_drop:
-        result = should_filter_noise(text, has_media)
-        assert result is True, f"Expected DROP for [{label}] but got KEEP"
+    for text, label in cases_skip:
+        assert skip_reason(text) == EMPTY, f"Expected SKIP for [{label}]"
 
-    # ── Should KEEP ──
+    # ── Kept: everything else, however short or chatty ──
     cases_keep = [
-        # Has media — always keep
-        (None, True, "no-text but has media"),
-        ("", True, "empty text but has media"),
-        # Recruitment signals
-        ("Deadline for IRIS registration is 10 PM tonight.", False, "IRIS deadline"),
-        ("OA link: https://hackerrank.com/xyz", False, "OA with link"),
-        ("Shortlist for DE Shaw interviews out!", False, "shortlist keyword"),
-        ("PPT rescheduled to 5:30 PM", False, "PPT time rescheduled"),
-        ("CTC: 45 LPA. Stipend: 80k/month", False, "ctc stipend"),
-        ("Form link extended till Oct 15", False, "form extended date"),
-        ("Interview round 1 results out", False, "interview round"),
+        "Slot 1",
+        "Room 204",
+        "Link active",
+        "ok",
+        "\U0001f44d",
+        "thanks",
+        "Rudrash kumar -> send phone number",
+        "Hey everyone, good morning!",
+        "Please check your mails.",
+        "Deadline for IRIS registration is 10 PM tonight.",
+        "PPT rescheduled to 5:30 PM",
     ]
-    for text, has_media, label in cases_keep:
-        result = should_filter_noise(text, has_media)
-        assert result is False, f"Expected KEEP for [{label}] but got DROP"
+    for text in cases_keep:
+        assert skip_reason(text) is None, f"Expected KEEP for {text!r}"
 
-    print("  [1] ✓ Pre-filter noise gate verified (DROP and KEEP cases)")
+    print("  [1] ✓ Pre-filter: only empty/whitespace/invisible messages are skipped; short announcements are kept")
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +163,7 @@ async def test_debounce_consolidation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — Edit event: is_edit flag propagates through debounce
+# Test 3 — Edit event: a buffered message collapses into its latest version
 # ---------------------------------------------------------------------------
 
 async def test_edit_event_debounce() -> None:
@@ -197,51 +187,53 @@ async def test_edit_event_debounce() -> None:
 
     await asyncio.sleep(0.120)
 
-    assert len(received) == 2, f"Expected 2 messages, got {len(received)}"
-    assert received[1]["is_edit"] is True, "Edited message must carry is_edit=True"
-    assert "4pm" in received[1]["text"], "Edit text not preserved"
+    assert len(received) == 1, f"Expected the two versions collapsed into 1 message, got {len(received)}"
+    assert "4pm" in received[0]["text"], "The latest version's text must win"
+    # The original was never dispatched, so the LLM sees the final text as a new message.
+    assert received[0]["is_edit"] is False
 
-    print("  [3] ✓ Edit event: is_edit=True propagates through debounce window")
+    # An edit of a message dispatched earlier stays an edit.
+    received.clear()
+    first_edit = {**edit, "text": "Interview at 5pm"}
+    second_edit = {**edit, "text": "Interview at 6pm"}
+    await debouncer.add_message(CHAT_ID, first_edit, callback, DELAY)
+    await debouncer.add_message(CHAT_ID, second_edit, callback, DELAY)
+    await asyncio.sleep(0.120)
+    assert [m["text"] for m in received] == ["Interview at 6pm"] and received[0]["is_edit"] is True
+
+    print("  [3] ✓ Edit event: versions of one message collapse into the latest; is_edit only when an earlier version was dispatched")
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — 24h backfill: strict time-window filtering & chronological index
+# Test 4 — Bounded fetch: time window, min_id and chronological order
 # ---------------------------------------------------------------------------
 
 async def test_backfill_time_window() -> None:
     now = _now()
 
-    # Mix of messages: 2 within 24h, 1 older than 24h
-    old_msg   = _make_message(1, "Old announcement (36h ago)",   now - timedelta(hours=36))
-    recent1   = _make_message(2, "IRIS deadline is tomorrow",    now - timedelta(hours=12))
-    recent2   = _make_message(3, "Form: https://forms.gle/xyz",  now - timedelta(hours=1))
+    old_msg = _make_message(1, "Old announcement (36h ago)", now - timedelta(hours=36))
+    recent1 = _make_message(2, "IRIS deadline is tomorrow", now - timedelta(hours=12))
+    recent2 = _make_message(3, "Form: https://forms.gle/xyz", now - timedelta(hours=1))
+    calls = []
 
-    all_messages = [old_msg, recent1, recent2]  # includes the old one
-
-    # Mock client.iter_messages as an async generator that yields all messages
-    async def mock_iter(*args, **kwargs):
-        for m in all_messages:
-            yield m
+    # Telethon iterates newest-first and honours min_id.
+    async def mock_iter(entity, min_id=0, limit=None):
+        calls.append((entity, min_id, limit))
+        for m in sorted([old_msg, recent1, recent2], key=lambda m: m.id, reverse=True):
+            if m.id > min_id:
+                yield m
 
     mock_client = MagicMock()
     mock_client.iter_messages = mock_iter
-    mock_entity = MagicMock()
-    mock_entity.id = 12345
 
-    results = await fetch_24h_backfill(mock_client, mock_entity)
+    results = await fetch_messages_since(mock_client, 12345, max_age=timedelta(hours=24))
+    assert [m.id for m in results] == [2, 3], "Only the last 24 h, oldest first"
 
-    assert len(results) == 2, f"Expected 2 results (within 24h), got {len(results)}"
-    assert results[0]["id"] == 2, "First result must be the 12h-old message"
-    assert results[1]["id"] == 3, "Second result must be the 1h-old message"
-    # Chronological numbering
-    assert results[0]["label"] == "[1]"
-    assert results[1]["label"] == "[2]"
-    assert results[0]["index"] == 1
-    assert results[1]["index"] == 2
-    # Strict ascending order
-    assert results[0]["timestamp"] < results[1]["timestamp"], "Results must be in ascending time order"
+    results = await fetch_messages_since(mock_client, 12345, min_id=2, max_age=timedelta(hours=72))
+    assert [m.id for m in results] == [3], "Only messages newer than min_id"
+    assert calls[-1] == (12345, 2, 200)
 
-    print("  [4] ✓ 24h backfill: old messages excluded, chronological indexing verified")
+    print("  [4] ✓ Bounded fetch: messages outside the window or at/below min_id excluded; oldest first")
 
 
 # ---------------------------------------------------------------------------
@@ -297,36 +289,39 @@ async def test_listener_payload_handler() -> None:
     """Verify that messages routed through the listener reach the handler."""
     received_payloads = []
 
-    async def handler(chat_id: int, context: str, messages: List[dict]) -> None:
-        received_payloads.append((chat_id, context, messages))
+    async def handler(source, messages: List[dict]) -> None:
+        received_payloads.append((source, messages))
 
     mock_client = MagicMock()
     mock_client.get_messages = AsyncMock(return_value=None)
 
     service = TelegramIngestionService(mock_client)
+    service.active_subchannel_ids.add(88888)
     await service.set_payload_handler(handler)
 
-    # Patch settings so subchannel debounce fires instantly
-    with patch("app.telegram.listener.settings") as mock_settings:
-        mock_settings.MAIN_FEED_CHANNEL_ID = 999
-        mock_settings.DEBOUNCE_DELAY_SECONDS = 0.05
-
+    original_delay = settings.DEBOUNCE_DELAY_SECONDS
+    settings.DEBOUNCE_DELAY_SECONDS = 0.05  # subchannel debounce fires almost at once
+    try:
         # ── Subchannel message with actionable content ──
         msg = _make_message(
             msg_id=1,
             text="OA deadline: 10:00 PM tonight. Link: https://oa.example.com",
             date=_now(),
         )
-        event = _make_event(chat_id=88888, message=msg)  # non-main-feed chat
+        event = _make_event(chat_id=88888, message=msg)
         await service._handle_subchannel(event, is_edit=False)
 
         await asyncio.sleep(0.10)  # wait for debounce
+    finally:
+        settings.DEBOUNCE_DELAY_SECONDS = original_delay
 
     assert len(received_payloads) == 1, f"Expected 1 payload, got {len(received_payloads)}"
-    chat_id, context, messages = received_payloads[0]
-    assert chat_id == 88888
-    assert context == "subchannel"
+    source, messages = received_payloads[0]
+    assert source.chat_id == 88888
+    assert source.context == "subchannel"
+    assert source.company_id is None and source.subchannel is None
     assert messages[0]["id"] == 1
+    assert messages[0]["label"] == "[1]"
 
     print("  [6] ✓ Listener payload handler dispatch verified (subchannel route)")
 

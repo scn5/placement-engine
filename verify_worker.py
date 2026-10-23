@@ -66,12 +66,14 @@ from app.models import (
 from app.telegram import client as tg_client_module
 from app.telegram import ledger
 from app.telegram import listener as listener_module
+from app.sources import MessageSource
 from app.telegram.listener import TelegramIngestionService
 
 # Every datetime handed to the ORM must be timezone-aware.
 warnings.simplefilter("error", NaiveDatetimeWarning)
 
 ROOT = Path(__file__).resolve().parent
+MAIN_FEED, TEST_FEED = -1001000000001, -1001000000002  # root feeds must be channel IDs
 
 
 class _ForbiddenTelegramClient:
@@ -246,7 +248,7 @@ def test_main_is_api_only() -> None:
 
 async def test_monitored_set_follows_tracking_rules() -> None:
     async with _TestSession() as db:
-        db.add(SystemConfig(main_feed_id=-1001, test_feed_id=-1002))
+        db.add(SystemConfig(main_feed_id=MAIN_FEED, test_feed_id=TEST_FEED))
         await db.commit()
 
     eligible = await _company("Eligible Co", chat_id=-1101, roles=["ELIGIBLE"])
@@ -260,12 +262,12 @@ async def test_monitored_set_follows_tracking_rules() -> None:
 
     both = TelegramIngestionService(FakeClient(), {"MAIN", "TEST"})
     await both.initialize()
-    assert both.root_feed_ids == {-1001: "MAIN", -1002: "TEST"}, both.root_feed_ids
+    assert both.root_feed_ids == {MAIN_FEED: "MAIN", TEST_FEED: "TEST"}, both.root_feed_ids
     assert both.active_subchannel_ids == {-1101, -1102, -1105, -1107}, both.active_subchannel_ids
 
     test_only = TelegramIngestionService(FakeClient(), {"TEST"})
     await test_only.initialize()
-    assert test_only.root_feed_ids == {-1002: "TEST"}, test_only.root_feed_ids
+    assert test_only.root_feed_ids == {TEST_FEED: "TEST"}, test_only.root_feed_ids
     assert test_only.active_subchannel_ids == {-1102}, test_only.active_subchannel_ids
 
     # Un-ignoring through the explicit user path makes the chat monitored again.
@@ -333,20 +335,20 @@ async def test_ledger_outcomes_and_backoff() -> None:
     chat = -1201
     service = TelegramIngestionService(FakeClient(), {"MAIN"})
 
-    async def ok_handler(chat_id, context, messages):
+    async def ok_handler(source, messages):
         return None
 
-    async def failing_handler(chat_id, context, messages):
+    async def failing_handler(source, messages):
         raise RuntimeError("LLM unavailable\n[SQL: INSERT ...] [parameters: ('secret message text',)]")
 
     await service.set_payload_handler(ok_handler)
-    await service._emit("subchannel", chat, [{"id": 1}, {"id": 2}])
+    await service._emit(MessageSource(chat, "subchannel"), [{"id": 1}, {"id": 2}])
     rows = await _ledger_rows(chat)
     assert rows[1].status == rows[2].status == ledger.DONE
 
     await service.set_payload_handler(failing_handler)
     before = datetime.now(timezone.utc)
-    await service._emit("subchannel", chat, [{"id": 3}])
+    await service._emit(MessageSource(chat, "subchannel"), [{"id": 3}])
     row = (await _ledger_rows(chat))[3]
     assert row.status == ledger.FAILED and row.attempts == 1
     assert timedelta(seconds=55) <= row.next_attempt_at - before <= timedelta(seconds=65)
@@ -370,9 +372,9 @@ async def test_ledger_outcomes_and_backoff() -> None:
     assert row.status == ledger.DONE and row.attempts == 0 and row.next_attempt_at is None
 
     service.active_subchannel_ids.add(chat)
-    await service._handle_subchannel(SimpleNamespace(chat_id=chat, message=_msg(4, "thanks")), is_edit=False)
+    await service._handle_subchannel(SimpleNamespace(chat_id=chat, message=_msg(4, "  \n ")), is_edit=False)
     row = (await _ledger_rows(chat))[4]
-    assert row.status == ledger.SKIPPED and row.reason == "pre_filter"
+    assert row.status == ledger.SKIPPED and row.reason == "empty"
 
     print("  [5] ✓ Ledger: DONE/FAILED/SKIPPED outcomes; backoff 1 m → 5 m → 30 m → 2 h, given up after 6 attempts; errors stored without SQL parameters")
 
@@ -384,8 +386,8 @@ async def test_retry_loop_redispatches_due_failures() -> None:
     service.active_subchannel_ids.add(chat)
     received = []
 
-    async def handler(chat_id, context, messages):
-        received.append((chat_id, context, [m["id"] for m in messages]))
+    async def handler(source, messages):
+        received.append((source.chat_id, source.context, [m["id"] for m in messages]))
 
     await service.set_payload_handler(handler)
     due = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -395,6 +397,7 @@ async def test_retry_loop_redispatches_due_failures() -> None:
         await db.commit()
 
     assert await service.retry_failed() == 1
+    await asyncio.sleep(settings.DEBOUNCE_DELAY_SECONDS * 3)  # the retried message is debounced first
     assert received == [(chat, "subchannel", [10])], received
     rows = await _ledger_rows(chat)
     assert rows[10].status == ledger.DONE
@@ -402,7 +405,7 @@ async def test_retry_loop_redispatches_due_failures() -> None:
     left = (await _ledger_rows(unmonitored))[20]
     assert left.status == ledger.FAILED and left.attempts == 1  # unmonitored chat left untouched
 
-    print("  [6] ✓ Retry loop: due failures are re-fetched and re-dispatched; deleted messages are skipped; unmonitored chats are left alone")
+    print("  [6] ✓ Retry loop: due failures are re-fetched and routed again; deleted messages are skipped; unmonitored chats are left alone")
 
 
 async def test_catch_up_skips_processed_buffered_and_inflight() -> None:
@@ -509,15 +512,17 @@ async def test_exit_codes() -> None:
 async def test_dispatch_bridge_propagates_errors() -> None:
     with patch.object(worker.dispatcher, "process_and_dispatch", new=AsyncMock(side_effect=RuntimeError("boom"))):
         try:
-            await worker.dispatch_to_ai(-1, "subchannel", [{"id": 1, "text": "x"}])
+            await worker.dispatch_to_ai(MessageSource(-1, "subchannel"), [{"id": 1, "text": "x"}])
         except RuntimeError:
             pass
         else:
             raise AssertionError("dispatch_to_ai swallowed a dispatcher error")
     with patch.object(worker.dispatcher, "process_and_dispatch", new=AsyncMock()) as dispatch:
-        await worker.dispatch_to_ai(-1, "subchannel", [{"id": 1, "text": "x"}])
-        assert dispatch.await_args.kwargs["chat_id"] == -1
-        assert dispatch.await_args.kwargs["db"] is not None
+        await worker.dispatch_to_ai(MessageSource(-1, "main_feed", company_id=7), [{"id": 1, "text": "x"}])
+        kwargs = dispatch.await_args.kwargs
+        assert kwargs["chat_id"] == -1 and kwargs["context_header"] == "main_feed"
+        assert kwargs["company_id"] == 7 and kwargs["subchannel"] is None
+        assert kwargs["db"] is not None
 
     print("  [10] ✓ The dispatcher bridge lets errors propagate, so failed batches are recorded and retried")
 

@@ -1,5 +1,5 @@
 # PROJECT_STATE.md — Placement Engine Backend
-**Last Updated:** 2026-10-22 | **Version:** 1.0.0 — **Status: pre-production** (verified gaps in §0.2; remediation "Phase 0 — stop silent losses" in progress) | **Branch:** `feature/phase-0-stop-losses`
+**Last Updated:** 2026-10-23 | **Version:** 1.0.0 — **Status: pre-production** (verified gaps in §0.2; remediation "Phase 0 — stop silent losses" in progress) | **Branch:** `feature/phase-0-stop-losses`
 
 > Single source of truth for the backend's operational status, architecture, and immediate backlog. Cross-referenced against `MASTER_SPEC.md` and `PRODUCT REQUIREMENTS DOCUMENT.md`.
 > **The code is the source of truth.** Every status claim in this file was re-verified against the code on 2026-10-22; intended-but-unbuilt behaviour belongs in `MASTER_SPEC.md`, not here.
@@ -29,7 +29,7 @@
 3. **Test Feed Isolation & In-Memory SQLite Requirement (`:memory:`)**:
    - **Rule:** All test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) MUST strictly bind to isolated in-memory databases (`sqlite+aiosqlite:///:memory:`) and override `app.database.engine`.
    - **Why:** Running tests against local disk files (`dev.db`) causes test fixtures to pollute the real `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting state for live Telegram listeners and mobile clients.
-   - **Enforcement:** Since Phase 0.2, every database-touching suite (`verify_phase2/3/4.py`, `verify_triage.py`, `verify_settings.py`, `verify_schema.py`) binds `:memory:`; `verify_phase3.py` was patched (it used to read the configured database through `_is_known_subchannel`). All suites also enable SQLite foreign keys and turn `NaiveDatetimeWarning` into an error.
+   - **Enforcement:** Since Phase 0.2, every database-touching suite (`verify_phase2/3/4.py`, `verify_triage.py`, `verify_settings.py`, `verify_schema.py`, and later `verify_worker.py`, `verify_ingestion.py`) binds `:memory:`; `verify_phase3.py` was patched (it used to read the configured database through `_is_known_subchannel`). All suites also enable SQLite foreign keys and turn `NaiveDatetimeWarning` into an error.
    - **⚠ Do not run `scripts/clean_test_data.py` against real data:** it *hard-deletes* every `MAIN` company whose name merely contains `test`, `dummy`, `fallback`, `mock` or `acme` (e.g. "Latest updates…", Testbook, Acme Solar). Fix scheduled for Phase 0.6.
 
 ---
@@ -37,7 +37,7 @@
 ## 0.1 Tracking-Status Invariants (binding — set by the owner, 2026-10-22)
 
 > [!IMPORTANT]
-> These rules override `MASTER_SPEC.md` §3 where they differ (a matching MASTER_SPEC edit is pending owner approval). Implementation lands in Phases 0.3–0.5; until then the code does **not** yet enforce items 2, 3, 4, 5, 6 (note kinds) and 9.
+> These rules override `MASTER_SPEC.md` §3 where they differ (the matching MASTER_SPEC edit was approved and applied on 2026-10-23). Enforced so far: items 2–4 at the router and in the monitored set (0.3), plus item 3's dispatcher re-check and main-feed attribution (0.4). Items 5, 6 (note kinds) and 9 land in Phase 0.5.
 
 1. **IGNORED is a terminal, human-only status.** No automated path (dispatcher, re-triage, linking, backfill, catch-up) may set or clear it on a company or role. Only the Companies-screen toggle — `PATCH /companies/{id}/tracking` — moves a company out of IGNORED. Setting IGNORED via the Triage "Discard" action is allowed (explicit user action).
 2. A company is **effectively IGNORED** when its company-level mode is IGNORED or every one of its role tracks is IGNORED. Discarding the last role in Triage syncs the company to IGNORED. A multi-role company with any role still tracked keeps ingesting.
@@ -58,22 +58,22 @@ Verified by reading the code; items marked † were also reproduced by executing
 | ID | Gap | Evidence | Fix |
 |---|---|---|---|
 | C1 | No reminder path end-to-end: no backend scheduler or push code; the app never schedules local alarms and never sends its push token. | `command-center/src/services/notifications.ts` (`scheduleEventReminders` unused) | Next phase |
-| C2 † | Pre-filter drops real announcements: "ok/okay/noted/thanks" *anywhere* → drop; plurals, "tomorrow/tonight", "GD", "venue" aren't signals. 8 of 9 realistic samples dropped. | `app/telegram/pre_filter.py:53-102` | 0.4 |
-| C3 | A root-feed post containing an invite link is only joined — its own text (roles, CTC, deadlines) never reaches the LLM; the company gets the channel title, "Default Role", FTE. | `app/telegram/listener.py:285-294`, `app/crud.py:530-551` | 0.4 |
-| C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | Downtime ✅ 0.3 (ledger catch-up + retries); LLM failures retryable from 0.5 (the extractor still swallows errors) |
+| C2 † | Pre-filter drops real announcements: "ok/okay/noted/thanks" *anywhere* → drop; plurals, "tomorrow/tonight", "GD", "venue" aren't signals. 8 of 9 realistic samples dropped. | `app/telegram/pre_filter.py:53-102` | ✅ 0.4 (only messages with no visible text are skipped) |
+| C3 | A root-feed post containing an invite link is only joined — its own text (roles, CTC, deadlines) never reaches the LLM; the company gets the channel title, "Default Role", FTE. | `app/telegram/listener.py:285-294`, `app/crud.py:530-551` | ✅ 0.4 (the post is extracted with its company, named by the LLM, else the channel title) |
+| C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | Downtime ✅ 0.3 (ledger catch-up + retries); offline edits and failed joins ✅ 0.4; LLM failures retryable from 0.5 (the extractor still swallows errors) |
 | C5 † | Regex fallback invents wrong events and fires on valid empty LLM results (see Tribal Knowledge #2). | `app/ai/extractor.py:66-77`, `app/ai/rule_extractor.py` | 0.5 |
-| C6 | Auto-join resolves any `t.me/<name>`: a person/bot username creates a company plus a 24 h backfill of the private DM history (sent to the LLM); permalinks join foreign channels; the private-hash fallback re-resolves the hash as a username. | `app/telegram/listener.py:40-47,363-366,376,425-435` | 0.4 |
+| C6 | Auto-join resolves any `t.me/<name>`: a person/bot username creates a company plus a 24 h backfill of the private DM history (sent to the LLM); permalinks join foreign channels; the private-hash fallback re-resolves the hash as a username. | `app/telegram/listener.py:40-47,363-366,376,425-435` | ✅ 0.4 (`join_policy.py`: channels and supergroups only; root feeds must be broadcast channels) |
 | C7 | No authentication on any route; CORS reflects any origin with credentials. | `app/main.py:145-151` | 0.6 |
 | H1 † | Mixed IST/UTC wall-clock storage in SQLite (see Tribal Knowledge #1). | `app/models.py:145-158` | ✅ 0.2 |
 | H2 | Message post times never reach the LLM; relative dates resolve against processing time (wrong for backfill, midnight, catch-up). | `app/ai/dispatcher.py:407-417`, `app/ai/prompts.py:90,130-137` | 0.5 |
-| H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | Re-posted invites no longer re-process ✅ 0.3 (ledger); rest 0.4–0.5 |
+| H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | Re-posted invites no longer re-process ✅ 0.3 (ledger); edit versions collapse, unchanged-text edit updates are ignored, batches of a chat never overlap ✅ 0.4; dedupe of extracted actions and the prompt rules 0.5 |
 | H4 | Weak update targeting: match = latest event of the same type; EXTEND moves only `end_time`; REPLACE_FORM leaves the old form visible; deleted events are fed to the LLM and resurrect; no CANCELLED/TBA. | `dispatcher.py:57-62,108-128`, `crud.py:347-400` | 0.5 (partial) |
-| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | Uniqueness ✅ 0.2; lookups 0.5 |
+| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | Uniqueness ✅ 0.2; subchannel linking env-scoped, never re-labels the environment, source company authoritative for invite posts and replies ✅ 0.4; name lookups 0.5 |
 | H6 | Profile unused: INDIVIDUAL messages dropped even when addressed to the user; defaulter, slot and shortlist logic unimplemented. | `dispatcher.py:497-503` | Next phase |
 | H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | ✅ 0.2 (Alembic; live-PG run is the first Phase 1 step) |
 | H8 | Telethon runs inside the API process: >1 worker or two hosts on one session → `AUTH_KEY_DUPLICATED`; the listener task is unsupervised; `/health` always reports healthy. | `app/main.py:48-113,159-161` | ✅ 0.3 (separate worker process; liveness in `worker_status`; status endpoint 0.6) |
 | H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | 0.6, Phase 1 |
-| M1–M7 | No per-action rollback; every STATUS_NOTE re-triages; the company toggle leaves `is_triaged=false`; the debouncer has no max-wait; Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
+| M1–M7 | No per-action rollback; every STATUS_NOTE re-triages; the company toggle leaves `is_triaged=false`; the debouncer has no max-wait (✅ 0.4); Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
 
 ---
 
@@ -102,7 +102,7 @@ placement-engine/
 ├── .env.example                  # Safe credential template (committed)
 ├── .gitignore                    # Excludes venv/, *.env, __pycache__, *.log
 ├── requirements.txt              # Dependency lower bounds (no lock file yet)
-├── alembic.ini, alembic/         # Schema migrations (env.py reads DATABASE_URL; versions/0001_baseline_schema.py)
+├── alembic.ini, alembic/         # Schema migrations (env.py reads DATABASE_URL; versions/0001_baseline_schema.py, 0002_ledger_content_hash.py)
 ├── AGENTS.md, README.md          # Agent rules / setup guide (MASTER_SPEC.md and the PRD live at the workspace root, outside this repo)
 ├── placement_session.session     # Live Telethon file session (git-ignored; used when TELEGRAM_SESSION_STRING is empty)
 ├── verify_phase1.py              # Schema & model smoke tests (no DB required)
@@ -113,6 +113,7 @@ placement-engine/
 ├── verify_settings.py            # Settings API & SystemConfig regression suite
 ├── verify_schema.py              # Alembic baseline, UTC storage & constraint suite (Phase 0.2)
 ├── verify_worker.py              # Ingestion worker, ledger, catch-up & retry suite (Phase 0.3)
+├── verify_ingestion.py           # Join policy, invite posts, edits/reactions, supergroups, debouncer suite (Phase 0.4)
 ├── scripts/
 │   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
 │   ├── login_telegram.py         # Interactive login → placement_session.session (also prints a session string — removal in 0.6)
@@ -128,6 +129,7 @@ placement-engine/
     ├── crud.py                   # Async CRUD operations (select/update/returning)
     ├── main.py                   # FastAPI app (API only): schema check, CORS, routers
     ├── worker.py                 # Ingestion worker process: Telethon, dispatcher bridge, loops, heartbeat
+    ├── sources.py                # MessageSource / SubchannelLink: where a batch came from (listener → dispatcher)
     │
     ├── routers/
     │   ├── __init__.py
@@ -139,9 +141,10 @@ placement-engine/
     ├── telegram/
     │   ├── __init__.py
     │   ├── client.py             # Telethon client factory (refuses to build one when Telegram is disabled)
-    │   ├── pre_filter.py         # Regex noise gate (should_filter_noise)
-    │   ├── debouncer.py          # Sliding-window ChannelDebouncer
-    │   ├── backfill.py           # 24h backfill + catch-up fetcher
+    │   ├── pre_filter.py         # Skips only messages with no visible text (skip_reason)
+    │   ├── join_policy.py        # Which links are followed and which chats may be joined (pure)
+    │   ├── debouncer.py          # Sliding-window ChannelDebouncer (max-wait, version collapse, per-chat order)
+    │   ├── backfill.py           # Bounded fetch for catch-up and the 24 h backfill
     │   ├── ledger.py             # message_ledger: outcomes, catch-up cursor, retry backoff
     │   └── listener.py           # TelegramIngestionService (routing, monitored set, catch-up, retries)
     │
@@ -192,8 +195,9 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `TELEGRAM_SESSION_NAME` | `placement_session` | File session used when `TELEGRAM_SESSION_STRING` is empty |
 | `TELEGRAM_SESSION_STRING` | `""` | Telethon `StringSession` token; takes precedence over the file session |
 | `TELEGRAM_PHONE` | `None` | Used for interactive first-auth only |
-| `MAIN_FEED_CHANNEL_ID` / `TEST_FEED_CHANNEL_ID` | `None` | Root feeds (merged with `system_config` values at boot) |
+| `MAIN_FEED_CHANNEL_ID` / `TEST_FEED_CHANNEL_ID` | `None` | Root feeds (merged with `system_config` values). Since 0.4 a feed must be a broadcast channel (`-100…` ID); anything else is refused and reported in `worker_status.last_error` |
 | `DEBOUNCE_DELAY_SECONDS` | `90.0` | Sliding window before batch dispatch |
+| `DEBOUNCE_MAX_WAIT_SECONDS` | `120.0` | A busy chat is flushed at most this long after its first buffered message (0.4) |
 | `LLM_API_KEY` / `GROQ_API_KEY` | `""` | Bearer token for the LLM endpoint (`LLM_API_KEY` wins) |
 | `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | Override for OpenRouter / local vLLM |
 | `LLM_MODEL` | `openai/gpt-oss-20b` | Model identifier |
@@ -208,7 +212,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 
 ## 5. ORM Models (`app/models.py`)
 
-> The schema is owned by Alembic (`alembic/versions/0001_baseline_schema.py`, Phase 0.2); the app never creates or alters tables. Every datetime column uses the `UTCDateTime` type: values are converted to UTC before writing and always read back as aware UTC (SQLite stores the UTC wall-clock; PostgreSQL uses `TIMESTAMP WITH TIME ZONE`). A naive datetime is assumed to be UTC and raises `NaiveDatetimeWarning` — an error in every verify suite. Constraint and index names follow `NAMING_CONVENTION` in `app/database.py`.
+> The schema is owned by Alembic (`alembic/versions/0001_baseline_schema.py`, Phase 0.2; `0002_ledger_content_hash.py`, Phase 0.4); the app never creates or alters tables. Every datetime column uses the `UTCDateTime` type: values are converted to UTC before writing and always read back as aware UTC (SQLite stores the UTC wall-clock; PostgreSQL uses `TIMESTAMP WITH TIME ZONE`). A naive datetime is assumed to be UTC and raises `NaiveDatetimeWarning` — an error in every verify suite. Constraint and index names follow `NAMING_CONVENTION` in `app/database.py`.
 
 ### 5.1 `Company`
 | Column | Type | Notes |
@@ -217,8 +221,8 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `name` | String(255) | Display name |
 | `normalized_name` | String(255), indexed | Lowercase stripped; lookup key. **Unique per environment** — `UNIQUE (normalized_name, environment_type)` since 0.2, so MAIN and TEST may share a name. ⚠ Extraction-time name lookups still ignore the environment until 0.5 |
 | `environment_type` | String(16) | `MAIN` \| `TEST` (default `MAIN`) |
-| `main_feed_msg_id` | BigInteger | Single-ID column — **never written by any code path** (no thread stitching yet) |
-| `invite_token` | String(128), indexed | Invite hash or public username the subchannel was joined from — added in 0.2, written from 0.4 |
+| `main_feed_msg_id` | BigInteger | Root-feed message id of the company's latest single-company invite post (written since 0.4): a reply to that post is attributed to the company. Single-ID column (see the gap below) |
+| `invite_token` | String(128), indexed | Invite hash or public username the subchannel was joined from (written since 0.4): a re-post of a known token needs no Telegram request |
 | `subchannel_id` | BigInteger UNIQUE | Telegram channel ID for routing |
 | `tracking_mode` | String(32) | `ELIGIBLE` \| `SILENT_TRACK` \| `IGNORED` — legacy company-level mode; can drift from role-level modes (see §0.1 invariant 2) |
 | `is_active` | Boolean | Soft-delete flag |
@@ -284,6 +288,7 @@ One row per processed Telegram message: idempotency, the catch-up cursor (max `m
 | `reason` | Text | Skip reason or last error |
 | `attempts`, `next_attempt_at` | Integer, UTCDateTime | Retry scheduling; index `ix_message_ledger_retry (status, next_attempt_at)` |
 | `processed_at` | UTCDateTime | Last update |
+| `content_hash` | String(64) | SHA-256 of the text that was handled (0.4, migration `0002`): an edit update whose text is unchanged is ignored, and catch-up replays messages edited while offline |
 
 ### 5.5 `WorkerStatus` (`worker_status`, added in 0.2 — used from 0.3)
 Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker and read by the API's status endpoint: `telegram_state`, `last_update_at`, `last_llm_ok_at`, `last_error`, `catchup_at`, `heartbeat_at`.
@@ -355,72 +360,63 @@ Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker an
 ### 7.1 Client (`client.py`)
 - `create_telegram_client()` → `TelegramClient` using `StringSession` when `TELEGRAM_SESSION_STRING` is set, **otherwise the file session** `placement_session.session` (present on disk, git-ignored; created by `scripts/login_telegram.py`)
 - Built without `catch_up`: updates missed while disconnected are not replayed (gap C4)
-- `flood_sleep_threshold=60` — auto-sleeps on `FloodWaitError` up to 60 s; longer waits raise, and a join that hits one is dropped
+- `flood_sleep_threshold=60` — auto-sleeps on `FloodWaitError` up to 60 s; longer waits raise. Since 0.4 a join that hits one leaves its invite post `FAILED`, retried after the wait (§7.5)
 - **Guard (0.3):** raises `RuntimeError` instead of building a client while Telegram is disabled (`TELEGRAM_API_ID=0` or empty `TELEGRAM_API_HASH`) — constructing one would load the live session's auth key.
 
 > **Activation gate:** Only the ingestion worker (`python -m app.worker`) creates a Telegram client, and it exits with code 0 when `TELEGRAM_API_ID=0`. The API process contains no Telegram code at all.
 
-### 7.2 Pre-Filter (`pre_filter.py`)
-`should_filter_noise(text, has_media) -> bool`
+### 7.2 Pre-Filter (`pre_filter.py`) — rewritten in 0.4
+`skip_reason(text) -> Optional[str]`
 
-**Decision tree (in order):**
-1. `has_media=True` → **KEEP** unconditionally (JD PDFs, schedule images)
-2. `text` empty/whitespace → **DROP**
-3. `len(text) < 8` → **DROP**
-4. Matches `_ADMIN_CHATTER_RE` (SPOC routing, "dm me", "ping us") → **DROP**
-5. No match in `_SIGNAL_RE` (dates, times, "deadline", "form", "oa", "interview", "iris", "ppt", "ctc", "shortlist", "http", …) → **DROP**
-6. Otherwise → **KEEP**
-
-> ⚠ Step 4 matches chatter words *anywhere* in the message and step 5 lacks common signals; verified to drop 8 of 9 realistic announcements (gap C2). Messages with link previews survive only because `has_media` also counts `MessageMediaWebPage`.
+A message is skipped (ledger `SKIPPED`, reason `empty`) **only** when it has no visible text: `None`, empty, whitespace, or only invisible characters (zero-width spaces/joiners, BOM, Hangul fillers). Everything else — "Slot 1", "Room 204", "Link active", "ok" — goes on to the debouncer and the LLM, in both tiers. Owner decision 2026-10-23: placement channels are announcement-only, so the old length, chatter and keyword rules lost more announcements than they saved tokens (gap C2). Only text and media captions are extracted, so media without a caption counts as empty.
 
 ### 7.3 Debouncer (`debouncer.py`)
 `ChannelDebouncer` — one instance per process, keyed by `chat_id`.
 
-- **Sliding window:** Each `add_message()` cancels the current `asyncio.Task` and schedules a fresh one for `DEBOUNCE_DELAY_SECONDS` (default 90s)
-- **On fire:** Buffer is popped, messages sorted by `date` ASC, `callback(chat_id, messages)` awaited
-- **`flush_all()`:** Force-dispatches all pending buffers on graceful shutdown
-- **Zero unhandled exceptions:** Callback errors are caught and logged; task cancellation uses explicit `try/except CancelledError`
-- **`pending_ids(chat_id)` / `discard(chat_id)` (0.3):** expose buffered message ids (so catch-up never re-adds them) and drop a chat's buffer when it stops being monitored (e.g. IGNORED)
-- ⚠ No maximum wait (a busy chat can postpone dispatch indefinitely); the slot is popped before the callback runs, so two dispatches for one chat can overlap (gap H3). Buffers are still in memory, but since 0.3 anything lost on a crash is recovered by catch-up.
+- **Sliding window:** each `add_message()` restarts the countdown (`DEBOUNCE_DELAY_SECONDS`, default 90 s).
+- **Max wait (0.4):** a buffer is flushed at most `DEBOUNCE_MAX_WAIT_SECONDS` (120 s) after its first message, however busy the chat.
+- **Version collapse (0.4):** a newer version of a buffered message (an edit) replaces it, so each message appears once, in its latest form. `is_edit` stays false when the original was never dispatched.
+- **Per-chat order (0.4):** batches of one chat never overlap — a flush waits for the previous one (one `asyncio.Lock` per chat). Ids waiting for or inside the callback still count in `pending_ids()`, so catch-up never re-adds them.
+- **On fire:** the buffer is popped, sorted by `date` ASC, and `callback(chat_id, messages)` awaited; callback errors are logged, never raised into the event loop.
+- **`flush_all()`** on graceful shutdown; **`discard(chat_id)`** when a chat stops being monitored (e.g. IGNORED).
 
 ### 7.4 Backfill (`backfill.py`)
-`fetch_24h_backfill(client, entity) -> List[dict]`
-
-- Cutoff = `now(UTC) - 24h`
-- Fetches recent messages backwards from now with defensive safety cap (`limit=200`), filtering `msg_date >= cutoff` (resolves Telethon `offset_date` + `reverse=True` bug).
-- Returns chronological payload matching live message contract: `[{index, label "[N]", id, text, raw_text, date, timestamp, has_media}, …]`
-- ⚠ Triggered after every successful link, including re-posts of an already-linked invite; since 0.3 messages already in the ledger, buffered or in flight are skipped, so a re-post no longer re-processes the channel. All remaining messages (≤200) still go to the LLM in one call.
-- `fetch_messages_since(client, entity, min_id, max_age, limit=200)` (0.3): raw messages newer than `min_id` and younger than `max_age`, oldest first — used by catch-up.
+`fetch_messages_since(client, entity, min_id=0, max_age=24h, limit=200)` → raw messages newer than `min_id` and younger than `max_age`, oldest first (Telethon iterates newest-first, so the scan stops at the cutoff; a warning is logged if the cap is hit). Used by catch-up. Since 0.4 the 24 h backfill of a newly linked channel is a catch-up with a 24 h window: its messages are routed like live ones (same filters, debouncer and ledger). The old one-call `fetch_24h_backfill` is gone.
 
 ### 7.5 Listener (`listener.py`) & Two-Tier Ingestion
 `TelegramIngestionService`:
 
-- **Monitored set (0.3):** `refresh_monitored()` loads the root feeds (`.env` + `system_config`, filtered by `INGEST_ENVIRONMENTS`) and the subchannels of ingestible companies (`crud.get_ingestible_subchannel_ids`: active, ingested environment, not effectively IGNORED — invariants 2–3). The worker refreshes it every 60 s; chats that leave the set have their buffers discarded, chats that join it are reported for a bounded catch-up (invariant 4). The old per-message `_is_known_subchannel` database fallback is gone, so routing never queries the database.
+- **Monitored set (0.3):** `refresh_monitored()` loads the root feeds (`.env` + `system_config`, filtered by `INGEST_ENVIRONMENTS`) and the subchannels of ingestible companies (`crud.get_ingestible_subchannel_ids`: active, ingested environment, not effectively IGNORED — invariants 2–3). The worker refreshes it every 60 s; chats that leave the set have their buffers discarded, chats that join it get a bounded catch-up (invariant 4). Routing never queries the database for membership.
+- **Subscriptions:** only `events.NewMessage` and `events.MessageEdited`. Reaction updates (`UpdateMessageReactions`, `UpdateBotMessageReaction(s)`) are never subscribed to — Telethon builds neither event from them — and `message.reactions` is never read: the payload carries only the message text or caption (owner decision 2026-10-23).
+- **Edit updates (0.4):** an edit is processed only if its text changed. An update without `edit_date`, one whose text hashes the same as the version already handled (`message_ledger.content_hash`), or an edit more than 24 h old of a message never processed here is ignored: Telegram can re-send a message when only a reaction or view count changed.
+- **Batches (0.4):** at most 40 messages per LLM call, numbered `[1]…[n]`; a buffer is split so each batch belongs to one company.
 - **Task tracking:** spawned `asyncio.Task` references are kept in `self._background_tasks` with error-logging callbacks.
-- **Ledger (0.3):** every message gets an outcome — pre-filtered chatter and invite posts `SKIPPED` immediately, dispatched batches `DONE`, or `FAILED` when the payload handler raises (see §7.6).
+- **Ledger:** every message gets an outcome (§7.6).
 
 | Tier | Feeds / Target | Routing Logic |
 |---|---|---|
-| **Tier 1 (Root Feeds)** | Configured `main_feed_id` or `test_feed_id` | 1. Reply-to stitching: parent context merged.<br>2. Invite link scan (`t.me/+...`, `t.me/joinchat/...`, `t.me/<username>`): auto-joins (`ImportChatInviteRequest` / `JoinChannelRequest`), links `Company` via `crud.link_or_create_subchannel_company` (`SILENT_TRACK`, `is_triaged=False`, stamped with parent `environment_type`), adds to `active_subchannel_ids`, and triggers 24h backfill.<br>3. Direct announcements (no invite): routed through `ChannelDebouncer` to Groq. |
-| **Tier 2 (Sub-channels)** | Any `chat_id` in `active_subchannel_ids` (ingestible companies only) | 1. Noise gate (`pre_filter.should_filter_noise`).<br>2. Sliding debouncer (`ChannelDebouncer`, 90s).<br>3. Dispatches consolidated payload to Groq (`openai/gpt-oss-20b`) via `dispatcher.process_and_dispatch`. |
+| **Tier 1 (Root Feeds)** | `main_feed_id` / `test_feed_id` — must be **broadcast channels** (0.4) | 1. No visible text → `SKIPPED empty`.<br>2. **Invite post** (links per §7.8), handled in a background task. Each link is looked up — a known `invite_token` needs no Telegram request — or previewed and joined under the join policy, at most one link per 30 s. *One channel:* the post is extracted with that company. A new channel is linked by the dispatcher under the extracted company name (else the channel title), then monitored with a 24 h backfill. An IGNORED or deleted company → `SKIPPED company_ignored`, with no LLM call. *Several channels:* each is linked under its title and the post is extracted as a plain announcement. *Every link refused:* plain announcement. A flood wait or network error leaves the post `FAILED`; it is retried, never before the wait ends, and other joins pause meanwhile.<br>3. **Other posts:** a reply to a company's single-company invite post is attributed to that company (or `SKIPPED company_ignored`); the parent's text is stitched as `[CONTEXT: …]`; debounced, then extracted. |
+| **Tier 2 (Sub-channels)** | `active_subchannel_ids` (ingestible companies only) | 1. No visible text → `SKIPPED empty`.<br>2. In a **supergroup**, only admins' posts (including anonymous admins) count; others are `SKIPPED non_admin_sender`. The admin list is read once per 24 h; if it can't be read, messages are kept (recall-first).<br>3. Debounced, then extracted via `dispatcher.process_and_dispatch`. |
 
 **Read-Only Safety & Feed Isolation Policy:**
-- **Zero Outbound/Destructive Operations:** Strictly an incoming event listener (`events.NewMessage`, `events.MessageEdited`). No `send_message`, `delete_messages`, `edit_message`, or `LeaveChannelRequest`. Auto-joining subchannels via `ImportChatInviteRequest` / `JoinChannelRequest` is the only permitted Telegram action.
-- **Feed Isolation:** Automatically drops private DMs (`event.is_private`) and every chat outside the monitored set — including channels of IGNORED or deleted companies (no pre-filter, no LLM call, no ledger row).
-- **Join gate (0.3):** after linking a joined channel, the company must be ingestible; otherwise the channel is neither monitored nor backfilled. If the database link fails, the channel is not monitored.
+- **Zero outbound/destructive operations:** no `send_message`, `delete_messages`, `edit_message` or `LeaveChannelRequest`. The only state-changing Telegram actions are joins (`ImportChatInviteRequest` / `JoinChannelRequest`) that the join policy allows. Invite previews (`CheckChatInviteRequest`), username resolution (`ResolveUsernameRequest`) and supergroup admin lists (`channels.getParticipants`) are read-only. Links are followed only from root-feed posts, never from subchannels, and `get_dialogs()` is never called.
+- **Feed isolation:** private chats and every chat outside the monitored set are dropped — including IGNORED or deleted companies' channels (no LLM call, no ledger row). A root feed that is not a broadcast channel (a group, person or bot — e.g. a mistyped ID) is never read or joined from; the problem is logged once and surfaced in `worker_status.last_error`.
+- **Environments:** attribution never crosses environments — a TEST-feed post is never attached to a MAIN company's channel, and vice versa.
 - **Process:** runs only inside the ingestion worker (§7.7), never in the API.
 
-> **⚠ Spec Gap:** Recursive reply fetching (depth ≤ 6) is not implemented — only single-level parent stitching exists. This affects deeply threaded announcements.
+> **⚠ Spec Gap:** Recursive reply fetching (depth ≤ 6) is not implemented — only single-level parent stitching exists.
 > **⚠ Spec Gap:** 60-second TCP heartbeat job (DC keep-alive) is not implemented.
-> **⚠ Verified gaps:** when a root-feed post contains an invite link, its own text is never extracted (C3); public `t.me/<name>` links are resolved and joined without checking that the entity is a channel, and the 24 h backfill bypasses the `is_private` guard (C6). Edits are re-processed as new text with no message provenance (H3).
+> ⚠ Until 0.5, messages in a batch aren't individually addressed (no message ids or post times in the prompt), so an edit can still create a duplicate event instead of updating the original (gaps H3/H4), and events carry no source message ids yet.
+> ⚠ In a discussion group linked to a broadcast channel, auto-forwarded channel posts arrive "from" that channel and are `SKIPPED non_admin_sender`. Company channels are expected to be broadcast channels.
+> ⚠ A fresh session bootstraps a root feed from its last 24 h only, so invite posts older than that are never seen. A wider one-time bootstrap for the VM's first start is a Phase 1 decision.
 
-### 7.6 Ledger, Catch-up & Retries (`ledger.py`, listener) — Phase 0.3
-- **Outcomes:** `message_ledger` holds one row per message: `DONE`, `SKIPPED` (with a reason: `pre_filter`, `invite_post`, `message_deleted`) or `FAILED`. Stored error text keeps only the exception class and first line — never SQL parameters or message text.
-- **Retries:** a failed batch is retried after 1 m, 5 m, 30 m, then every 2 h; after 6 consecutive failures it stays `FAILED` and is logged as given up. The worker polls due retries every 60 s, re-fetches the messages by id (deleted ones become `SKIPPED message_deleted`) and re-dispatches them with the chat's original context. Chats that are no longer monitored are left alone.
-- **Catch-up:** at boot and every 15 min, each monitored chat is re-scanned from 100 messages behind its ledger cursor (a crash can leave buffered messages below a later recorded one). The scan is bounded by `CATCHUP_MAX_AGE_HOURS` (72 h), or 24 h for a chat with no history or one that was just un-ignored or added (invariant 4). Messages already recorded, buffered or in flight are skipped; the rest are routed exactly like live messages.
+### 7.6 Ledger, Catch-up & Retries (`ledger.py`, listener) — Phase 0.3, extended in 0.4
+- **Outcomes:** `message_ledger` holds one row per message: `DONE`, `FAILED`, or `SKIPPED` with a reason — `empty`, `company_ignored`, `non_admin_sender`, `message_deleted` (the 0.3 reasons `pre_filter` and `invite_post` are gone). Each row keeps the hash of the text it handled (0.4). Stored error text keeps only the exception class and first line — never SQL parameters or message text.
+- **Retries:** a failed message is retried after 1 m, 5 m, 30 m, then every 2 h — or after a Telegram flood wait, if that is longer; after 6 consecutive failures it stays `FAILED` and is logged as given up. The worker polls due retries every 60 s, re-fetches the messages by id (deleted ones become `SKIPPED message_deleted`) and since 0.4 routes them again like live messages, so a retried invite post re-runs its joins and every filter applies. Chats that are no longer monitored are left alone.
+- **Catch-up:** at boot and every 15 min, each monitored chat is re-scanned from 100 messages behind its ledger cursor (a crash can leave buffered messages below a later recorded one). The scan is bounded by `CATCHUP_MAX_AGE_HOURS` (72 h), or 24 h for a chat with no history or one that was just un-ignored, added or linked (invariant 4). Messages already recorded, buffered or in flight are skipped; the rest are routed exactly like live messages. Since 0.4, recorded messages whose text has changed since (edited while offline) are routed again as edits. Edits older than the scan (100 messages behind the cursor, 72 h) are not replayed.
 - **Entity cache:** catch-up and retries resolve chats from the Telethon session's entity cache. A chat that isn't cached yet (e.g. a brand-new session) is skipped until its first live update caches it — so production should use the file session, which persists the cache (a `StringSession` loses it on restart).
 - **Delivery guarantee:** at-least-once. If a ledger write fails, the message may be processed again but is never lost.
-- ⚠ Until Phase 0.5, catch-up and backfill messages still have relative dates ("tomorrow") resolved against processing time (gap H2), and LLM failures don't reach the retry loop because the extractor swallows them (gap C4). Edits made while the worker was down aren't caught up — only new messages are.
+- ⚠ Until Phase 0.5, catch-up and backfill messages still have relative dates ("tomorrow") resolved against processing time (gap H2), and LLM failures don't reach the retry loop because the extractor swallows them (gap C4).
 
 ### 7.7 Ingestion Worker (`app/worker.py`) — Phase 0.3
 Run with `python -m app.worker`, **exactly one per Telegram session**.
@@ -430,6 +426,13 @@ Run with `python -m app.worker`, **exactly one per Telegram session**.
 4. Runs the listener plus four loops: boot catch-up then every 15 min; monitored-set refresh every 60 s (newly monitored chats get the 24 h catch-up); retries every 60 s; heartbeat every 30 s into `worker_status`. A failing loop iteration is logged and the loop continues.
 5. Exits 1 if the listener stops or crashes (state `DISCONNECTED`; safe to restart) and 2 on session errors (`SESSION_INVALID`). On SIGTERM/SIGINT it records `STOPPED` and exits 0 after flushing buffers (30 s cap; anything unflushed is recovered by catch-up).
 - **Heartbeat:** writes `telegram_state`, `heartbeat_at`, `last_update_at`, `last_llm_ok_at` (last successful dispatch), `catchup_at` and `last_error`. When `DEADMAN_URL` is set it pings it at most every 5 min, only while connected.
+
+### 7.8 Join Policy (`join_policy.py`) — Phase 0.4
+Pure functions (no client, no I/O), unit-tested in `verify_ingestion.py`:
+- `find_invite_links(text)` — the followable links in a root-feed post. Private invites: `t.me/+<hash>`, `t.me/joinchat/<hash>`, `tg://join?invite=`. Public channels: `t.me/<username>`, `t.me/s/<username>`, `<username>.t.me`, `tg://resolve?domain=`. `telegram.me` and `telegram.dog` are aliases. Never followed: message permalinks (`t.me/<name>/<id>`, `t.me/c/…`), phone links (`t.me/+<digits>`), links with a query (bot `?start=`, Mini Apps, livestreams), and folder, sticker, theme, proxy, login and share links.
+- `check_invite(preview)` / `check_chat(chat)` — only channels and supergroups qualify. Refused: persons and bots (`person_or_bot`), basic groups (`not_a_channel`), the root feeds (`root_feed`), and invites that need admin approval (`needs_approval` — joining would send the admins a join request).
+- `is_channel_id(id)` (root feeds must have `-100…` IDs) and `is_broadcast_channel(chat)` (root feeds must be broadcast channels, where only admins post).
+- The listener previews a private invite with `messages.checkChatInvite` before importing it, and resolves a username with `contacts.resolveUsername` directly. It never uses Telethon's string heuristics, which treat a phone number as a contact lookup. The old fallback that re-resolved a private hash as a username is gone (gap C6). Invite hashes are logged masked (`t.me/+AbCd…`).
 
 ---
 
@@ -476,14 +479,14 @@ Injections per call:
 > ⚠ Because the extractor never raises, an LLM failure still ends as an empty (or regex) result that is recorded `DONE` — the retry loop added in 0.3 only sees errors that propagate. Making extraction failures raise is Phase 0.5 (gap C4). The regex tier is under revision (gap C5, Tribal Knowledge #2).
 
 ### 8.4 Dispatcher & Pre-Interview State Engine (`ai/dispatcher.py`)
-`process_and_dispatch(chat_id, context_header, messages, db)`
+`process_and_dispatch(chat_id, context_header, messages, db, company_id=None, subchannel=None)`
 
 **5-Step Pipeline** (verified defects: H3–H6, M1, M2 — see §0.2):
 1. Normalize text block from message list.
-2. Resolve `Company` by `subchannel_id == chat_id`, falling back to LLM-extracted name or subchannel mapping.
+2. Resolve `Company`. Since 0.4 a company known from the source is **authoritative for every action** (per-action company names are not followed): `company_id` (a reply to, or re-post of, its invite post) or the channel an invite post just joined (`subchannel`). Otherwise: by `subchannel_id == chat_id`, falling back to the LLM-extracted name or subchannel mapping. An IGNORED or deleted company stops the batch before the LLM call.
 3. Build schedule context → inject into prompt.
-4. Call `extract_placement_actions()` with automated fallback chain.
-5. Execute pre-interview state machine mutations per action (silently dropping `INDIVIDUAL` scope):
+4. Call `extract_placement_actions()` with automated fallback chain. For an invite post (`subchannel`), the channel is then linked with `crud.link_or_create_subchannel_company` under the extracted company name, else the channel title. Only an active company of the same environment that has no channel yet is reused (it stays IGNORED if it was). Otherwise a SILENT_TRACK company with an untriaged default role is created, under "<title> (<channel id>)" if both names are taken. `invite_token` and `main_feed_msg_id` are recorded.
+5. Execute pre-interview state machine mutations per action, silently dropping `INDIVIDUAL` scope and — since 0.4 — any action whose company is IGNORED or deleted (invariant 3, re-checked per action):
 
 | Action | State Machine Transition & Fallback |
 |---|---|
@@ -503,13 +506,16 @@ Injections per call:
 
 ### 8.5 Dispatcher Bridge (`app/worker.py`)
 ```python
-async def dispatch_to_ai(chat_id, context_header, messages):
+async def dispatch_to_ai(source: MessageSource, messages):
     async with database.AsyncSessionLocal() as db:
-        await dispatcher.process_and_dispatch(chat_id=chat_id, context_header=context_header, messages=messages, db=db)
+        await dispatcher.process_and_dispatch(
+            chat_id=source.chat_id, context_header=source.context, messages=messages, db=db,
+            company_id=source.company_id, subchannel=source.subchannel,
+        )
 
 await service.set_payload_handler(dispatch_to_ai)
 ```
-Each batch opens an **isolated `AsyncSession`**. Since 0.3 errors **propagate**: the listener records the batch `FAILED` and the retry loop re-dispatches it. The old bridge in `main.py` logged and swallowed them.
+`MessageSource` and `SubchannelLink` live in `app/sources.py` (0.4). Each batch opens an **isolated `AsyncSession`**. Since 0.3 errors **propagate**: the listener records the batch `FAILED` and the retry loop re-dispatches it. The old bridge in `main.py` logged and swallowed them.
 
 ---
 
@@ -556,12 +562,13 @@ All scripts are self-contained and require no live credentials or running server
 |---|---|---|
 | `verify_phase1.py` | ORM model instantiation, all 4 `display_state` branches, Pydantic schema round-trip | None |
 | `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline recovery, HTTP router tests (`POST /companies/` mobile contract, `GET /companies/{id}/events` 200/404, timeline `?env=MAIN\|TEST` isolation, complete/uncomplete) | In-memory SQLite |
-| `verify_phase3.py` | Pre-filter DROP/KEEP cases, debounce sliding window, edit event propagation, 24h backfill, reply-to stitching, payload handler dispatch | Mock objects + in-memory SQLite (patched in 0.2) |
+| `verify_phase3.py` | Pre-filter (only blank messages skipped), debounce sliding window, version collapse of edits, bounded fetch window, reply-to stitching, payload handler dispatch | Mock objects + in-memory SQLite (patched in 0.2) |
 | `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM, EXTEND_DEADLINE, prompt context injection, dirty subchannel payloads (missing company/drive), e2e CREATE_EVENT, e2e STATUS_NOTE, RESCHEDULE_EVENT start/end updates | In-memory SQLite |
 | `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
 | `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
 | `verify_schema.py` | Alembic upgrade → downgrade → upgrade + drift check, startup revision check, UTC round-trip, IST deadline flips to MISSED on time, naive-datetime policy, per-environment name uniqueness, foreign keys, ledger/status constraints | In-memory SQLite |
 | `verify_worker.py` | `TELEGRAM_API_ID=0` builds no client; `app.main` imports no Telegram code; monitored set vs invariants 2–4; un-ignore/new-chat 24 h catch-up; ledger outcomes and backoff; retry loop; catch-up skipping; heartbeat + dead-man ping; exit codes; error propagation. The real `TelegramClient` class is replaced by one that fails if constructed | In-memory SQLite (migrated) |
+| `verify_ingestion.py` | Join-policy link and chat tables; short messages reach the LLM; reactions never subscribed to or read, unchanged-text edit updates ignored; invite posts joined, linked and extracted with their company, re-posts and replies attributed, IGNORED companies skipped; refused links (bot, person, basic group, approval, expired, phone, permalink, root feed) never joined; flood-wait retry and join pacing; supergroup admin filter; root feeds must be broadcast channels; debouncer max-wait and per-chat order; ≤ 40 messages per LLM call; offline edits caught up; dispatcher source company, naming and IGNORED gate; no cross-environment attribution. Every chat, person and bot is a mocked entity | In-memory SQLite (migrated) |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
 > ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
@@ -575,6 +582,10 @@ python verify_phase3.py
 python verify_phase4.py
 python verify_triage.py
 python verify_settings.py
+python verify_schema.py
+python verify_worker.py
+python verify_ingestion.py
+# Owner-run only (uses the live session, read-only):
 python scripts/test_live_ingestion.py
 ```
 
@@ -588,8 +599,8 @@ python scripts/test_live_ingestion.py
 |---|---|---|
 | 0.1 | Docs truth pass; root spec edits approved and applied 2026-10-23 | ✅ Done — reviewed |
 | 0.2 | Schema foundation: Alembic baseline, `UTCDateTime`, env-scoped company uniqueness, `message_ledger` / `worker_status` tables, SQLite pragmas | ✅ Done — reviewed 2026-10-23 (settings row restored from the backup) |
-| 0.3 | API / worker process split; ledger outcomes; monitored-set refresh, catch-up, retry and heartbeat loops | ✅ Done — pending owner review |
-| 0.4 | Ingestion: pre-filter, invite-post extraction, join policy, debouncer, IGNORED ingestion gate | Planned |
+| 0.3 | API / worker process split; ledger outcomes; monitored-set refresh, catch-up, retry and heartbeat loops | ✅ Done — reviewed 2026-10-23 |
+| 0.4 | Ingestion: empty-only pre-filter, join policy, invite-post extraction and attribution, reactions ignored and edit detection, supergroup admin filter, debouncer max-wait and order, ≤ 40 messages per LLM call | ✅ Done — pending owner review |
 | 0.5 | Extraction & dispatch: post timestamps, event IDs, regex-tier removal, invariants 1–9 | Planned |
 | 0.6 | API key, CORS removal, secret hygiene, `.dockerignore` | Planned |
 | 0.7 | Frontend: API-key pairing, needs-review pill, Telegram deep links | Planned |
@@ -625,7 +636,7 @@ Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN fee
 | # | Item | File(s) | Detail |
 |---|---|---|---|
 | 9 | **Recursive reply stitching (depth ≤ 6)** | `telegram/listener.py` | Current impl fetches only 1 level of `reply_to_msg_id` |
-| 10 | **Auto-join private channels** | `telegram/listener.py` | ✅ **Resolved** — Auto-joins via `ImportChatInviteRequest` (hashes) / `JoinChannelRequest` (usernames) and links SQLite `Company` record. ⚠ Join scope is unsafe (C6) — fix in 0.4. |
+| 10 | **Auto-join private channels** | `telegram/listener.py`, `telegram/join_policy.py` | ✅ **Resolved** — invites previewed and joined via `ImportChatInviteRequest` / `JoinChannelRequest` under the join policy (0.4, gap C6); the post is extracted with its company. |
 | 11 | **60s TCP heartbeat** | `app/main.py` | Background task pinging Telegram DC to reset half-open connections |
 | 12 | **`system_config` table & profile API** | `models.py`, `app/routers/settings.py` | ✅ **Resolved** — `GET /settings` and `PUT /settings` implemented with student profile and feed IDs. |
 | 13 | **FCM push notification worker** | `app/workers/notifier.py` | 60s polling: `PENDING` events ±2h or ±30min from `start_time` → FCM dispatch |
@@ -653,7 +664,7 @@ e850a9c feat(pre-interview): implement master spec time normalization, ist ancho
 e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
 
-> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`.
+> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), then 0.4.
 
 ---
 
@@ -679,4 +690,4 @@ cloudflared tunnel --url http://localhost:8000
 > Swagger UI available at `http://localhost:8000/docs` during development.
 
 > [!WARNING]
-> With `TELEGRAM_API_ID` set, **the worker** connects the **live personal session**, processes the feeds in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins invite links found there. Never run two workers on the same session (Telegram revokes it). To keep a worker from connecting, set `TELEGRAM_API_ID=0` for that process only (PowerShell: `$env:TELEGRAM_API_ID="0"`) — never by editing `.env`. The API never connects to Telegram.
+> With `TELEGRAM_API_ID` set, **the worker** connects the **live personal session**, processes the feeds in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins the channel invite links posted there, under the join policy (§7.8). Never run two workers on the same session (Telegram revokes it). To keep a worker from connecting, set `TELEGRAM_API_ID=0` for that process only (PowerShell: `$env:TELEGRAM_API_ID="0"`) — never by editing `.env`. The API never connects to Telegram.

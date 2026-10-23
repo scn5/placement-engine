@@ -37,6 +37,7 @@ from app import database
 from app.ai import dispatcher
 from app.config import settings
 from app.models import WorkerStatus
+from app.sources import MessageSource
 from app.telegram import client as telegram_client
 from app.telegram.listener import TelegramIngestionService
 
@@ -67,15 +68,17 @@ _SESSION_ERRORS = tuple(
 )
 
 
-async def dispatch_to_ai(chat_id: int, context_header: str, messages: List[dict]) -> None:
+async def dispatch_to_ai(source: MessageSource, messages: List[dict]) -> None:
     """Telegram → dispatcher bridge. Each batch gets its own database session.
     Errors propagate, so the listener records the batch as FAILED and retries it."""
     async with database.AsyncSessionLocal() as db:
         await dispatcher.process_and_dispatch(
-            chat_id=chat_id,
-            context_header=context_header,
+            chat_id=source.chat_id,
+            context_header=source.context,
             messages=messages,
             db=db,
+            company_id=source.company_id,
+            subchannel=source.subchannel,
         )
 
 
