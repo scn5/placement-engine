@@ -6,7 +6,7 @@ Responsibilities:
   • Register NewMessage + MessageEdited handlers on a Telethon client — nothing
     else. Reaction updates (UpdateMessageReactions, UpdateBotMessageReaction…)
     are never subscribed to, reactions are never read, and an edit update that
-    leaves the text unchanged (Telegram can re-send a message after a reaction)
+    leaves the text unchanged (Telegram may re-send a message after a reaction)
     is ignored.
   • Root feeds (main/test; broadcast channels only): an invite post's channels
     are joined under the join policy and the post is extracted together with
@@ -434,7 +434,7 @@ class TelegramIngestionService:
             await self._handle_subchannel(event, is_edit)
 
     async def _is_new_version(self, chat_id: int, message) -> bool:
-        """Whether an edit update carries new text. Telegram also sends edit
+        """Whether an edit update carries new text. Telegram may also send edit
         updates when only metadata changed (e.g. a reaction); those — and
         updates for old messages that were never processed here — are ignored."""
         edit_date = _as_utc(getattr(message, "edit_date", None))
