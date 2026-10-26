@@ -284,6 +284,8 @@ async def test_router_http_endpoints() -> None:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    from app.security import require_api_key  # authentication: verify_security.py
+    app.dependency_overrides[require_api_key] = lambda: None
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # ── 1. POST /companies/ with mobile payload ──

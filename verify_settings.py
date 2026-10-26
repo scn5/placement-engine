@@ -55,6 +55,8 @@ async def verify():
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    from app.security import require_api_key  # authentication: verify_security.py
+    app.dependency_overrides[require_api_key] = lambda: None
 
     # We need to use httpx.ASGITransport for testing FastAPI app
     transport = httpx.ASGITransport(app=app)

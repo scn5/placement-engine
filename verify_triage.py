@@ -245,6 +245,8 @@ async def test_fastapi_endpoints() -> None:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    from app.security import require_api_key  # authentication: verify_security.py
+    app.dependency_overrides[require_api_key] = lambda: None
 
     # Setup isolated test fixtures specifically for endpoint tests
     async with _TestSession() as db:

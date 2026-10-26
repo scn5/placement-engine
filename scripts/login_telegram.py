@@ -3,6 +3,11 @@ scripts/login_telegram.py
 Standalone interactive CLI script to authenticate a Telethon user session
 for the Placement Engine backend.
 
+The session file it creates is a live credential for the whole Telegram
+account: it is never printed, copied or committed. (Earlier versions also
+printed a StringSession for TELEGRAM_SESSION_STRING; that was removed in
+Phase 0.6 — anything printed ends up in terminal scrollback and logs.)
+
 Usage (from placement-engine/ directory):
     .\\venv\\Scripts\\python.exe scripts/login_telegram.py
 """
@@ -18,7 +23,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 # Load .env explicitly from placement-engine root
 load_dotenv(PROJECT_ROOT / ".env")
@@ -62,13 +66,8 @@ async def main() -> None:
         print(f"  Logged in as : {full_name}{username_str}")
         print(f"  User ID      : {me.id}")
         print(f"  Session file : {session_path}.session")
-        try:
-            session_str = StringSession.save(client.session)
-            if session_str:
-                print("\nOptional stateless session string (for TELEGRAM_SESSION_STRING in .env):")
-                print(f"TELEGRAM_SESSION_STRING={session_str}")
-        except Exception:
-            pass
+        print("\nThe session file is a live login for this account: keep it private,")
+        print("never commit, copy or share it. Run exactly one worker per session.")
         print("============================================================\n")
     finally:
         if client.is_connected():

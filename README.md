@@ -99,8 +99,8 @@ placement-engine/
 │   ├── sources.py              # Where a message batch came from (listener → dispatcher)
 │   └── worker.py               # Ingestion worker: Telethon, dispatcher bridge, catch-up/retry/heartbeat loops
 ├── scripts/
-│   ├── clean_test_data.py      # Cleans test/sandbox records from MAIN environment
-│   ├── login_telegram.py       # CLI interactive MTProto session authenticator
+│   ├── clean_test_data.py      # Removes TEST companies only; dry run unless --apply
+│   ├── login_telegram.py       # CLI interactive MTProto session authenticator (prints no session string)
 │   └── test_live_ingestion.py  # Live sandbox integration harness
 ├── alembic/                    # Schema migrations (config in alembic.ini; target = DATABASE_URL)
 ├── requirements.txt            # Production Python dependencies
@@ -160,6 +160,8 @@ cp .env.example .env
 | `DEBOUNCE_DELAY_SECONDS`| Buffer window for message bursts | `90.0` |
 | `DEBOUNCE_MAX_WAIT_SECONDS`| Longest a busy chat's buffer waits before it is sent | `120.0` |
 | `GROQ_API_KEY` / `LLM_API_KEY` | API key for the extraction LLM (`LLM_API_KEY` wins if both are set) | `""` |
+| `API_KEY` | Shared key the app sends as `X-API-Key`; required in production (≥ 32 characters). Generate: `python -c "import secrets; print(secrets.token_urlsafe(32))"` | unset |
+| `APP_ENV` | `development`, `testing` or `production` (anything else counts as production) | `development` |
 | `LLM_BASE_URL` | OpenAI-compatible endpoint | `https://api.groq.com/openai/v1` |
 | `LLM_MODEL` | LLM model identifier | `openai/gpt-oss-20b` |
 | `LLM_REASONING_EFFORT` | Optional `low` / `medium` / `high` (unset = provider default) | unset |
@@ -192,9 +194,11 @@ python -m app.worker
 > With `TELEGRAM_API_ID` set, **the worker** connects your **live** Telegram session, processes the feeds listed in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins the channel invite links posted there, under the join policy. Never run two workers on the same session — Telegram revokes it. To keep a worker offline, set `TELEGRAM_API_ID=0` for that process only; don't edit `.env`.
 >
 > Worker exit codes: `0` disabled or stopped cleanly, `1` listener stopped (safe to restart), `2` session unauthorized/revoked (re-run `scripts/login_telegram.py`).
-Interactive OpenAPI documentation will be accessible at:
-- **Swagger UI**: `http://localhost:8000/docs`
+Interactive OpenAPI documentation is served in development only:
+- **Swagger UI**: `http://localhost:8000/docs` (use **Authorize** with the API key when `API_KEY` is set)
 - **ReDoc**: `http://localhost:8000/redoc`
+
+Every route except `GET /health` requires the `X-API-Key` header when `API_KEY` is set (always in production); `GET /status` reports the ingestion worker's heartbeat.
 
 ---
 
@@ -220,8 +224,12 @@ python verify_extraction.py # Extractor, prompt headers, dispatcher updates and 
 
 ## Database Maintenance
 
-> [!CAUTION]
-> **Do not run `scripts/clean_test_data.py` against real data.** It *hard-deletes* every `MAIN` company whose name merely contains `test`, `dummy`, `fallback`, `mock` or `acme` (e.g. "Latest updates…", Testbook, Acme Solar). A TEST-only, dry-run-by-default version is planned for Phase 0.6.
+`scripts/clean_test_data.py` removes TEST-environment companies (with their roles and events) and never touches MAIN data. It is a dry run unless you pass `--apply`; `--name <text>` narrows it.
+
+```bash
+python scripts/clean_test_data.py                 # list what would be deleted
+python scripts/clean_test_data.py --name acme --apply
+```
 
 ---
 
@@ -230,7 +238,7 @@ python verify_extraction.py # Extractor, prompt headers, dispatcher updates and 
 ### Docker Deployment
 
 > [!CAUTION]
-> **Superseded — do not build this.** There is no `.dockerignore`, so `COPY . .` would bake `.env`, `placement_session.session`, `dev.db` and the local venv into image layers. It also uses Python 3.11 while production targets 3.12, and it runs Telethon inside the API process. The hardened multi-stage image (API and worker containers, secrets on mounted volumes) is part of Phase 1.
+> **Superseded — do not build this.** A `.dockerignore` now keeps `.env*`, sessions, databases, `venv/` and `.git/` out of the build context (Phase 0.6), but this Dockerfile is still not the production image. It also uses Python 3.11 while production targets 3.12, and it runs Telethon inside the API process. The hardened multi-stage image (API and worker containers, secrets on mounted volumes) is part of Phase 1.
 
 ```dockerfile
 FROM python:3.11-slim
@@ -249,4 +257,4 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
-Use the assigned Cloudflare HTTPS URL as the backend URL in the mobile **Command Center**. Quick-tunnel URLs change on every restart, and the API has no authentication yet. Production will use a named tunnel on an owned domain plus a shared API key (Phases 0.6 and 1).
+Use the assigned Cloudflare HTTPS URL as the backend URL in the mobile **Command Center**. Quick-tunnel URLs change on every restart. Set `API_KEY` before exposing the API through any tunnel; production uses a named tunnel on an owned domain (Phase 1).

@@ -704,6 +704,8 @@ async def test_tracking_invariants() -> None:
     await _dispatch(_result(_action(title="Silent OA", end_time=_now() + timedelta(days=2))), chat_id=silent_chat, messages=[_message(140)])
 
     app.dependency_overrides[get_db] = override_get_db
+    from app.security import require_api_key  # authentication: verify_security.py
+    app.dependency_overrides[require_api_key] = lambda: None
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             # 5 + 1: triage never changes an IGNORED role or a role of an IGNORED company.

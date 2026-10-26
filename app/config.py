@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENVIRONMENTS = {"MAIN", "TEST"}
@@ -9,7 +9,12 @@ _ENVIRONMENTS = {"MAIN", "TEST"}
 class Settings(BaseSettings):
     # Database — production must set DATABASE_URL explicitly.
     DATABASE_URL: str = "sqlite+aiosqlite:///./dev.db"
+    # development | testing | production. Any other value counts as production
+    # (fail-closed): API docs are off and API_KEY is required.
     APP_ENV: str = "development"
+    # Shared key the app sends as X-API-Key (Phase 0.6). Required in production
+    # (at least 32 characters); without one in development every route is open.
+    API_KEY: Optional[SecretStr] = None
 
     # Telegram MTProto credentials (TELEGRAM_API_ID=0 disables the ingestion worker)
     TELEGRAM_API_ID: int = 0
@@ -71,6 +76,16 @@ class Settings(BaseSettings):
         if value not in ("low", "medium", "high"):
             raise ValueError(f"LLM_REASONING_EFFORT must be low, medium or high, got {value!r}")
         return value
+
+    @property
+    def is_production(self) -> bool:
+        return self.APP_ENV.strip().lower() not in ("development", "testing")
+
+    @property
+    def api_key(self) -> Optional[str]:
+        """The configured API key, or None when unset or blank."""
+        value = self.API_KEY.get_secret_value().strip() if self.API_KEY is not None else ""
+        return value or None
 
     @property
     def ingest_environments(self) -> frozenset[str]:

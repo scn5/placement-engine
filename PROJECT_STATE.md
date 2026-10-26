@@ -30,7 +30,7 @@
    - **Rule:** All test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) MUST strictly bind to isolated in-memory databases (`sqlite+aiosqlite:///:memory:`) and override `app.database.engine`.
    - **Why:** Running tests against local disk files (`dev.db`) causes test fixtures to pollute the real `MAIN` feed environment with mock companies (`FallbackTestCorp`, `Acme Corp`), corrupting state for live Telegram listeners and mobile clients.
    - **Enforcement:** Since Phase 0.2, every database-touching suite (`verify_phase2/3/4.py`, `verify_triage.py`, `verify_settings.py`, `verify_schema.py`, and later `verify_worker.py`, `verify_ingestion.py`) binds `:memory:`; `verify_phase3.py` was patched (it used to read the configured database through `_is_known_subchannel`). All suites also enable SQLite foreign keys and turn `NaiveDatetimeWarning` into an error.
-   - **⚠ Do not run `scripts/clean_test_data.py` against real data:** it *hard-deletes* every `MAIN` company whose name merely contains `test`, `dummy`, `fallback`, `mock` or `acme` (e.g. "Latest updates…", Testbook, Acme Solar). Fix scheduled for Phase 0.6.
+   - **`scripts/clean_test_data.py` (rewritten in 0.6):** it only ever touches TEST-environment companies and is a dry run unless `--apply` is given (`--name` narrows it). The old version hard-deleted MAIN companies whose names merely contained "test", "acme", …
 
 ---
 
@@ -63,7 +63,7 @@ Verified by reading the code; items marked † were also reproduced by executing
 | C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | ✅ Downtime 0.3 (ledger catch-up + retries); offline edits and failed joins 0.4; LLM failures raise `ExtractionFailed` and are retried 0.5 |
 | C5 † | Regex fallback invents wrong events and fires on valid empty LLM results (see Tribal Knowledge #2). | `app/ai/extractor.py:66-77`, `app/ai/rule_extractor.py` | ✅ 0.5 (deleted; failures are retried instead) |
 | C6 | Auto-join resolves any `t.me/<name>`: a person/bot username creates a company plus a 24 h backfill of the private DM history (sent to the LLM); permalinks join foreign channels; the private-hash fallback re-resolves the hash as a username. | `app/telegram/listener.py:40-47,363-366,376,425-435` | ✅ 0.4 (`join_policy.py`: channels and supergroups only; root feeds must be broadcast channels) |
-| C7 | No authentication on any route; CORS reflects any origin with credentials. | `app/main.py:145-151` | 0.6 |
+| C7 | No authentication on any route; CORS reflects any origin with credentials. | `app/main.py:145-151` | ✅ 0.6 (`X-API-Key` on every route but `/health`; CORS removed; docs off in production) |
 | H1 † | Mixed IST/UTC wall-clock storage in SQLite (see Tribal Knowledge #1). | `app/models.py:145-158` | ✅ 0.2 |
 | H2 | Message post times never reach the LLM; relative dates resolve against processing time (wrong for backfill, midnight, catch-up). | `app/ai/dispatcher.py:407-417`, `app/ai/prompts.py:90,130-137` | ✅ 0.5 (`[msg <id> · posted <IST> · edited]` headers; dates resolve against each message's post time) |
 | H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | ✅ 0.3–0.5 (ledger; edit collapse and per-chat order 0.4; event ids and `target_event_id`, edits update the events they created, same-time duplicates suppressed, reminder rule fixed 0.5) |
@@ -72,8 +72,8 @@ Verified by reading the code; items marked † were also reproduced by executing
 | H6 | Profile unused: INDIVIDUAL messages dropped even when addressed to the user; defaulter, slot and shortlist logic unimplemented. | `dispatcher.py:497-503` | Next phase |
 | H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | ✅ 0.2 (Alembic; live-PG run is the first Phase 1 step) |
 | H8 | Telethon runs inside the API process: >1 worker or two hosts on one session → `AUTH_KEY_DUPLICATED`; the listener task is unsupervised; `/health` always reports healthy. | `app/main.py:48-113,159-161` | ✅ 0.3 (separate worker process; liveness in `worker_status`; status endpoint 0.6) |
-| H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | 0.6, Phase 1 |
-| M1–M7 | No per-action rollback (✅ 0.5); every STATUS_NOTE re-triages (✅ 0.5, note kinds); the company toggle leaves `is_triaged=false` (✅ 0.5); the debouncer has no max-wait (✅ 0.4); Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
+| H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | ✅ 0.6 (`.dockerignore`; no session string printed); hardened image Phase 1 |
+| M1–M7 | No per-action rollback (✅ 0.5); every STATUS_NOTE re-triages (✅ 0.5, note kinds); the company toggle leaves `is_triaged=false` (✅ 0.5); the debouncer has no max-wait (✅ 0.4); Add Stage silently defaults to now+24 h; substring hard-delete script (✅ 0.6); documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
 
 ---
 
@@ -115,10 +115,12 @@ placement-engine/
 ├── verify_worker.py              # Ingestion worker, ledger, catch-up & retry suite (Phase 0.3)
 ├── verify_ingestion.py           # Join policy, invite posts, edits/reactions, supergroups, debouncer suite (Phase 0.4)
 ├── verify_extraction.py          # Extractor, prompt, dispatcher and invariants 1–9 suite (Phase 0.5)
+├── verify_security.py            # API key, /status, CORS/docs, startup policy, integrity errors, scripts, .dockerignore (Phase 0.6)
+├── .dockerignore                 # Keeps .env*, sessions, databases, venv/ and .git/ out of images (0.6)
 ├── scripts/
 │   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
-│   ├── login_telegram.py         # Interactive login → placement_session.session (also prints a session string — removal in 0.6)
-│   └── clean_test_data.py        # ⚠ substring-matching HARD delete — see Tribal Knowledge #3
+│   ├── login_telegram.py         # Interactive login → placement_session.session (prints no session string since 0.6)
+│   └── clean_test_data.py        # Removes TEST companies only; dry run unless --apply (0.6)
 ├── dev.db                        # Local SQLite database (git-ignored)
 │
 └── app/
@@ -128,7 +130,8 @@ placement-engine/
     ├── models.py                 # SQLAlchemy 2.0 ORM models
     ├── schemas.py                # Pydantic v2 API request/response schemas
     ├── crud.py                   # Async CRUD operations (select/update/returning)
-    ├── main.py                   # FastAPI app (API only): schema check, CORS, routers
+    ├── main.py                   # FastAPI app factory (API only): key policy, schema check, routers, integrity errors
+    ├── security.py               # X-API-Key dependency and the production key policy (0.6)
     ├── worker.py                 # Ingestion worker process: Telethon, dispatcher bridge, loops, heartbeat
     ├── sources.py                # MessageSource / SubchannelLink: where a batch came from (listener → dispatcher)
     │
@@ -137,7 +140,8 @@ placement-engine/
     │   ├── companies.py          # /companies endpoints
     │   ├── events.py             # /events endpoints
     │   ├── triage.py             # /triage staging queue & action endpoints
-    │   └── settings.py           # /settings user profile & feed configuration
+    │   ├── settings.py           # /settings user profile & feed configuration
+    │   └── status.py             # GET /status — ingestion worker heartbeat (0.6)
     │
     ├── telegram/
     │   ├── __init__.py
@@ -189,7 +193,8 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | Setting | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | `sqlite+aiosqlite:///./dev.db` (since 0.3; the old default carried a placeholder credential) | Production must set it explicitly |
-| `APP_ENV` | `development` | Environment label |
+| `APP_ENV` | `development` | `development`, `testing` or `production`. Any other value counts as production (fail-closed): API docs off and `API_KEY` required |
+| `API_KEY` | unset | Shared key every request sends as `X-API-Key` (0.6). Production refuses to start without one of ≥ 32 characters; unset in development leaves the API open (warning at startup). Generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `TELEGRAM_API_ID` | `0` | MTProto App ID (0 = listener disabled) |
 | `TELEGRAM_API_HASH` | `""` | MTProto App Hash |
 | `TELEGRAM_SESSION_NAME` | `placement_session` | File session used when `TELEGRAM_SESSION_STRING` is empty |
@@ -304,32 +309,33 @@ Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker an
 
 ### 6.1 Registered Routes
 
-> ⚠ No route requires authentication (gap C7).
+> **Authentication (0.6):** every route except `/health` requires the `X-API-Key` header, compared in constant time with `API_KEY` (`app/security.py`); a missing or wrong key → **401**. A production server without a key would answer **503** — it refuses to start anyway. Missing records referenced by a request return **404** (path) or **422** (body), duplicates **409**, other constraint violations **422** — never a 500 or SQL text.
 
 #### Meta
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Preflight check; returns `{"status": "healthy"}` |
+| `GET` | `/health` | Public liveness probe of the API process; returns only `{"status": "ok"}` |
+| `GET` | `/status` | Authenticated. The ingestion worker's heartbeat from `worker_status`: `status` (`ok` = fresh heartbeat and Telegram connected, `degraded`, `unknown` = never ran), `telegram_state`, `heartbeat_at`, `heartbeat_age_seconds`, `last_update_at`, `last_llm_ok_at`, `catchup_at`, `last_error` |
 
 #### Companies — `/companies`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `POST` | `/companies/` | `CompanyCreate` (accepts `name`, `company_name`, `target_role`, `role_name`, `drive_type`, `ctc_stipend_info`, `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates parent company and default `RoleTrack` (`is_triaged=True`, `tracking_mode="ELIGIBLE"`) |
+| `POST` | `/companies/` | `CompanyCreate` (accepts `name`, `company_name`, `target_role`, `role_name`, `drive_type`, `ctc_stipend_info`, `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates parent company and default `RoleTrack` (`is_triaged=True`, `tracking_mode="ELIGIBLE"`); **409** if the name exists in that environment |
 | `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` (filters `is_active == True`, serializes both `name` and `company_name`) |
 | `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological, filters `is_deleted == False`, returns 404 if company does not exist) |
 | `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` and `is_triaged=true` to every child `RoleTrack` — invariant 9). The only path out of IGNORED (invariant 1) |
-| `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201); **409** for an effectively IGNORED company (a new role would bring it back) |
+| `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201); **404** for an unknown company; **409** for an effectively IGNORED company (a new role would bring it back) |
 | `DELETE` | `/companies/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes company `is_active=False` & cascades `is_deleted=True` to events) |
 
 #### Timeline Events — `/events`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
 | `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (LEFT OUTER JOIN on `RoleTrack` so company-level events are preserved; filters `Company.is_active == True`, company not IGNORED, role ELIGIBLE and `TimelineEvent.is_deleted == False`; serializes `display_state`/`status`, and since 0.5 `needs_review`, `review_reason`, `source_chat_id`, `source_message_id`) |
-| `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201) |
+| `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201); **422** if `company_id` does not exist or `role_track_id` is not one of its roles |
 | `PATCH` | `/events/{id}/complete` | `?completed=true` | `TimelineEventResponse` |
 | `POST` | `/events/{id}/uncomplete` | — (alias `/reopen`) | `TimelineEventResponse` (resets `user_status=PENDING`, `completed_at=None`) |
 | `PATCH` | `/events/{id}/extend` | `ExtendDeadlinePayload` | `TimelineEventResponse` |
-| `POST` | `/events/companies/{id}/replace-form` | `ReplaceFormPayload` | `TimelineEventResponse` (201) |
+| `POST` | `/events/companies/{id}/replace-form` | `ReplaceFormPayload`, `?role_track_id=` | `TimelineEventResponse` (201); hides the superseded form (0.5); **404** for an unknown company, **422** for a role of another company |
 | `DELETE` | `/events/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes event `is_deleted=True`) |
 
 #### Triage Hub — `/triage`
@@ -520,7 +526,9 @@ await service.set_payload_handler(dispatch_to_ai)
 ```
 API — uvicorn app.main:app                    Worker — python -m app.worker (one per session)
   Startup                                       ├─ TELEGRAM_API_ID=0 → exit 0 (no client, no DB)
-  └─ assert_schema_current()                    ├─ assert_schema_current()
+  ├─ check_api_key_configuration()              ├─ assert_schema_current()
+  │   (production: no key ≥ 32 chars → refuse)  │
+  └─ assert_schema_current()                    │
   yield ←── FastAPI serves requests             ├─ connect + is_user_authorized → else exit 2 (after 10 min)
   Shutdown                                      ├─ refresh monitored set, register handlers, wire dispatch_to_ai
   └─ engine.dispose()                           ├─ listener + loops (catch-up, refresh, retries, heartbeat)
@@ -532,21 +540,13 @@ API — uvicorn app.main:app                    Worker — python -m app.worker 
 
 ---
 
-## 10. CORS & Networking
+## 10. Networking & API Security (Phase 0.6)
 
-```python
-CORSMiddleware(
-    allow_origin_regex=r"^https?://.*",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-```
-
-- ⚠ No authentication, and the origin regex reflects any origin with credentials (gap C7). React Native clients don't need CORS — removal planned in 0.6.
-- Bound on `0.0.0.0:8000` locally (earlier sessions used 8080)
-- Exposed publicly via `cloudflared tunnel --url http://localhost:8000` (quick tunnel: the URL changes on every restart)
-- HTTPS termination at Cloudflare edge — satisfies Android API 28+ cleartext restrictions
+- **No CORS middleware.** The React Native app makes native requests, which CORS doesn't govern; browsers get no `Access-Control-Allow-Origin` header, so no web page can call the API with a visitor's browser.
+- **Shared API key:** every route except `/health` requires `X-API-Key` (§6.1). The app pairs with the server URL and key in Phase 0.7; until then the current APK works only against a server without `API_KEY` (local development).
+- **Docs:** `/docs`, `/redoc` and `/openapi.json` are served in development only.
+- Bound on `0.0.0.0:8000` locally (earlier sessions used 8080).
+- Exposed via Cloudflare. Locally a quick tunnel (`cloudflared tunnel --url http://localhost:8000`, URL changes on every restart); production uses a named tunnel on an owned domain (Phase 1). HTTPS terminates at the Cloudflare edge, which satisfies Android API 28+ cleartext restrictions.
 
 ---
 
@@ -566,6 +566,7 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_worker.py` | `TELEGRAM_API_ID=0` builds no client; `app.main` imports no Telegram code; monitored set vs invariants 2–4; un-ignore/new-chat 24 h catch-up; ledger outcomes and backoff; retry loop; catch-up skipping; heartbeat + dead-man ping; exit codes; error propagation. The real `TelegramClient` class is replaced by one that fails if constructed | In-memory SQLite (migrated) |
 | `verify_ingestion.py` | Join-policy link and chat tables; short messages reach the LLM; reactions never subscribed to or read, unchanged-text edit updates ignored; invite posts joined, linked and extracted with their company, re-posts and replies attributed, IGNORED companies skipped; refused links (bot, person, basic group, approval, expired, phone, permalink, root feed) never joined; flood-wait retry and join pacing; supergroup admin filter; root feeds must be broadcast channels; debouncer max-wait and per-chat order; ≤ 40 messages per LLM call; offline edits caught up; dispatcher source company, naming and IGNORED gate; no cross-environment attribution. Every chat, person and bot is a mocked entity | In-memory SQLite (migrated) |
 | `verify_extraction.py` | Strict JSON-schema requests (schema closed and in step with the model); `ExtractionFailed` for invalid/empty/truncated answers, timeouts, network and rate limits (no regex fallback); output-mode fallbacks; failed extraction → ledger FAILED → retried to DONE; message headers and prompt rules; updates by `target_event_id`; edits update instead of duplicating; same-time duplicates suppressed; `needs_review` flags; source message ids; superseded forms hidden; note kinds; env-scoped root-feed names; per-action rollback; invariants 1–9 through the API (409s, last-discard sync, timeline filters, PATCH triages every role, no profile data to the LLM) | In-memory SQLite (migrated) |
+| `verify_security.py` | Every operation but `/health` requires `X-API-Key` (OpenAPI schema and live calls: missing, wrong, truncated → 401); constant-time compare; `/health` minimal, `/status` ok/degraded/unknown; no CORS headers; docs off in production; APP_ENV fail-closed; production startup refused without a strong key; 404/409/422 instead of 500; login script prints no session string (static check — never run); `clean_test_data.py` dry-run and TEST-only; `.dockerignore` coverage | In-memory SQLite (migrated) |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
 > ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
@@ -583,6 +584,7 @@ python verify_schema.py
 python verify_worker.py
 python verify_ingestion.py
 python verify_extraction.py
+python verify_security.py
 # Owner-run only (uses the live session, read-only):
 python scripts/test_live_ingestion.py
 ```
@@ -599,8 +601,8 @@ python scripts/test_live_ingestion.py
 | 0.2 | Schema foundation: Alembic baseline, `UTCDateTime`, env-scoped company uniqueness, `message_ledger` / `worker_status` tables, SQLite pragmas | ✅ Done — reviewed 2026-10-23 (settings row restored from the backup) |
 | 0.3 | API / worker process split; ledger outcomes; monitored-set refresh, catch-up, retry and heartbeat loops | ✅ Done — reviewed 2026-10-23 |
 | 0.4 | Ingestion: empty-only pre-filter, join policy, invite-post extraction and attribution, reactions ignored and edit detection, supergroup admin filter, debouncer max-wait and order, ≤ 40 messages per LLM call | ✅ Done — reviewed 2026-10-26 |
-| 0.5 | Extraction & dispatch: message headers and post-time dates, event ids and `target_event_id`, regex fallback removed and `ExtractionFailed` retried, strict structured output, note kinds, review flags and source ids, invariants 1–9 | ✅ Done — pending owner review |
-| 0.6 | API key, CORS removal, secret hygiene, `.dockerignore` | Planned |
+| 0.5 | Extraction & dispatch: message headers and post-time dates, event ids and `target_event_id`, regex fallback removed and `ExtractionFailed` retried, strict structured output, note kinds, review flags and source ids, invariants 1–9 | ✅ Done — reviewed 2026-10-26 |
+| 0.6 | API security: `X-API-Key` on every route but `/health`, authenticated `/status`, CORS removed, docs off in production, production refuses to start without a key, 404/409/422 instead of 500, safe login and cleanup scripts, `.dockerignore` | ✅ Done — pending owner review |
 | 0.7 | Frontend: API-key pairing, needs-review pill, Telegram deep links | Planned |
 
 Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN feed) follows Phase 0.
@@ -662,7 +664,7 @@ e850a9c feat(pre-interview): implement master spec time normalization, ist ancho
 e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
 
-> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), then 0.5.
+> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), `76a0fd8` (0.5), then 0.6.
 
 ---
 
@@ -685,7 +687,7 @@ python -m app.worker
 cloudflared tunnel --url http://localhost:8000
 ```
 
-> Swagger UI available at `http://localhost:8000/docs` during development.
+> Swagger UI available at `http://localhost:8000/docs` in development only (use **Authorize** with the API key when `API_KEY` is set).
 
 > [!WARNING]
 > With `TELEGRAM_API_ID` set, **the worker** connects the **live personal session**, processes the feeds in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins the channel invite links posted there, under the join policy (§7.8). Never run two workers on the same session (Telegram revokes it). To keep a worker from connecting, set `TELEGRAM_API_ID=0` for that process only (PowerShell: `$env:TELEGRAM_API_ID="0"`) — never by editing `.env`. The API never connects to Telegram.

@@ -3,10 +3,22 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import crud, schemas
+from app import crud, models, schemas
 from app.database import get_db
 
 router = APIRouter(prefix="/events", tags=["Timeline Events"])
+
+
+async def _check_role_of_company(db: AsyncSession, role_track_id: Optional[int], company_id: int) -> None:
+    """422 unless *role_track_id* is empty or one of the company's roles."""
+    if role_track_id is None:
+        return
+    role = await db.get(models.RoleTrack, role_track_id)
+    if role is None or role.company_id != company_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"role_track_id {role_track_id} is not a role of company {company_id}.",
+        )
 
 
 @router.get(
@@ -41,6 +53,12 @@ async def create_event(
     db: AsyncSession = Depends(get_db),
 ) -> schemas.TimelineEventResponse:
     """Create a new custom stage or deadline event."""
+    if await db.get(models.Company, event_in.company_id) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"company_id {event_in.company_id} does not exist.",
+        )
+    await _check_role_of_company(db, event_in.role_track_id, event_in.company_id)
     db_event = await crud.create_custom_event(db, event_in)
     return schemas.TimelineEventResponse.model_validate(db_event)
 
@@ -125,6 +143,12 @@ async def replace_form(
     db: AsyncSession = Depends(get_db),
 ) -> schemas.TimelineEventResponse:
     """Supersede the current FORM_SUBMISSION event with a new versioned entry."""
+    if await db.get(models.Company, company_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company {company_id} not found.",
+        )
+    await _check_role_of_company(db, role_track_id, company_id)
     new_event = await crud.replace_form_event(
         db, company_id=company_id, role_track_id=role_track_id, payload=payload
     )

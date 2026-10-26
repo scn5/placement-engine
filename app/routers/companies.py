@@ -101,8 +101,13 @@ async def add_role_track(
     """Add a new FTE / Internship / Combined role track to an existing company."""
     if track_in.company_id != company_id:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="Body company_id must match path company_id.",
+        )
+    if await db.get(models.Company, company_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company {company_id} not found.",
         )
     try:
         db_track = await crud.create_role_track(db, track_in)

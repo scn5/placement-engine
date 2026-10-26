@@ -207,6 +207,20 @@ class SystemConfigResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class WorkerStatusResponse(BaseModel):
+    """GET /status: the ingestion worker's last heartbeat (worker_status)."""
+
+    status: Literal["ok", "degraded", "unknown"]
+    telegram_state: Optional[str] = None
+    heartbeat_at: Optional[datetime] = None
+    heartbeat_age_seconds: Optional[int] = None
+    last_update_at: Optional[datetime] = None
+    last_llm_ok_at: Optional[datetime] = None
+    catchup_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    checked_at: datetime
+
+
 class SystemConfigUpdate(BaseModel):
     student_name: Optional[str] = None
     roll_number: Optional[str] = None

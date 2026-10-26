@@ -15,7 +15,7 @@
 * **LLM Engine:** Use the `openai` Python SDK configured with a custom `base_url` for Groq. Request Groq strict structured output (`json_schema`, `strict: true`, `RESULT_JSON_SCHEMA`) with the JSON-object fallback, and keep that schema in step with `ExtractedEvent` / `LLMExtractionResult` (`verify_extraction.py` checks it). Never add a regex or heuristic extraction fallback that writes events — a failed extraction raises `ExtractionFailed` and is retried, never guessed (see `PROJECT_STATE.md` Tribal Knowledge #2).
 
 ## 4. Tenancy & Auth
-* **Single Tenant:** Do not build multi-user authentication, JWT middleware, or user tables. This system belongs to a single user. The only authentication is one shared API key (`X-API-Key`) set when the app is paired — planned for Phase 0.6; today no route is authenticated.
+* **Single Tenant:** Do not build multi-user authentication, JWT middleware, or user tables. This system belongs to a single user. The only authentication is one shared API key: every router is included with `Depends(require_api_key)` (`app/security.py`) and only `/health` is public — keep it that way for new routes (`verify_security.py` checks every operation). Never log or echo the key.
 
 ## 5. Binding Domain Rules
 * **Tracking-status invariants:** `PROJECT_STATE.md` §0.1 is binding. In short: `IGNORED` is a terminal, human-only status (only `PATCH /companies/{id}/tracking` reverses it, and its channel is not processed); criteria relaxation only *proposes* re-triage for `SILENT_TRACK` roles and never changes `tracking_mode`; CGPA/branch are never given to the automation.

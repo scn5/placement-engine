@@ -1,0 +1,38 @@
+# Docker build context exclusions (Phase 0.6). Secrets, sessions, databases and
+# local tooling must never be copied into an image layer — production reads
+# them from the host at run time (see PROJECT_STATE §12, Phase 1).
+
+# Secrets and environment files (.env, .env.local, .env.example, ...)
+.env*
+**/.env*
+*.env
+
+# Telegram sessions: a live login for the whole account
+*.session*
+**/*.session*
+
+# Databases, WAL/SHM side files and backups
+*.db*
+**/*.db*
+*.sqlite*
+**/*.sqlite*
+*.bak
+
+# Virtual environments, VCS and caches
+venv/
+.venv/
+env/
+.git/
+.gitignore
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor, OS and log files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
