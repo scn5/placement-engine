@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     LLM_BASE_URL: Optional[str] = "https://api.groq.com/openai/v1"
     LLM_MODEL: str = "openai/gpt-oss-20b"
+    # low | medium | high; unset = the provider's default. Lower effort is cheaper
+    # and faster but may resolve dates less carefully — tune with shadow-run data.
+    LLM_REASONING_EFFORT: Optional[str] = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -58,6 +61,16 @@ class Settings(BaseSettings):
                 f"INGEST_ENVIRONMENTS must list MAIN and/or TEST, got {value!r}"
             )
         return ",".join(envs)
+
+    @field_validator("LLM_REASONING_EFFORT")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        value = value.strip().lower()
+        if value not in ("low", "medium", "high"):
+            raise ValueError(f"LLM_REASONING_EFFORT must be low, medium or high, got {value!r}")
+        return value
 
     @property
     def ingest_environments(self) -> frozenset[str]:

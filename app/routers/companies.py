@@ -104,7 +104,10 @@ async def add_role_track(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Body company_id must match path company_id.",
         )
-    db_track = await crud.create_role_track(db, track_in)
+    try:
+        db_track = await crud.create_role_track(db, track_in)
+    except crud.TrackingLocked as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return schemas.RoleTrackResponse.model_validate(db_track)
 
 

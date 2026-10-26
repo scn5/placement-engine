@@ -22,7 +22,9 @@ def get_ai_client() -> AsyncOpenAI:
     global _ai_client
     if _ai_client is None:
         api_key = settings.LLM_API_KEY or settings.GROQ_API_KEY or "no-key"
-        kwargs = {"api_key": api_key}
+        # Transient errors (429, 5xx, timeouts) are retried here first; whatever
+        # still fails reaches the message ledger's retry backoff.
+        kwargs = {"api_key": api_key, "max_retries": 3}
         if settings.LLM_BASE_URL:
             kwargs["base_url"] = settings.LLM_BASE_URL
         _ai_client = AsyncOpenAI(**kwargs)

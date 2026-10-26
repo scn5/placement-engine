@@ -33,6 +33,16 @@ ActionType = Literal[
 ]
 """State machine verb the dispatcher will execute for this extraction."""
 
+EventType = Literal["IRIS_DEADLINE", "FORM_SUBMISSION", "PPT", "OA_WINDOW", "INTERVIEW", "CUSTOM"]
+"""Canonical event types (the prompt's rule list and the strict JSON schema)."""
+
+Confidence = Literal["HIGH", "MEDIUM", "LOW"]
+"""How sure the model is; LOW results are kept but flagged needs_review."""
+
+NoteKind = Literal["CRITERIA_RELAXATION", "GENERAL"]
+"""STATUS_NOTE kind. Only CRITERIA_RELAXATION may re-open a SILENT_TRACK role in
+Triage (PROJECT_STATE §0.1 invariant 6); a missing kind counts as GENERAL."""
+
 
 # ---------------------------------------------------------------------------
 # Core extraction models
@@ -126,6 +136,33 @@ class ExtractedEvent(BaseModel):
         default=None,
         description="Free-text status update for STATUS_NOTE actions (e.g. 'Shortlists delayed by 2 days').",
     )
+    note_kind: Optional[NoteKind] = Field(
+        default=None,
+        description="STATUS_NOTE only: CRITERIA_RELAXATION when eligibility was widened, else GENERAL.",
+    )
+    target_event_id: Optional[int] = Field(
+        default=None,
+        description="Id of the existing event (from the Known Schedule) this action updates; null for a new event.",
+    )
+    source_message_id: Optional[int] = Field(
+        default=None,
+        description="Id of the message (from its [msg <id> …] header) the action comes from.",
+    )
+    confidence: Optional[Confidence] = Field(
+        default=None,
+        description="HIGH, MEDIUM or LOW; LOW results are kept but flagged for review.",
+    )
+
+    @field_validator("note_kind", "confidence", mode="before")
+    @classmethod
+    def normalise_labels(cls, v, info):
+        """Accept any letter case; an unknown label becomes None instead of
+        failing the whole batch."""
+        if not isinstance(v, str):
+            return None
+        value = v.strip().upper()
+        allowed = ("CRITERIA_RELAXATION", "GENERAL") if info.field_name == "note_kind" else ("HIGH", "MEDIUM", "LOW")
+        return value if value in allowed else None
 
 
 class LLMExtractionResult(BaseModel):
@@ -139,3 +176,55 @@ class LLMExtractionResult(BaseModel):
         default_factory=list,
         description="Ordered list of extracted state-machine actions.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Strict JSON schema (Groq structured outputs, strict mode)
+# ---------------------------------------------------------------------------
+# Strict mode decodes only output that matches the schema: every property must
+# be listed in "required", every object closed with "additionalProperties":
+# false, and optional values are expressed as unions with null. Keep the
+# properties in step with ExtractedEvent / LLMExtractionResult —
+# verify_extraction.py checks they match.
+
+
+def _nullable(schema: dict) -> dict:
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+def _enum(values) -> dict:
+    return {"type": "string", "enum": list(values)}
+
+
+_ACTION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": _enum(ActionType.__args__),
+        "company_name": _nullable({"type": "string"}),
+        "role_name": _nullable({"type": "string"}),
+        "drive_type": _enum(DriveType.__args__),
+        "audience_scope": _enum(AudienceScope.__args__),
+        "event_type": _nullable(_enum(EventType.__args__)),
+        "title": _nullable({"type": "string"}),
+        "action_link": _nullable({"type": "string"}),
+        "start_time": _nullable({"type": "string", "description": "ISO-8601 with a UTC offset"}),
+        "end_time": _nullable({"type": "string", "description": "ISO-8601 with a UTC offset"}),
+        "status_note": _nullable({"type": "string"}),
+        "note_kind": _nullable(_enum(NoteKind.__args__)),
+        "target_event_id": _nullable({"type": "integer"}),
+        "source_message_id": _nullable({"type": "integer"}),
+        "confidence": _enum(Confidence.__args__),
+    },
+    "additionalProperties": False,
+}
+_ACTION_JSON_SCHEMA["required"] = list(_ACTION_JSON_SCHEMA["properties"])
+
+RESULT_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company_name": _nullable({"type": "string"}),
+        "actions": {"type": "array", "items": _ACTION_JSON_SCHEMA},
+    },
+    "required": ["company_name", "actions"],
+    "additionalProperties": False,
+}

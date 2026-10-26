@@ -12,7 +12,7 @@
 
 ## 3. External Integrations
 * **Telethon:** The Telegram ingestion listener runs on `asyncio`. Ensure no blocking synchronous code (like `time.sleep` or heavy synchronous CPU bounds) is executed inside the event handlers, as this drops MTProto keep-alives.
-* **LLM Engine:** Use the `openai` Python SDK configured with a custom `base_url` for Groq. Pass `response_format={"type": "json_object"}` until Phase 0.5 evaluates Groq's strict `json_schema` mode for gpt-oss-20b. Never add a regex or heuristic extraction fallback that writes events — failed extractions must be retried, not guessed (see `PROJECT_STATE.md` §0.2 gap C5).
+* **LLM Engine:** Use the `openai` Python SDK configured with a custom `base_url` for Groq. Request Groq strict structured output (`json_schema`, `strict: true`, `RESULT_JSON_SCHEMA`) with the JSON-object fallback, and keep that schema in step with `ExtractedEvent` / `LLMExtractionResult` (`verify_extraction.py` checks it). Never add a regex or heuristic extraction fallback that writes events — a failed extraction raises `ExtractionFailed` and is retried, never guessed (see `PROJECT_STATE.md` Tribal Knowledge #2).
 
 ## 4. Tenancy & Auth
 * **Single Tenant:** Do not build multi-user authentication, JWT middleware, or user tables. This system belongs to a single user. The only authentication is one shared API key (`X-API-Key`) set when the app is paired — planned for Phase 0.6; today no route is authenticated.

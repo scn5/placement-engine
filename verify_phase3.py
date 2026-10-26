@@ -321,7 +321,7 @@ async def test_listener_payload_handler() -> None:
     assert source.context == "subchannel"
     assert source.company_id is None and source.subchannel is None
     assert messages[0]["id"] == 1
-    assert messages[0]["label"] == "[1]"
+    assert messages[0]["is_edit"] is False and messages[0]["date"] > 0  # header fields for the prompt
 
     print("  [6] ✓ Listener payload handler dispatch verified (subchannel route)")
 

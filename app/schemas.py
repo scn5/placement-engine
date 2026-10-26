@@ -37,6 +37,12 @@ class TimelineEventResponse(TimelineEventBase):
     completed_at: Optional[datetime] = None
     is_custom: bool
     version: int
+    # Uncertain extractions are kept but flagged for the user (recall-first).
+    needs_review: bool = False
+    review_reason: Optional[str] = None
+    # Telegram message that last created or updated the event (for deep links).
+    source_chat_id: Optional[int] = None
+    source_message_id: Optional[int] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -70,6 +76,7 @@ class RoleTrackResponse(RoleTrackBase):
     company_id: int
     lifecycle_status: str
     latest_status_note: Optional[str] = None
+    latest_note_kind: Optional[str] = None  # CRITERIA_RELAXATION | GENERAL
     created_at: datetime
     updated_at: datetime
 
@@ -173,6 +180,8 @@ class TriageItemResponse(BaseModel):
     environment_type: str = "MAIN"
     ctc_stipend_info: Optional[str] = None
     latest_status_note: Optional[str] = None
+    # CRITERIA_RELAXATION marks a proposal to re-triage a SILENT_TRACK role.
+    latest_note_kind: Optional[str] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

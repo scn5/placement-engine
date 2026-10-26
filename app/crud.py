@@ -7,6 +7,29 @@ from sqlalchemy.orm import selectinload
 
 from app import models, schemas
 
+NOTE_KINDS = ("CRITERIA_RELAXATION", "GENERAL")
+_REVIEW_REASON_LIMIT = 500
+
+
+class TrackingLocked(Exception):
+    """The change would touch an IGNORED company or role. IGNORED is terminal
+    and human-only: only PATCH /companies/{id}/tracking (the Companies-screen
+    toggle) can reverse it (PROJECT_STATE §0.1 invariants 1, 2 and 5)."""
+
+
+async def is_effectively_ignored(db: AsyncSession, company_id: int) -> bool:
+    """IGNORED at company level, or every one of its roles IGNORED (invariant 2)."""
+    company = await db.get(models.Company, company_id)
+    if company is None:
+        return False
+    if company.tracking_mode == "IGNORED":
+        return True
+    result = await db.execute(
+        select(models.RoleTrack.tracking_mode).where(models.RoleTrack.company_id == company_id)
+    )
+    modes = list(result.scalars().all())
+    return bool(modes) and all(mode == "IGNORED" for mode in modes)
+
 
 # ---------------------------------------------------------------------------
 # Company Operations
@@ -115,6 +138,9 @@ async def update_company_tracking(
     db: AsyncSession, company_id: int, mode: str
 ) -> Optional[models.Company]:
     """Update a company's tracking_mode and cascade to all its child RoleTracks.
+    This is the only path that moves a company out of IGNORED (invariant 1). An
+    explicit company-level choice also marks every role triaged, so a company
+    never shows in Triage and on the Timeline at once (invariant 9).
     Eagerly loads role_tracks to prevent MissingGreenlet in async serializers.
     Returns None if company not found."""
     check_stmt = select(models.Company).where(models.Company.id == company_id)
@@ -133,7 +159,7 @@ async def update_company_tracking(
     await db.execute(
         update(models.RoleTrack)
         .where(models.RoleTrack.company_id == company_id)
-        .values(tracking_mode=mode)
+        .values(tracking_mode=mode, is_triaged=True)
     )
 
     await db.commit()
@@ -177,7 +203,11 @@ async def soft_delete_timeline_event(
 async def create_role_track(
     db: AsyncSession, track_in: schemas.RoleTrackCreate
 ) -> models.RoleTrack:
-    """Add a new role track to an existing company."""
+    """Add a new role track to an existing company. Refused for an effectively
+    IGNORED company: a new role would bring it back without the Companies-screen
+    toggle (invariant 1)."""
+    if await is_effectively_ignored(db, track_in.company_id):
+        raise TrackingLocked("This company is IGNORED. Change it from the Companies screen first.")
     db_track = models.RoleTrack(
         company_id=track_in.company_id,
         role_name=track_in.role_name,
@@ -220,6 +250,7 @@ async def get_timeline_events(
         )
         .where(
             models.Company.is_active == True,  # noqa: E712
+            models.Company.tracking_mode != "IGNORED",
             models.TimelineEvent.is_deleted == False,  # noqa: E712
             or_(
                 models.RoleTrack.tracking_mode == "ELIGIBLE",
@@ -298,7 +329,7 @@ async def create_custom_event(
         track_result = await db.execute(
             select(models.RoleTrack.id)
             .where(models.RoleTrack.company_id == event_in.company_id)
-            .order_by(models.RoleTrack.id.asc())
+            .order_by((models.RoleTrack.tracking_mode == "IGNORED").asc(), models.RoleTrack.id.asc())
             .limit(1)
         )
         role_track_id = track_result.scalar()
@@ -347,18 +378,17 @@ async def set_event_completion(
 async def extend_event_deadline(
     db: AsyncSession, event_id: int, new_end_time: datetime
 ) -> Optional[models.TimelineEvent]:
-    """Extend an event's end_time. A MISSED event naturally recovers to PENDING
-    when new_end_time > now (via the display_state property)."""
-    stmt = (
-        update(models.TimelineEvent)
-        .where(models.TimelineEvent.id == event_id)
-        .values(end_time=new_end_time)
-        .returning(models.TimelineEvent)
-    )
-    result = await db.execute(stmt)
+    """Extend an event's end_time. A point deadline (start == end) moves its
+    start with it; a window keeps its start. A MISSED event naturally recovers
+    to PENDING when new_end_time > now (via the display_state property)."""
+    event = await db.get(models.TimelineEvent, event_id)
+    if event is None:
+        return None
+    if event.start_time is not None and event.start_time == event.end_time:
+        event.start_time = new_end_time
+    event.end_time = new_end_time
     await db.commit()
-    row = result.scalars().first()
-    return await _load_event(db, row.id) if row is not None else None
+    return await _load_event(db, event_id)
 
 
 async def replace_form_event(
@@ -366,11 +396,14 @@ async def replace_form_event(
     company_id: int,
     role_track_id: Optional[int],
     payload: schemas.ReplaceFormPayload,
+    supersedes: Optional[int] = None,
 ) -> models.TimelineEvent:
     """Supersede the current FORM_SUBMISSION event with a new versioned entry.
 
     Finds the max version of existing FORM_SUBMISSION events for this company
     (and optional role_track) and inserts a brand-new event with version+1.
+    The superseded form — *supersedes*, or else every active form of the
+    company (and role) — is soft-deleted, so only the new link is shown.
     """
     stmt = select(func.max(models.TimelineEvent.version)).where(
         models.TimelineEvent.company_id == company_id,
@@ -382,6 +415,18 @@ async def replace_form_event(
     result = await db.execute(stmt)
     current_max: Optional[int] = result.scalar()
     next_version = (current_max or 0) + 1
+
+    superseded = update(models.TimelineEvent).where(
+        models.TimelineEvent.company_id == company_id,
+        models.TimelineEvent.is_deleted == False,  # noqa: E712
+    )
+    if supersedes is not None:
+        superseded = superseded.where(models.TimelineEvent.id == supersedes)
+    else:
+        superseded = superseded.where(models.TimelineEvent.event_type == "FORM_SUBMISSION")
+        if role_track_id is not None:
+            superseded = superseded.where(models.TimelineEvent.role_track_id == role_track_id)
+    await db.execute(superseded.values(is_deleted=True))
 
     new_event = models.TimelineEvent(
         company_id=company_id,
@@ -398,6 +443,32 @@ async def replace_form_event(
     db.add(new_event)
     await db.commit()
     return await _load_event(db, new_event.id)
+
+
+async def annotate_event(
+    db: AsyncSession,
+    event_id: int,
+    *,
+    source_chat_id: Optional[int] = None,
+    source_message_id: Optional[int] = None,
+    review_reasons: Iterable[str] = (),
+) -> None:
+    """Record which Telegram message last created or updated an event, and flag
+    it for the user's review (needs_review) with the given reasons. A flag is
+    never cleared here — only the user clears it."""
+    event = await db.get(models.TimelineEvent, event_id)
+    if event is None:
+        return
+    if source_message_id is not None:
+        event.source_chat_id = source_chat_id
+        event.source_message_id = source_message_id
+    reasons = [r for r in review_reasons if r]
+    if reasons:
+        known = [r for r in (event.review_reason or "").split("; ") if r]
+        merged = known + [r for r in reasons if r not in known]
+        event.needs_review = True
+        event.review_reason = "; ".join(merged)[:_REVIEW_REASON_LIMIT]
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +488,8 @@ async def get_pending_triage_items(
         .join(models.Company, models.RoleTrack.company_id == models.Company.id)
         .where(
             models.Company.is_active == True,  # noqa: E712
+            models.Company.tracking_mode != "IGNORED",
+            models.RoleTrack.tracking_mode != "IGNORED",
             models.RoleTrack.is_triaged == False,  # noqa: E712
         )
         .options(selectinload(models.RoleTrack.company))
@@ -431,7 +504,12 @@ async def get_pending_triage_items(
 async def triage_role_track(
     db: AsyncSession, role_track_id: int, action: str
 ) -> Optional[models.RoleTrack]:
-    """Update RoleTrack.tracking_mode = action and strictly set is_triaged = True."""
+    """Update RoleTrack.tracking_mode = action and strictly set is_triaged = True.
+
+    Raises TrackingLocked for an IGNORED role or an effectively IGNORED company
+    (invariants 1 and 5). Accepting a role promotes its company to ELIGIBLE;
+    discarding the last role that was not IGNORED marks the company IGNORED, so
+    the Companies screen agrees (invariant 2)."""
     stmt = (
         select(models.RoleTrack)
         .options(selectinload(models.RoleTrack.company))
@@ -441,16 +519,25 @@ async def triage_role_track(
     track = result.scalars().first()
     if track is None:
         return None
+    if track.tracking_mode == "IGNORED" or await is_effectively_ignored(db, track.company_id):
+        raise TrackingLocked("This role is IGNORED. Change it from the Companies screen.")
 
     track.tracking_mode = action
     track.is_triaged = True
     track.updated_at = datetime.now(timezone.utc)
+    await db.flush()
 
     if action == "ELIGIBLE":
         await db.execute(
             update(models.Company)
             .where(models.Company.id == track.company_id)
             .values(tracking_mode="ELIGIBLE")
+        )
+    elif action == "IGNORED" and await is_effectively_ignored(db, track.company_id):
+        await db.execute(
+            update(models.Company)
+            .where(models.Company.id == track.company_id)
+            .values(tracking_mode="IGNORED")
         )
 
     await db.commit()
@@ -465,11 +552,16 @@ async def triage_role_track(
 
 
 async def flag_for_retriage(
-    db: AsyncSession, role_track_id: int, note: str
+    db: AsyncSession, role_track_id: int, note: str, note_kind: str = "GENERAL"
 ) -> Optional[models.RoleTrack]:
-    """Update latest_status_note on a RoleTrack.
-    Only if tracking_mode == 'SILENT_TRACK', also set is_triaged = False
-    so it reappears in the pending triage queue."""
+    """Record a status note on a RoleTrack (PROJECT_STATE §0.1 invariant 6).
+
+    - The note text and its kind (CRITERIA_RELAXATION | GENERAL; anything else
+      counts as GENERAL) are always stored.
+    - Only a CRITERIA_RELAXATION note on a SILENT_TRACK role re-opens it in
+      Triage (is_triaged = False) — a proposal; tracking_mode never changes.
+    - An IGNORED role, or a role of an effectively IGNORED company, is never
+      touched (invariant 1)."""
     stmt = (
         select(models.RoleTrack)
         .options(selectinload(models.RoleTrack.company))
@@ -479,10 +571,14 @@ async def flag_for_retriage(
     track = result.scalars().first()
     if track is None:
         return None
+    if track.tracking_mode == "IGNORED" or await is_effectively_ignored(db, track.company_id):
+        return track
 
+    kind = note_kind if note_kind in NOTE_KINDS else "GENERAL"
     track.latest_status_note = note
+    track.latest_note_kind = kind
     track.updated_at = datetime.now(timezone.utc)
-    if track.tracking_mode == "SILENT_TRACK":
+    if kind == "CRITERIA_RELAXATION" and track.tracking_mode == "SILENT_TRACK":
         track.is_triaged = False
 
     await db.commit()
@@ -685,6 +781,12 @@ async def is_company_ingestible(
     return result.first() is not None
 
 
+async def get_trackable_companies(db: AsyncSession, environment: str) -> List[models.Company]:
+    """Active, not effectively IGNORED companies of one environment."""
+    result = await db.execute(select(models.Company).where(*_ingestible_company_filters([environment])))
+    return list(result.scalars().all())
+
+
 async def is_company_trackable(db: AsyncSession, company_id: int) -> bool:
     """Active and not effectively IGNORED, in any environment: the dispatcher's
     re-check before it changes anything for a company (invariant 3)."""
@@ -706,11 +808,15 @@ async def reschedule_event(
     event_id: int,
     new_end_time: datetime,
     new_start_time: Optional[datetime] = None,
+    action_link: Optional[str] = None,
 ) -> Optional[models.TimelineEvent]:
-    """Reschedule an event by updating both start_time and end_time."""
+    """Reschedule an event by updating both start_time and end_time (and its
+    link, when a new one is given)."""
     values: dict = {"end_time": new_end_time}
     if new_start_time is not None:
         values["start_time"] = new_start_time
+    if action_link:
+        values["action_link"] = action_link
 
     stmt = (
         update(models.TimelineEvent)

@@ -57,13 +57,13 @@ The **Placement Engine** is a single-tenant backend service that monitors offici
 2. **AI Structured Extraction Engine**:
    - Uses **`openai/gpt-oss-20b`** hosted on Groq for ultra-low latency inference.
    - Prompt injected with real-time **Indian Standard Time (IST, UTC+05:30)** anchoring and known company schedules.
-   - Automatic fallback to regex-based IST temporal extraction on unstructured bursts. ⚠ *Under revision: verified to create wrong events and to fire on valid empty LLM results; removal planned in Phase 0.5.*
+   - Each message reaches the model under a `[msg <id> · posted <IST> · edited]` header: relative dates resolve against the post time, and updates target existing events by id. Output is Groq strict structured JSON; a failed extraction is retried, never guessed.
 
 3. **Pre-Interview State Machine**:
    - **Event Lifecycle**: Point-in-time deadlines (`IRIS_DEADLINE`, `FORM_SUBMISSION`) and duration events (`OA_WINDOW`, `PPT`, `INTERVIEW`, `CUSTOM`).
-   - **Form Versioning (`REPLACE_FORM`)**: When coordinators post updated Google Forms, the engine inserts a new version (`version` + 1) with the new link and deadline and `user_status = PENDING`. ⚠ *The previous version currently stays visible; hiding superseded forms is planned.*
-   - **Criteria Relaxation Re-Triage**: Applies only to `SILENT_TRACK` roles and only proposes re-triage — it never changes the tracking mode. `IGNORED` is a terminal, human-only status. See the binding invariants in `PROJECT_STATE.md` §0.1. ⚠ *Today every status note re-triages SILENT_TRACK roles; the relaxation-only rule lands in Phase 0.5.*
-   - **Feed Isolation**: Companies carry `environment_type = 'MAIN' | 'TEST'` and the timeline, companies and triage queries filter by it. ⚠ *Name-based company lookups during extraction do not filter by environment yet (gap H5).*
+   - **Form Versioning (`REPLACE_FORM`)**: When coordinators post updated Google Forms, the engine inserts a new version (`version` + 1) with the new link and deadline and `user_status = PENDING`, and hides the form it supersedes.
+   - **Criteria Relaxation Re-Triage**: Applies only to `SILENT_TRACK` roles and only proposes re-triage (a `CRITERIA_RELAXATION` status note) — it never changes the tracking mode. `IGNORED` is a terminal, human-only status. See the binding invariants in `PROJECT_STATE.md` §0.1.
+   - **Feed Isolation**: Companies carry `environment_type = 'MAIN' | 'TEST'`; the timeline, companies and triage queries filter by it, and extraction matches company names only within the post's environment.
 
 ---
 
@@ -75,10 +75,9 @@ placement-engine/
 │   ├── ai/
 │   │   ├── client.py           # Async OpenAI client configured for Groq LPU
 │   │   ├── dispatcher.py       # State-machine dispatcher and mutation router
-│   │   ├── extractor.py        # LLM extraction call with fallback JSON sanitization
-│   │   ├── prompts.py          # Dynamic system prompt builder with IST anchoring
-│   │   ├── rule_extractor.py   # Regex-based deterministic IST relative date parser
-│   │   └── schemas.py          # Pydantic v2 schemas for extraction actions
+│   │   ├── extractor.py        # LLM extraction call (strict schema, fallbacks); raises ExtractionFailed
+│   │   ├── prompts.py          # System prompt and [msg <id> · posted <IST>] message headers
+│   │   └── schemas.py          # Pydantic v2 extraction models + strict JSON schema
 │   ├── routers/
 │   │   ├── companies.py        # Company and role-track CRUD endpoints
 │   │   ├── events.py           # Timeline event mutations and lifecycle routes
@@ -163,6 +162,7 @@ cp .env.example .env
 | `GROQ_API_KEY` / `LLM_API_KEY` | API key for the extraction LLM (`LLM_API_KEY` wins if both are set) | `""` |
 | `LLM_BASE_URL` | OpenAI-compatible endpoint | `https://api.groq.com/openai/v1` |
 | `LLM_MODEL` | LLM model identifier | `openai/gpt-oss-20b` |
+| `LLM_REASONING_EFFORT` | Optional `low` / `medium` / `high` (unset = provider default) | unset |
 
 ### 4. Authenticate Telegram Client
 
@@ -213,6 +213,7 @@ python verify_settings.py # Student profile settings API
 python verify_schema.py   # Alembic migrations, UTC storage and database constraints
 python verify_worker.py   # Ingestion worker, ledger, catch-up and retries (Telegram fully mocked)
 python verify_ingestion.py # Join policy, invite posts, edits/reactions, supergroups, debouncer limits
+python verify_extraction.py # Extractor, prompt headers, dispatcher updates and tracking invariants (LLM mocked)
 ```
 
 ---

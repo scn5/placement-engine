@@ -1022,7 +1022,7 @@ class TelegramIngestionService:
         success, FAILED (with retry backoff) if the payload handler raises."""
         if self._payload_handler is None:
             return False
-        batch = [{**m, "label": f"[{index}]"} for index, m in enumerate(messages, start=1)]
+        batch = list(messages)
         message_ids = [m["id"] for m in batch if m.get("id") is not None]
         hashes = {m["id"]: m["content_hash"] for m in batch if m.get("id") is not None and m.get("content_hash")}
         inflight = self._inflight.setdefault(source.chat_id, set())

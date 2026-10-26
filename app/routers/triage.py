@@ -23,6 +23,7 @@ def _to_triage_item(track: models.RoleTrack) -> schemas.TriageItemResponse:
         environment_type=env_type,
         ctc_stipend_info=track.ctc_stipend_info,
         latest_status_note=track.latest_status_note,
+        latest_note_kind=track.latest_note_kind,
         created_at=track.created_at,
     )
 
@@ -62,8 +63,12 @@ async def triage_role_track(
     db: AsyncSession = Depends(get_db),
 ) -> schemas.TriageItemResponse:
     """Triage a role track by setting its tracking_mode to ELIGIBLE, SILENT_TRACK, or IGNORED,
-    and strictly setting is_triaged = True."""
-    track = await crud.triage_role_track(db, role_track_id, payload.action)
+    and strictly setting is_triaged = True. An IGNORED role (or a role of an IGNORED
+    company) is refused with 409: only the Companies-screen toggle reverses IGNORED."""
+    try:
+        track = await crud.triage_role_track(db, role_track_id, payload.action)
+    except crud.TrackingLocked as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if track is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -114,11 +119,13 @@ async def flag_for_retriage(
     note_or_role_track_id: Union[str, int],
     note_param: Optional[str] = None,
     db_param: Optional[AsyncSession] = None,
+    note_kind: str = "GENERAL",
 ) -> Optional[models.RoleTrack]:
-    """Flag a role track for re-triage by updating latest_status_note.
+    """Record a status note on a role track (see crud.flag_for_retriage).
 
-    Only if the current tracking_mode == 'SILENT_TRACK', it also sets
-    is_triaged = False so it reappears in the pending triage queue.
+    Only a CRITERIA_RELAXATION note on a SILENT_TRACK role sets is_triaged =
+    False so it reappears in the pending triage queue; IGNORED roles are never
+    touched.
 
     Supports both signatures:
       - flag_for_retriage(db, role_track_id, note)
@@ -128,12 +135,12 @@ async def flag_for_retriage(
         session = role_track_id_or_db
         rt_id = int(note_or_role_track_id)
         note = note_param or ""
-        return await crud.flag_for_retriage(session, rt_id, note)
+        return await crud.flag_for_retriage(session, rt_id, note, note_kind)
 
     rt_id = int(role_track_id_or_db)
     note = str(note_or_role_track_id)
     if db_param is not None:
-        return await crud.flag_for_retriage(db_param, rt_id, note)
+        return await crud.flag_for_retriage(db_param, rt_id, note, note_kind)
 
     async with AsyncSessionLocal() as session:
-        return await crud.flag_for_retriage(session, rt_id, note)
+        return await crud.flag_for_retriage(session, rt_id, note, note_kind)

@@ -942,17 +942,17 @@ async def test_batches_hold_at_most_40_messages() -> None:
     batches = []
 
     async def handler(source, messages):
-        batches.append((len(messages), messages[0]["label"], messages[-1]["label"]))
+        batches.append((len(messages), messages[0]["id"], messages[-1]["id"]))
 
     await service.set_payload_handler(handler)
     for i in range(1, 96):
         await service._process_event(_event(chat, _msg(i, f"Update {i}")), is_edit=False)
     await _settle(service)
-    assert batches == [(40, "[1]", "[40]"), (40, "[1]", "[40]"), (15, "[1]", "[15]")], batches
+    assert batches == [(40, 1, 40), (40, 41, 80), (15, 81, 95)], batches
     rows = await _ledger_rows(chat)
     assert len(rows) == 95 and all(row.status == "DONE" for row in rows.values())
 
-    print("  [12] ✓ 95 buffered messages → LLM calls of 40, 40 and 15, each numbered from [1] and recorded DONE")
+    print("  [12] ✓ 95 buffered messages → LLM calls of 40, 40 and 15, in order, each recorded DONE")
 
 
 async def test_catch_up_replays_offline_edits() -> None:

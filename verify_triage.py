@@ -7,7 +7,8 @@ Tests:
   2. GET /triage/pending query returns untriaged role tracks joined with Company.name.
   3. POST /triage/{role_track_id} accepts TriageActionPayload, mutates tracking_mode, and sets is_triaged=True.
   4. GET /events/timeline strictly requires RoleTrack.tracking_mode == 'ELIGIBLE'.
-  5. Re-triage logic: flag_for_retriage resets is_triaged=False ONLY if tracking_mode == 'SILENT_TRACK'.
+  5. Re-triage logic (invariant 6): only a CRITERIA_RELAXATION note re-opens a SILENT_TRACK role;
+     GENERAL notes and ELIGIBLE roles never re-open Triage; IGNORED roles are never touched.
   6. Endpoint verification via FastAPI test client (HTTP 200, 404).
 
 Run: python verify_triage.py
@@ -188,12 +189,22 @@ async def test_triage_flow() -> None:
         assert ev_pm.id not in feed_ids, "IGNORED event must NOT appear in timeline feed"
         print("  [4] ✓ Triage mutations, Company tracking cascade & ELIGIBLE timeline filtering verified")
 
-        # ── 5. Re-triage Logic: flag_for_retriage
-        # Test Case A: Role in SILENT_TRACK -> flag_for_retriage resets is_triaged=False
-        updated_intern = await flag_for_retriage(db, role_intern.id, "Criteria relaxed: 6.5 CGPA allowed")
+        # ── 5. Re-triage Logic: flag_for_retriage (PROJECT_STATE §0.1 invariant 6)
+        # Test Case A: SILENT_TRACK + GENERAL note -> note stored, role stays triaged
+        updated_intern = await flag_for_retriage(db, role_intern.id, "Shortlist expected next week")
+        assert updated_intern.latest_status_note == "Shortlist expected next week"
+        assert updated_intern.latest_note_kind == "GENERAL"
+        assert updated_intern.is_triaged is True, "A GENERAL note must not re-open Triage"
+
+        # Test Case B: SILENT_TRACK + CRITERIA_RELAXATION -> re-opened as a proposal, mode unchanged
+        updated_intern = await flag_for_retriage(
+            db, role_intern.id, "Criteria relaxed: 6.5 CGPA allowed", note_kind="CRITERIA_RELAXATION"
+        )
         assert updated_intern is not None
         assert updated_intern.latest_status_note == "Criteria relaxed: 6.5 CGPA allowed"
-        assert updated_intern.is_triaged is False, "SILENT_TRACK role MUST be reset to is_triaged=False on re-triage"
+        assert updated_intern.latest_note_kind == "CRITERIA_RELAXATION"
+        assert updated_intern.is_triaged is False, "SILENT_TRACK role MUST be re-opened on a criteria relaxation"
+        assert updated_intern.tracking_mode == "SILENT_TRACK", "tracking_mode must never change automatically"
 
         # It must now re-appear in pending queue!
         pending_reopened = await crud.get_pending_triage_items(db)
@@ -201,23 +212,27 @@ async def test_triage_flow() -> None:
         assert pending_reopened[0].id == role_intern.id
         assert pending_reopened[0].latest_status_note == "Criteria relaxed: 6.5 CGPA allowed"
 
-        # Test Case B: Role in ELIGIBLE -> flag_for_retriage updates note but keeps is_triaged=True
-        updated_swe = await flag_for_retriage(db, role_swe.id, "OA platform changed to HackerRank")
+        # Test Case C: ELIGIBLE + CRITERIA_RELAXATION -> note updated, stays triaged
+        updated_swe = await flag_for_retriage(
+            db, role_swe.id, "OA open to all branches", note_kind="CRITERIA_RELAXATION"
+        )
         assert updated_swe is not None
-        assert updated_swe.latest_status_note == "OA platform changed to HackerRank"
+        assert updated_swe.latest_status_note == "OA open to all branches"
         assert updated_swe.is_triaged is True, "ELIGIBLE role MUST stay is_triaged=True"
 
-        # Test Case C: Role in IGNORED -> flag_for_retriage updates note but keeps is_triaged=True
-        updated_pm = await flag_for_retriage(db, role_pm.id, "PM role open for all branches")
+        # Test Case D: IGNORED role -> never touched (invariant 1)
+        updated_pm = await flag_for_retriage(
+            db, role_pm.id, "PM role open for all branches", note_kind="CRITERIA_RELAXATION"
+        )
         assert updated_pm is not None
-        assert updated_pm.latest_status_note == "PM role open for all branches"
-        assert updated_pm.is_triaged is True, "IGNORED role MUST stay is_triaged=True"
+        assert updated_pm.latest_status_note is None, "An IGNORED role must not be changed"
+        assert updated_pm.is_triaged is True and updated_pm.tracking_mode == "IGNORED"
 
-        # Test Case D: Non-existent role track returns None
+        # Test Case E: Non-existent role track returns None
         not_found = await flag_for_retriage(db, 999999, "Note")
         assert not_found is None
 
-        print("  [5] ✓ Re-triage conditional criteria relaxation logic (SILENT_TRACK vs ELIGIBLE/IGNORED) verified")
+        print("  [5] ✓ Re-triage: only CRITERIA_RELAXATION re-opens SILENT_TRACK (mode unchanged); GENERAL/ELIGIBLE stay triaged; IGNORED untouched")
 
 
 async def test_fastapi_endpoints() -> None:

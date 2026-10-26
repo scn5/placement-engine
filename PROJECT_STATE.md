@@ -1,5 +1,5 @@
 # PROJECT_STATE.md — Placement Engine Backend
-**Last Updated:** 2026-10-23 | **Version:** 1.0.0 — **Status: pre-production** (verified gaps in §0.2; remediation "Phase 0 — stop silent losses" in progress) | **Branch:** `feature/phase-0-stop-losses`
+**Last Updated:** 2026-10-26 | **Version:** 1.0.0 — **Status: pre-production** (verified gaps in §0.2; remediation "Phase 0 — stop silent losses" in progress) | **Branch:** `feature/phase-0-stop-losses`
 
 > Single source of truth for the backend's operational status, architecture, and immediate backlog. Cross-referenced against `MASTER_SPEC.md` and `PRODUCT REQUIREMENTS DOCUMENT.md`.
 > **The code is the source of truth.** Every status claim in this file was re-verified against the code on 2026-10-22; intended-but-unbuilt behaviour belongs in `MASTER_SPEC.md`, not here.
@@ -14,17 +14,17 @@
 1. **Timezone Representation (Zero-Dependency Native UTC+05:30 IST)**:
    - **Rule:** Timezones MUST be defined using standard library `datetime.timezone(datetime.timedelta(hours=5, minutes=30), name="IST")`.
    - **Why:** On Windows machines, `zoneinfo.ZoneInfo("Asia/Kolkata")` crashes fatally with `ZoneInfoNotFoundError: 'No time zone found with key Asia/Kolkata'` if the Python environment lacks the `tzdata` package. Because Indian Standard Time does not observe Daylight Saving Time (strictly fixed at UTC+05:30 year-round), the native `datetime.timezone` constructor provides 100% deterministic, cross-platform stability with zero external dependency risks.
-   - **Enforcement:** Enforced in `app/ai/prompts.py`, `app/ai/schemas.py`, and `app/ai/rule_extractor.py`. In addition, `tzdata>=2024.1` is pinned defensively in `requirements.txt`.
+   - **Enforcement:** Enforced in `app/ai/prompts.py`, `app/ai/schemas.py` and `app/ai/dispatcher.py`. In addition, `tzdata>=2024.1` is pinned defensively in `requirements.txt`.
    - **⚠ Storage gap (verified 2026-10-21):** SQLite's `DateTime(timezone=True)` drops the offset *without converting*. LLM/app writes persist IST wall-clock, `rule_extractor` writes persist UTC, and `display_state` reads everything back as UTC — so IST-written deadlines turn MISSED 5.5 h late. **✅ Fixed in Phase 0.2:** every datetime column now uses the `UTCDateTime` type (stored as UTC, read back as aware UTC), and API inputs must carry an offset (`AwareDatetime`). Times shown to the LLM are converted back to IST.
 
-2. **Groq AI Extraction Headroom (`max_tokens=4096`) & Dual-Tier Fallback Architecture**:
-   - **Rule:** Both the primary and fallback LLM completions in `app/ai/extractor.py` MUST specify `max_tokens=4096` (never default or 1024), and extraction MUST follow a multi-tier fallback hierarchy.
-   - **Why:** Complex campus announcements containing multiple concurrent actions or long eligibility updates produce large JSON payloads. Setting `max_tokens=1024` or lower causes Groq to truncate generation mid-stream, tripping JSON parser errors (`EOF while parsing a string` / `json_validate_failed`).
-   - **Multi-Tier Fallback Structure:**
-     1. **Tier 1 (Structured Groq Inference):** `temperature=0.0`, `response_format={"type": "json_object"}` with strict JSON formatting constraints in `build_system_prompt()`.
-     2. **Tier 2 (In-Flight Fallback Completion):** Triggered on `json_validate_failed` or `APIError`. Retries without schema constraints, strips markdown code fences (` ```json `), and extracts the first valid JSON substring via regex.
-     3. **Tier 3 (Deterministic Regex Fallback — `rule_extractor.py`):** If the LLM produces 0 actions or fails inference for messages containing unambiguous temporal keywords ("tomorrow 9pm", "today by 11:59 PM", "OA window"), regex patterns extract the event type and normalize IST timestamps into structured events.
-   - **⚠ Tier 3 is under revision — do not extend it (verified 2026-10-21).** It also fires when the LLM *validly* returns zero actions (the prompt asks for `{"actions": []}` on non-actionable text), and it was verified to create wrong events: "Round 2 of the OA is tomorrow at 5pm" → 02:00; "OA on 25th October at 5 PM" → today 17:00; a defaulter-list message → a FORM deadline (defeats PRD Workflow 6). Removal is scheduled for Phase 0.5, with failed batches retried instead. Unverified hypothesis: gpt-oss-20b is a reasoning model whose reasoning tokens count against `max_tokens`, which may be the real cause of the original truncation.
+2. **Groq AI Extraction: Token Headroom, Structured Output & No Guessing** (revised in Phase 0.5):
+   - **Rule:** Every completion in `app/ai/extractor.py` sets `max_completion_tokens=8192` (never the default). gpt-oss-20b is a reasoning model: its reasoning tokens share that budget with the JSON answer, and a 1024 cap truncated multi-action answers mid-JSON (`EOF while parsing a string`). A truncated answer (`finish_reason="length"`) raises `ExtractionFailed`.
+   - **Output modes, in order:**
+     1. **Strict structured output** — `response_format` `json_schema` with `strict: true` and `RESULT_JSON_SCHEMA` (`app/ai/schemas.py`); Groq documents strict mode for `openai/gpt-oss-20b` (constrained decoding, every field required, objects closed). If Groq rejects it but JSON-object mode then works, strict mode is turned off for the rest of the process.
+     2. **JSON-object mode** — `response_format={"type": "json_object"}`, validated with Pydantic.
+     3. **No response format** — only after Groq's `json_validate_failed`; JSON is cut out of the text (code fences stripped).
+   - **No regex fallback.** The old Tier 3 (`rule_extractor.py`) was verified to create wrong events ("Round 2 of the OA is tomorrow at 5pm" → 02:00; "OA on 25th October at 5 PM" → today 17:00; a defaulter-list message → a FORM deadline) and fired on valid empty answers. It was deleted in Phase 0.5. Hard failures raise `ExtractionFailed`: the batch is recorded `FAILED` in the message ledger and retried with backoff — never guessed.
+   - Keep `RESULT_JSON_SCHEMA` in step with `ExtractedEvent` / `LLMExtractionResult`; `verify_extraction.py` fails if they drift.
 
 3. **Test Feed Isolation & In-Memory SQLite Requirement (`:memory:`)**:
    - **Rule:** All test verification suites (`verify_phase1.py` through `verify_phase4.py`, `verify_triage.py`, `verify_settings.py`) MUST strictly bind to isolated in-memory databases (`sqlite+aiosqlite:///:memory:`) and override `app.database.engine`.
@@ -37,7 +37,7 @@
 ## 0.1 Tracking-Status Invariants (binding — set by the owner, 2026-10-22)
 
 > [!IMPORTANT]
-> These rules override `MASTER_SPEC.md` §3 where they differ (the matching MASTER_SPEC edit was approved and applied on 2026-10-23). Enforced so far: items 2–4 at the router and in the monitored set (0.3), plus item 3's dispatcher re-check and main-feed attribution (0.4). Items 5, 6 (note kinds) and 9 land in Phase 0.5.
+> These rules override `MASTER_SPEC.md` §3 where they differ (the matching MASTER_SPEC edit was approved and applied on 2026-10-23). All nine are enforced since Phase 0.5: items 2–4 at the router and in the monitored set (0.3), item 3's dispatcher re-check and main-feed attribution (0.4), and items 1, 2, 5, 6, 8 and 9 in `crud.py` and the dispatcher (0.5). `verify_extraction.py` tests them through the API.
 
 1. **IGNORED is a terminal, human-only status.** No automated path (dispatcher, re-triage, linking, backfill, catch-up) may set or clear it on a company or role. Only the Companies-screen toggle — `PATCH /companies/{id}/tracking` — moves a company out of IGNORED. Setting IGNORED via the Triage "Discard" action is allowed (explicit user action).
 2. A company is **effectively IGNORED** when its company-level mode is IGNORED or every one of its role tracks is IGNORED. Discarding the last role in Triage syncs the company to IGNORED. A multi-role company with any role still tracked keeps ingesting.
@@ -60,20 +60,20 @@ Verified by reading the code; items marked † were also reproduced by executing
 | C1 | No reminder path end-to-end: no backend scheduler or push code; the app never schedules local alarms and never sends its push token. | `command-center/src/services/notifications.ts` (`scheduleEventReminders` unused) | Next phase |
 | C2 † | Pre-filter drops real announcements: "ok/okay/noted/thanks" *anywhere* → drop; plurals, "tomorrow/tonight", "GD", "venue" aren't signals. 8 of 9 realistic samples dropped. | `app/telegram/pre_filter.py:53-102` | ✅ 0.4 (only messages with no visible text are skipped) |
 | C3 | A root-feed post containing an invite link is only joined — its own text (roles, CTC, deadlines) never reaches the LLM; the company gets the channel title, "Default Role", FTE. | `app/telegram/listener.py:285-294`, `app/crud.py:530-551` | ✅ 0.4 (the post is extracted with its company, named by the LLM, else the channel title) |
-| C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | Downtime ✅ 0.3 (ledger catch-up + retries); offline edits and failed joins ✅ 0.4; LLM failures retryable from 0.5 (the extractor still swallows errors) |
-| C5 † | Regex fallback invents wrong events and fires on valid empty LLM results (see Tribal Knowledge #2). | `app/ai/extractor.py:66-77`, `app/ai/rule_extractor.py` | 0.5 |
+| C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | ✅ Downtime 0.3 (ledger catch-up + retries); offline edits and failed joins 0.4; LLM failures raise `ExtractionFailed` and are retried 0.5 |
+| C5 † | Regex fallback invents wrong events and fires on valid empty LLM results (see Tribal Knowledge #2). | `app/ai/extractor.py:66-77`, `app/ai/rule_extractor.py` | ✅ 0.5 (deleted; failures are retried instead) |
 | C6 | Auto-join resolves any `t.me/<name>`: a person/bot username creates a company plus a 24 h backfill of the private DM history (sent to the LLM); permalinks join foreign channels; the private-hash fallback re-resolves the hash as a username. | `app/telegram/listener.py:40-47,363-366,376,425-435` | ✅ 0.4 (`join_policy.py`: channels and supergroups only; root feeds must be broadcast channels) |
 | C7 | No authentication on any route; CORS reflects any origin with credentials. | `app/main.py:145-151` | 0.6 |
 | H1 † | Mixed IST/UTC wall-clock storage in SQLite (see Tribal Knowledge #1). | `app/models.py:145-158` | ✅ 0.2 |
-| H2 | Message post times never reach the LLM; relative dates resolve against processing time (wrong for backfill, midnight, catch-up). | `app/ai/dispatcher.py:407-417`, `app/ai/prompts.py:90,130-137` | 0.5 |
-| H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | Re-posted invites no longer re-process ✅ 0.3 (ledger); edit versions collapse, unchanged-text edit updates are ignored, batches of a chat never overlap ✅ 0.4; dedupe of extracted actions and the prompt rules 0.5 |
-| H4 | Weak update targeting: match = latest event of the same type; EXTEND moves only `end_time`; REPLACE_FORM leaves the old form visible; deleted events are fed to the LLM and resurrect; no CANCELLED/TBA. | `dispatcher.py:57-62,108-128`, `crud.py:347-400` | 0.5 (partial) |
-| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | Uniqueness ✅ 0.2; subchannel linking env-scoped, never re-labels the environment, source company authoritative for invite posts and replies ✅ 0.4; name lookups 0.5 |
+| H2 | Message post times never reach the LLM; relative dates resolve against processing time (wrong for backfill, midnight, catch-up). | `app/ai/dispatcher.py:407-417`, `app/ai/prompts.py:90,130-137` | ✅ 0.5 (`[msg <id> · posted <IST> · edited]` headers; dates resolve against each message's post time) |
+| H3 | Duplicates by construction: edits re-extracted as new text (no message provenance), invite re-posts re-run the 24 h backfill, contradictory prompt rules turn reminders into CREATE, no dedupe key, overlapping dispatches per chat. | `listener.py:415-421`, `prompts.py:94-96` vs `115-118`, `crud.py:292-318`, `debouncer.py:111-119` | ✅ 0.3–0.5 (ledger; edit collapse and per-chat order 0.4; event ids and `target_event_id`, edits update the events they created, same-time duplicates suppressed, reminder rule fixed 0.5) |
+| H4 | Weak update targeting: match = latest event of the same type; EXTEND moves only `end_time`; REPLACE_FORM leaves the old form visible; deleted events are fed to the LLM and resurrect; no CANCELLED/TBA. | `dispatcher.py:57-62,108-128`, `crud.py:347-400` | ✅ 0.5 except CANCELLED/TBA (updates by id, ambiguous matches flagged, point deadlines move whole, superseded forms hidden, deleted events never shown to the LLM) |
+| H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | ✅ 0.2–0.5 (per-env uniqueness; env-scoped linking 0.4; source company authoritative, env-scoped name lookups, deleted names never re-created, mentioned companies' schedules for main-feed posts 0.5) |
 | H6 | Profile unused: INDIVIDUAL messages dropped even when addressed to the user; defaulter, slot and shortlist logic unimplemented. | `dispatcher.py:497-503` | Next phase |
 | H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | ✅ 0.2 (Alembic; live-PG run is the first Phase 1 step) |
 | H8 | Telethon runs inside the API process: >1 worker or two hosts on one session → `AUTH_KEY_DUPLICATED`; the listener task is unsupervised; `/health` always reports healthy. | `app/main.py:48-113,159-161` | ✅ 0.3 (separate worker process; liveness in `worker_status`; status endpoint 0.6) |
 | H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | 0.6, Phase 1 |
-| M1–M7 | No per-action rollback; every STATUS_NOTE re-triages; the company toggle leaves `is_triaged=false`; the debouncer has no max-wait (✅ 0.4); Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
+| M1–M7 | No per-action rollback (✅ 0.5); every STATUS_NOTE re-triages (✅ 0.5, note kinds); the company toggle leaves `is_triaged=false` (✅ 0.5); the debouncer has no max-wait (✅ 0.4); Add Stage silently defaults to now+24 h; substring hard-delete script; documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
 
 ---
 
@@ -114,6 +114,7 @@ placement-engine/
 ├── verify_schema.py              # Alembic baseline, UTC storage & constraint suite (Phase 0.2)
 ├── verify_worker.py              # Ingestion worker, ledger, catch-up & retry suite (Phase 0.3)
 ├── verify_ingestion.py           # Join policy, invite posts, edits/reactions, supergroups, debouncer suite (Phase 0.4)
+├── verify_extraction.py          # Extractor, prompt, dispatcher and invariants 1–9 suite (Phase 0.5)
 ├── scripts/
 │   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
 │   ├── login_telegram.py         # Interactive login → placement_session.session (also prints a session string — removal in 0.6)
@@ -151,10 +152,9 @@ placement-engine/
     └── ai/
         ├── __init__.py
         ├── client.py             # AsyncOpenAI factory (cached singleton)
-        ├── schemas.py            # LLM extraction Pydantic models (relaxed defaults)
-        ├── prompts.py            # System prompt builder (UTC + context injection)
-        ├── extractor.py          # LLM inference + fallback chain + timeout
-        ├── rule_extractor.py     # Regex fallback (⚠ verified harmful — removal in 0.5)
+        ├── schemas.py            # LLM extraction models + RESULT_JSON_SCHEMA (strict structured output)
+        ├── prompts.py            # System prompt + [msg <id> · posted <IST> · edited] message headers
+        ├── extractor.py          # LLM call (strict schema → JSON object → no format); raises ExtractionFailed
         └── dispatcher.py         # State-machine CRUD executor
 ```
 
@@ -201,6 +201,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `LLM_API_KEY` / `GROQ_API_KEY` | `""` | Bearer token for the LLM endpoint (`LLM_API_KEY` wins) |
 | `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | Override for OpenRouter / local vLLM |
 | `LLM_MODEL` | `openai/gpt-oss-20b` | Model identifier |
+| `LLM_REASONING_EFFORT` | unset | `low` \| `medium` \| `high`; unset = the provider's default. Lower is cheaper and faster but may resolve dates less carefully — to be tuned with shadow-run data (0.5) |
 | `INGEST_ENVIRONMENTS` | `TEST` | Feeds the worker reads (`MAIN`, `TEST` or `MAIN,TEST`). TEST-only by default so a development machine never processes the real feed; production sets `MAIN,TEST` |
 | `CONFIG_REFRESH_SECONDS` / `CATCHUP_INTERVAL_SECONDS` / `RETRY_POLL_SECONDS` / `HEARTBEAT_SECONDS` | `60` / `900` / `60` / `30` | Worker loop intervals |
 | `CATCHUP_MAX_AGE_HOURS` | `72` | Oldest message catch-up replays for a chat with history (24 h for a chat without history or after an un-ignore) |
@@ -245,7 +246,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `is_triaged` | Boolean | `False` = pending in Triage Hub |
 | `lifecycle_status` | String(64) | `APPLICATION_WINDOW` \| `INTERVIEWS` \| … |
 | `latest_status_note` | Text | Non-temporal status (e.g. "Shortlists delayed") |
-| `latest_note_kind` | String(32) | `CRITERIA_RELAXATION` \| `GENERAL` — added in 0.2, written from 0.5 (only relaxations may re-open a SILENT_TRACK role, invariant 6) |
+| `latest_note_kind` | String(32) | `CRITERIA_RELAXATION` \| `GENERAL` — written since 0.5 with every status note; only a relaxation re-opens a SILENT_TRACK role (invariant 6). Exposed in triage and role responses |
 | `created_at` | UTCDateTime | UTC default |
 | `updated_at` | UTCDateTime | Auto-updated on write |
 
@@ -265,8 +266,8 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `is_custom` | Boolean | **Currently always `True`** — `crud.create_custom_event` hardcodes it, including for LLM-created events; not a reliable provenance flag |
 | `is_deleted` | Boolean | Soft-delete flag (`default=False`) |
 | `version` | Integer | Form replacement counter |
-| `needs_review` / `review_reason` | Boolean / Text | Uncertain extractions are kept but flagged for the user (recall-first) — added in 0.2, written from 0.5 |
-| `source_chat_id` / `source_message_id` | BigInteger | Telegram message that last created or updated the event (provenance, deep links); composite index `ix_timeline_events_source` — added in 0.2, written from 0.4/0.5 |
+| `needs_review` / `review_reason` | Boolean / Text | Uncertain extractions are kept but flagged for the user (recall-first) — written since 0.5: low confidence, a date before its announcement or over a year away, an extension that moves earlier, an unknown target id, an ambiguous match, an edit whose earlier event can't be identified. Never cleared automatically |
+| `source_chat_id` / `source_message_id` | BigInteger | Telegram message that last created or updated the event (provenance, deep links, edit matching); composite index `ix_timeline_events_source` — written since 0.5 (never guessed in a multi-message batch) |
 | `created_at` | UTCDateTime | |
 
 **Computed Property — `display_state`:**
@@ -316,14 +317,14 @@ Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker an
 | `POST` | `/companies/` | `CompanyCreate` (accepts `name`, `company_name`, `target_role`, `role_name`, `drive_type`, `ctc_stipend_info`, `environment_type="MAIN"`) | `CompanyResponse` (201) — atomically creates parent company and default `RoleTrack` (`is_triaged=True`, `tracking_mode="ELIGIBLE"`) |
 | `GET` | `/companies/` | `?tracking_mode=&env=MAIN\|TEST` | `List[CompanyResponse]` (filters `is_active == True`, serializes both `name` and `company_name`) |
 | `GET` | `/companies/{id}/events` | — | `List[TimelineEventResponse]` (chronological, filters `is_deleted == False`, returns 404 if company does not exist) |
-| `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` to child `RoleTrack`s; does not set `is_triaged` — invariant 9, fix in 0.5) |
-| `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201) |
+| `PATCH` | `/companies/{id}/tracking` | `ToggleTrackingPayload` | `CompanyResponse` (cascades `tracking_mode` and `is_triaged=true` to every child `RoleTrack` — invariant 9). The only path out of IGNORED (invariant 1) |
+| `POST` | `/companies/{id}/tracks` | `RoleTrackCreate` | `RoleTrackResponse` (201); **409** for an effectively IGNORED company (a new role would bring it back) |
 | `DELETE` | `/companies/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes company `is_active=False` & cascades `is_deleted=True` to events) |
 
 #### Timeline Events — `/events`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (LEFT OUTER JOIN on `RoleTrack` so company-level events are preserved; filters `Company.is_active == True` and `TimelineEvent.is_deleted == False`; serializes both `display_state` and `status`) |
+| `GET` | `/events/timeline` | `?drive_type=FTE&env=MAIN\|TEST` | `List[TimelineEventResponse]` (LEFT OUTER JOIN on `RoleTrack` so company-level events are preserved; filters `Company.is_active == True`, company not IGNORED, role ELIGIBLE and `TimelineEvent.is_deleted == False`; serializes `display_state`/`status`, and since 0.5 `needs_review`, `review_reason`, `source_chat_id`, `source_message_id`) |
 | `POST` | `/events/` | `TimelineEventCreate` | `TimelineEventResponse` (201) |
 | `PATCH` | `/events/{id}/complete` | `?completed=true` | `TimelineEventResponse` |
 | `POST` | `/events/{id}/uncomplete` | — (alias `/reopen`) | `TimelineEventResponse` (resets `user_status=PENDING`, `completed_at=None`) |
@@ -334,11 +335,11 @@ Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker an
 #### Triage Hub — `/triage`
 | Method | Path | Request Body / Params | Response |
 |---|---|---|---|
-| `GET` | `/triage/pending` | `?env=MAIN\|TEST` | `List[TriageItemResponse]` (`is_triaged == False`, newest first, includes `environment_type`) |
+| `GET` | `/triage/pending` | `?env=MAIN\|TEST` | `List[TriageItemResponse]` (`is_triaged == False`, never IGNORED roles or companies, newest first; includes `environment_type`, `latest_status_note`, `latest_note_kind`) |
 | `GET` | `/triage` | `?env=MAIN\|TEST` | Alias to `/triage/pending` |
-| `POST` | `/triage/{id}` | `TriageActionPayload` | `TriageItemResponse` (sets `tracking_mode` & `is_triaged=True`, cascades `ELIGIBLE` to parent `Company`) |
-| `POST` | `/triage/{id}/accept` | — | `TriageItemResponse` (convenience shortcut for `ELIGIBLE`, cascades to parent `Company`) |
-| `POST` | `/triage/{id}/ignore` | — | `TriageItemResponse` (convenience shortcut for `IGNORED`) |
+| `POST` | `/triage/{id}` | `TriageActionPayload` | `TriageItemResponse` (sets `tracking_mode` & `is_triaged=True`, cascades `ELIGIBLE` to the parent `Company`; discarding the last tracked role marks the company IGNORED). **409** for an IGNORED role or a role of an IGNORED company (invariants 2, 5) |
+| `POST` | `/triage/{id}/accept` | — | `TriageItemResponse` (shortcut for `ELIGIBLE`; same 409 rule) |
+| `POST` | `/triage/{id}/ignore` | — | `TriageItemResponse` (shortcut for `IGNORED`; same 409 rule) |
 
 #### System Settings — `/settings`
 | Method | Path | Request Body | Response |
@@ -389,7 +390,7 @@ A message is skipped (ledger `SKIPPED`, reason `empty`) **only** when it has no 
 - **Monitored set (0.3):** `refresh_monitored()` loads the root feeds (`.env` + `system_config`, filtered by `INGEST_ENVIRONMENTS`) and the subchannels of ingestible companies (`crud.get_ingestible_subchannel_ids`: active, ingested environment, not effectively IGNORED — invariants 2–3). The worker refreshes it every 60 s; chats that leave the set have their buffers discarded, chats that join it get a bounded catch-up (invariant 4). Routing never queries the database for membership.
 - **Subscriptions:** only `events.NewMessage` and `events.MessageEdited`. Reaction updates (`UpdateMessageReactions`, `UpdateBotMessageReaction(s)`) are never subscribed to — Telethon builds neither event from them — and `message.reactions` is never read: the payload carries only the message text or caption (owner decision 2026-10-23).
 - **Edit updates (0.4):** an edit is processed only if its text changed. An update without `edit_date`, one whose text hashes the same as the version already handled (`message_ledger.content_hash`), or an edit more than 24 h old of a message never processed here is ignored, since Telegram may re-send a message when only metadata such as reactions changed (not verified; the check makes it harmless either way).
-- **Batches (0.4):** at most 40 messages per LLM call, numbered `[1]…[n]`; a buffer is split so each batch belongs to one company.
+- **Batches (0.4):** at most 40 messages per LLM call; a buffer is split so each batch belongs to one company. The dispatcher puts each message under a `[msg <id> · posted <IST> · edited]` header (0.5).
 - **Task tracking:** spawned `asyncio.Task` references are kept in `self._background_tasks` with error-logging callbacks.
 - **Ledger:** every message gets an outcome (§7.6).
 
@@ -406,7 +407,7 @@ A message is skipped (ledger `SKIPPED`, reason `empty`) **only** when it has no 
 
 > **⚠ Spec Gap:** Recursive reply fetching (depth ≤ 6) is not implemented — only single-level parent stitching exists.
 > **⚠ Spec Gap:** 60-second TCP heartbeat job (DC keep-alive) is not implemented.
-> ⚠ Until 0.5, messages in a batch aren't individually addressed (no message ids or post times in the prompt), so an edit can still create a duplicate event instead of updating the original (gaps H3/H4), and events carry no source message ids yet.
+> ✅ Since 0.5 messages are individually addressed in the prompt (ids, post times, edited flag), events record their source message, and an edit updates the event it created (§8.4).
 > ⚠ In a discussion group linked to a broadcast channel, auto-forwarded channel posts arrive "from" that channel and are `SKIPPED non_admin_sender`. Company channels are expected to be broadcast channels.
 > ⚠ A fresh session bootstraps a root feed from its last 24 h only, so invite posts older than that are never seen. A wider one-time bootstrap for the VM's first start is a Phase 1 decision.
 
@@ -416,7 +417,7 @@ A message is skipped (ledger `SKIPPED`, reason `empty`) **only** when it has no 
 - **Catch-up:** at boot and every 15 min, each monitored chat is re-scanned from 100 messages behind its ledger cursor (a crash can leave buffered messages below a later recorded one). The scan is bounded by `CATCHUP_MAX_AGE_HOURS` (72 h), or 24 h for a chat with no history or one that was just un-ignored, added or linked (invariant 4). Messages already recorded, buffered or in flight are skipped; the rest are routed exactly like live messages. Since 0.4, recorded messages whose text has changed since (edited while offline) are routed again as edits. Edits older than the scan (100 messages behind the cursor, 72 h) are not replayed.
 - **Entity cache:** catch-up and retries resolve chats from the Telethon session's entity cache. A chat that isn't cached yet (e.g. a brand-new session) is skipped until its first live update caches it — so production should use the file session, which persists the cache (a `StringSession` loses it on restart).
 - **Delivery guarantee:** at-least-once. If a ledger write fails, the message may be processed again but is never lost.
-- ⚠ Until Phase 0.5, catch-up and backfill messages still have relative dates ("tomorrow") resolved against processing time (gap H2), and LLM failures don't reach the retry loop because the extractor swallows them (gap C4).
+- ✅ Since 0.5, relative dates resolve against each message's post time (so catch-up and backfill batches are dated correctly), and LLM failures raise `ExtractionFailed`, so they reach the retry loop (gaps H2, C4).
 
 ### 7.7 Ingestion Worker (`app/worker.py`) — Phase 0.3
 Run with `python -m app.worker`, **exactly one per Telegram session**.
@@ -445,59 +446,54 @@ Pure functions (no client, no I/O), unit-tested in `verify_ingestion.py`:
 | `ActionType` | `CREATE_EVENT`, `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, `REPLACE_FORM`, `STATUS_NOTE`, `NO_ACTION` |
 | `DriveType` | `FTE`, `INTERNSHIP`, `COMBINED` (default `"FTE"`) |
 | `AudienceScope` | `COHORT`, `INDIVIDUAL` (default `"COHORT"`) |
+| `EventType` | `IRIS_DEADLINE`, `FORM_SUBMISSION`, `PPT`, `OA_WINDOW`, `INTERVIEW`, `CUSTOM` |
+| `Confidence` (0.5) | `HIGH`, `MEDIUM`, `LOW` — LOW results are kept but flagged `needs_review` |
+| `NoteKind` (0.5) | `CRITERIA_RELAXATION`, `GENERAL` — a missing kind counts as GENERAL |
 
-`ExtractedEvent` fields: `action`, `company_name` (optional), `role_name` (optional), `drive_type` (default `"FTE"`), `audience_scope` (default `"COHORT"`), `event_type`, `title` (optional, falls back to `event_type`), `action_link`, `start_time`, `end_time`, `status_note`.
+`ExtractedEvent` fields: `action`, `company_name`, `role_name`, `drive_type`, `audience_scope`, `event_type`, `title` (falls back to `event_type`), `action_link`, `start_time`, `end_time` (naive values are read as IST), `status_note`, and since 0.5 `note_kind`, `target_event_id` (id of the scheduled event an action updates), `source_message_id` (from the message header) and `confidence`. Unknown `note_kind`/`confidence` labels become null instead of failing the batch.
 
-> **⚠ Schema Divergence vs MASTER_SPEC §4:** The current `ExtractedEvent` is a simplified Phase 4 schema (with Phase 1 null-safety relaxations). The spec's canonical `PlacementExtractionPayload` requires: `is_actionable`, `roles[]` (with `lifecycle_note`), `events[].event_category` (RESUME/IRIS/FORM/OA/GD/…), `events[].round_number`, `events[].is_form_replacement`, `events[].venue`.
+`RESULT_JSON_SCHEMA` is the same contract as a strict JSON schema for Groq structured outputs (every property required, nullable fields as unions with null, objects closed).
+
+> **⚠ Schema Divergence vs MASTER_SPEC §4:** The current `ExtractedEvent` is a simplified Phase 4 schema. The spec's canonical `PlacementExtractionPayload` requires: `is_actionable`, `roles[]` (with `lifecycle_note`), `events[].event_category` (RESUME/IRIS/FORM/OA/GD/…), `events[].round_number`, `events[].is_form_replacement`, `events[].venue`.
 
 ### 8.2 Prompt Builder (`ai/prompts.py`)
-`build_system_prompt(context: dict) -> str`
+`build_system_prompt(context)` and `format_message_block(messages)`, rebuilt for every call (0.5):
+- **Message headers:** each message in the user turn starts with `[msg <id> · posted <weekday, date, HH:MM> IST · edited]`. A `[CONTEXT: …]` line quotes the parent of a reply.
+- **Dates:** relative dates resolve against the **posted time in the header** of the message that contains them, not the current time; a date without a year is the next such date on or after the post (gap H2).
+- **Known Companies & Their Current Schedule:** for each company, its roles and its non-deleted events (not those of IGNORED roles) as `id=<n> — [TYPE] — title — role — starts/ends (IST) — link — status — from msg <id>`. The source company is marked "every message below is about this company"; a root-feed post gets the tracked companies it mentions by name.
+- **Rules:** one event, one entry — create only what is not scheduled; a reminder of a scheduled event is NO_ACTION; a later deadline is EXTEND_DEADLINE, a moved slot RESCHEDULE_EVENT, a superseding form REPLACE_FORM, each with `target_event_id`; an edited message updates the entries "from msg <id>" it created. Also `source_message_id`, per-action `company_name` for digest posts, audience scope, note kinds (CRITERIA_RELAXATION only when eligibility was widened; never judge the student's eligibility) and confidence levels. The old contradictory rules that turned reminders into new events are gone (gap H3).
+- **Output format:** JSON formatting rules and the schema example (mirrors `RESULT_JSON_SCHEMA`).
 
-Injections per call:
-- **Groq JSON Schema Compliance Header:** Strict formatting constraints requiring pure JSON output without markdown fences.
-- **Current IST Timestamp & Anchoring:** Dynamic Indian Standard Time timestamp generated via native `_IST = timezone(timedelta(hours=5, minutes=30), name="IST")`.
-- **Relative Date Resolution Rules:** Explicit resolution rules converting "today" (calendar date in IST), "tonight" (23:59:59 IST), "tomorrow", and upcoming weekday names relative to today.
-- **Company Schedule State Block:** Current event titles, types, deadlines, and statuses to allow resolving "same timings", "shifted by 2 hours", etc.
-- **Strict Operational Rules:** Action selection criteria for `CREATE_EVENT`, `EXTEND_DEADLINE`, `RESCHEDULE_EVENT`, `REPLACE_FORM`, `STATUS_NOTE`, and `NO_ACTION`.
-- **Verbatim JSON Schema:** Injected schema template preventing hallucinated field names.
+> ⚠ The user profile (`system_config`) is never injected (gap H6); CGPA and branch are never collected (invariant 7).
 
-> ⚠ Per-message post timestamps are not injected, so relative dates resolve against processing time (gap H2). The schedule block appears only when the company is already resolved — never for main-feed posts — includes soft-deleted events, and carries no event IDs (gaps H4, H5). The user profile (`system_config`) is never injected (gap H6).
+### 8.3 Extractor (`ai/extractor.py`)
+`extract_placement_actions(raw_text, current_context) -> LLMExtractionResult` — raises `ExtractionFailed`.
 
-### 8.3 Extractor (`ai/extractor.py`) & Fallback Extractor (`ai/rule_extractor.py`)
-`extract_placement_actions(raw_text, current_context) -> LLMExtractionResult`
-
-- Cached module-level `AsyncOpenAI` singleton via `get_ai_client()` for connection reuse
-- `timeout=30.0` on completions call
-- `response_format={"type": "json_object"}` — forces JSON output
-- `temperature=0.0` — deterministic extraction
-- `max_tokens=4096` — ensures full token headroom avoiding mid-JSON truncation (`EOF while parsing a string`)
-- **Dual-Tier Fallback Architecture:**
-  1. *In-flight Fallback:* If Groq returns 400 `json_validate_failed` or invalid JSON, re-requests without schema enforcement and extracts JSON with code-fence stripping.
-  2. *Secondary Deterministic Regex Fallback (`rule_extractor.py`):* If the LLM produces 0 actions or fails inference for messages containing clear recruitment temporal keywords ("tomorrow 9pm", "today by 11:59 PM", "OA window 8-10am"), deterministic regex patterns extract event types and IST timestamps directly into structured actions.
-- Falls back to `LLMExtractionResult()` (empty) on unrecoverable error — **never raises**
-
-> ⚠ Because the extractor never raises, an LLM failure still ends as an empty (or regex) result that is recorded `DONE` — the retry loop added in 0.3 only sees errors that propagate. Making extraction failures raise is Phase 0.5 (gap C4). The regex tier is under revision (gap C5, Tribal Knowledge #2).
+- Cached `AsyncOpenAI` client (`get_ai_client()`) with `max_retries=3` for transient errors (429, 5xx, timeouts); 60 s per request; `temperature=0.0`; `max_completion_tokens=8192`; `reasoning_effort` only when `LLM_REASONING_EFFORT` is set.
+- **Output modes:** strict `json_schema` → JSON-object mode (strict mode switched off for the process if Groq rejects it but JSON-object mode works) → no format after `json_validate_failed` (Tribal Knowledge #2).
+- **Valid results are returned** — including one with no actions. **Everything else raises `ExtractionFailed`:** request errors left after the client's retries, a rejected request, an empty or truncated answer, output that doesn't match the schema. The message ledger records the batch `FAILED` (with a short reason, never message text) and retries it with backoff (§7.6). There is no regex fallback (gap C5, deleted in 0.5).
 
 ### 8.4 Dispatcher & Pre-Interview State Engine (`ai/dispatcher.py`)
-`process_and_dispatch(chat_id, context_header, messages, db, company_id=None, subchannel=None)`
+`process_and_dispatch(chat_id, context_header, messages, db, company_id=None, subchannel=None)` — rewritten in 0.5.
 
-**5-Step Pipeline** (verified defects: H3–H6, M1, M2 — see §0.2):
-1. Normalize text block from message list.
-2. Resolve `Company`. Since 0.4 a company known from the source is **authoritative for every action** (per-action company names are not followed): `company_id` (a reply to, or re-post of, its invite post) or the channel an invite post just joined (`subchannel`). Otherwise: by `subchannel_id == chat_id`, falling back to the LLM-extracted name or subchannel mapping. An IGNORED or deleted company stops the batch before the LLM call.
-3. Build schedule context → inject into prompt.
-4. Call `extract_placement_actions()` with automated fallback chain. For an invite post (`subchannel`), the channel is then linked with `crud.link_or_create_subchannel_company` under the extracted company name, else the channel title. Only an active company of the same environment that has no channel yet is reused (it stays IGNORED if it was). Otherwise a SILENT_TRACK company with an untriaged default role is created, under "<title> (<channel id>)" if both names are taken. `invite_token` and `main_feed_msg_id` are recorded.
-5. Execute pre-interview state machine mutations per action, silently dropping `INDIVIDUAL` scope and — since 0.4 — any action whose company is IGNORED or deleted (invariant 3, re-checked per action):
+1. **Format** the messages under their headers.
+2. **Source company** — authoritative for every action (per-action company names are not followed): `company_id` (a reply to, or re-post of, its invite post), the channel an invite post just joined (`subchannel`), or the subchannel itself. A subchannel without a company, or an IGNORED/deleted source company, stops before the LLM call.
+3. **Context:** the source company's schedule with event ids, or for a root-feed post the tracked companies it mentions.
+4. **Extraction** (`ExtractionFailed` propagates → retried). An invite post's channel is then linked with `crud.link_or_create_subchannel_company` under the extracted company name, else the channel title (only an active same-environment company without a channel is reused; it stays IGNORED if it was).
+5. **Actions:** INDIVIDUAL scope and NO_ACTION are skipped. Root-feed actions go to the company their name matches **within the feed's environment**; an unknown name becomes a SILENT_TRACK company with an untriaged default role (Triage); a deleted or IGNORED company's actions are dropped and never re-created. An action for an IGNORED role is dropped. Each action runs on its own: a failure is rolled back and the rest of the batch continues (M1).
 
-| Action | State Machine Transition & Fallback |
+| Action | Behaviour |
 |---|---|
-| `CREATE_EVENT` | Normalizes start/end times (`_normalize_event_times`) and invokes `crud.create_custom_event()`. |
-| `EXTEND_DEADLINE` | Queries `_find_matching_event` (filtering `is_deleted == False`). If found, updates deadline via `crud.extend_event_deadline()`. **Fallback:** If no prior event exists, falls back seamlessly to `CREATE_EVENT`. |
-| `RESCHEDULE_EVENT` | Queries `_find_matching_event` (filtering `is_deleted == False`). If found, updates both `start_time` and `end_time` via `crud.reschedule_event()`. **Fallback:** If no prior event exists, falls back seamlessly to `CREATE_EVENT`. |
-| `REPLACE_FORM` | If a prior form event exists and `action_link` is present, calls `crud.replace_form_event()` to increment `version = max_version + 1`, update `action_link`, set both `start_time` and `end_time` to `new_end_time`, and reset `user_status = "PENDING"`. **Fallback:** If no prior event exists, falls back to `CREATE_EVENT` with `event_type="FORM_SUBMISSION"`. |
-| `STATUS_NOTE` | Criteria Relaxation / Re-Triage trigger: calls `crud.flag_for_retriage(db, target_track.id, note=extracted.status_note)`. Persists `latest_status_note` and resets `is_triaged = False` strictly if `tracking_mode == "SILENT_TRACK"`. |
+| `CREATE_EVENT` | Creates the event (times normalized below) — unless `target_event_id` names an existing event, or the message is an edit of one that created an event of that type, in which case that event is updated. An event of the same company and type within 1 minute of the same time is not created twice. |
+| `EXTEND_DEADLINE` | Moves the target's deadline; a point deadline (start = end) moves whole. Target: `target_event_id`, else the event the edited message created, else the company's event of that type (and named role) — the latest one, flagged, if several. No match → created. |
+| `RESCHEDULE_EVENT` | Sets the target's new start and end (and link, if given); same target rules. |
+| `REPLACE_FORM` | With a link: inserts version `max + 1` (PENDING) and soft-deletes the form it supersedes (H4). Without a link: reschedules the form. No form found → created as `FORM_SUBMISSION`. |
+| `STATUS_NOTE` | Stores the note and its kind on the named role, else on every role that is not IGNORED. Only `CRITERIA_RELAXATION` on a SILENT_TRACK role re-opens it in Triage; `tracking_mode` never changes; IGNORED roles are never touched (invariant 6). |
 | `NO_ACTION` | No-op. |
 
-> ⚠ Verified behaviour (2026-10-21): `EXTEND_DEADLINE` updates only `end_time` (point deadlines keep the old `start_time`); `REPLACE_FORM` inserts a new version and leaves the previous form visible; `STATUS_NOTE` re-triages on *any* note, not only criteria relaxations (conflicts with §0.1 invariant 6); INDIVIDUAL-scope actions are dropped even when addressed to the user; a failed action is not rolled back, so later actions in the same batch can fail.
+**Provenance and review:** every created or updated event records its source message (`source_chat_id`, `source_message_id`) — the action's `source_message_id` if it is in the batch, else the only message of a one-message batch, never a guess. Events are flagged `needs_review` (with the reasons) for low confidence, a date before its announcement or more than a year away, an extension that moves the deadline earlier, an unknown `target_event_id`, an ambiguous match, or an edit whose earlier event can't be identified.
+
+> ⚠ Still open: INDIVIDUAL-scope actions are dropped even when addressed to the user (gap H6); there is no CANCELLED/TBA state (H4).
 
 **Temporal Normalization Rules (`_normalize_event_times`):**
 - *Live events* (`OA_WINDOW`, `PPT`, `INTERVIEW`): If only `start_time` is present, defaults `end_time = start_time + 2 hours`.
@@ -564,11 +560,12 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_phase2.py` | CRUD mutations, drive-type viewport filtering, form versioning, deadline recovery, HTTP router tests (`POST /companies/` mobile contract, `GET /companies/{id}/events` 200/404, timeline `?env=MAIN\|TEST` isolation, complete/uncomplete) | In-memory SQLite |
 | `verify_phase3.py` | Pre-filter (only blank messages skipped), debounce sliding window, version collapse of edits, bounded fetch window, reply-to stitching, payload handler dispatch | Mock objects + in-memory SQLite (patched in 0.2) |
 | `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM, EXTEND_DEADLINE, prompt context injection, dirty subchannel payloads (missing company/drive), e2e CREATE_EVENT, e2e STATUS_NOTE, RESCHEDULE_EVENT start/end updates | In-memory SQLite |
-| `verify_triage.py` | RoleTrack defaults, pending triage items, re-triage criteria relaxation, isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
+| `verify_triage.py` | RoleTrack defaults, pending triage items, note kinds (only CRITERIA_RELAXATION re-opens SILENT_TRACK; IGNORED roles untouched), isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
 | `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
 | `verify_schema.py` | Alembic upgrade → downgrade → upgrade + drift check, startup revision check, UTC round-trip, IST deadline flips to MISSED on time, naive-datetime policy, per-environment name uniqueness, foreign keys, ledger/status constraints | In-memory SQLite |
 | `verify_worker.py` | `TELEGRAM_API_ID=0` builds no client; `app.main` imports no Telegram code; monitored set vs invariants 2–4; un-ignore/new-chat 24 h catch-up; ledger outcomes and backoff; retry loop; catch-up skipping; heartbeat + dead-man ping; exit codes; error propagation. The real `TelegramClient` class is replaced by one that fails if constructed | In-memory SQLite (migrated) |
 | `verify_ingestion.py` | Join-policy link and chat tables; short messages reach the LLM; reactions never subscribed to or read, unchanged-text edit updates ignored; invite posts joined, linked and extracted with their company, re-posts and replies attributed, IGNORED companies skipped; refused links (bot, person, basic group, approval, expired, phone, permalink, root feed) never joined; flood-wait retry and join pacing; supergroup admin filter; root feeds must be broadcast channels; debouncer max-wait and per-chat order; ≤ 40 messages per LLM call; offline edits caught up; dispatcher source company, naming and IGNORED gate; no cross-environment attribution. Every chat, person and bot is a mocked entity | In-memory SQLite (migrated) |
+| `verify_extraction.py` | Strict JSON-schema requests (schema closed and in step with the model); `ExtractionFailed` for invalid/empty/truncated answers, timeouts, network and rate limits (no regex fallback); output-mode fallbacks; failed extraction → ledger FAILED → retried to DONE; message headers and prompt rules; updates by `target_event_id`; edits update instead of duplicating; same-time duplicates suppressed; `needs_review` flags; source message ids; superseded forms hidden; note kinds; env-scoped root-feed names; per-action rollback; invariants 1–9 through the API (409s, last-discard sync, timeline filters, PATCH triages every role, no profile data to the LLM) | In-memory SQLite (migrated) |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
 > ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
@@ -585,6 +582,7 @@ python verify_settings.py
 python verify_schema.py
 python verify_worker.py
 python verify_ingestion.py
+python verify_extraction.py
 # Owner-run only (uses the live session, read-only):
 python scripts/test_live_ingestion.py
 ```
@@ -600,8 +598,8 @@ python scripts/test_live_ingestion.py
 | 0.1 | Docs truth pass; root spec edits approved and applied 2026-10-23 | ✅ Done — reviewed |
 | 0.2 | Schema foundation: Alembic baseline, `UTCDateTime`, env-scoped company uniqueness, `message_ledger` / `worker_status` tables, SQLite pragmas | ✅ Done — reviewed 2026-10-23 (settings row restored from the backup) |
 | 0.3 | API / worker process split; ledger outcomes; monitored-set refresh, catch-up, retry and heartbeat loops | ✅ Done — reviewed 2026-10-23 |
-| 0.4 | Ingestion: empty-only pre-filter, join policy, invite-post extraction and attribution, reactions ignored and edit detection, supergroup admin filter, debouncer max-wait and order, ≤ 40 messages per LLM call | ✅ Done — pending owner review |
-| 0.5 | Extraction & dispatch: post timestamps, event IDs, regex-tier removal, invariants 1–9 | Planned |
+| 0.4 | Ingestion: empty-only pre-filter, join policy, invite-post extraction and attribution, reactions ignored and edit detection, supergroup admin filter, debouncer max-wait and order, ≤ 40 messages per LLM call | ✅ Done — reviewed 2026-10-26 |
+| 0.5 | Extraction & dispatch: message headers and post-time dates, event ids and `target_event_id`, regex fallback removed and `ExtractionFailed` retried, strict structured output, note kinds, review flags and source ids, invariants 1–9 | ✅ Done — pending owner review |
 | 0.6 | API key, CORS removal, secret hygiene, `.dockerignore` | Planned |
 | 0.7 | Frontend: API-key pairing, needs-review pill, Telegram deep links | Planned |
 
@@ -614,9 +612,9 @@ Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN fee
 | 1 | **Implement `/triage` router** | `app/routers/triage.py` | ✅ **Resolved** — `GET /triage/pending`, `POST /triage/{id}`, `/accept`, `/ignore`, and conditional re-triage. |
 | — | **Atomic Company Creation** | `app/crud.py`, `app/schemas.py` | ✅ **Resolved** — `POST /companies/` creates default `RoleTrack` atomically with role metadata. |
 | — | **Enriched Timeline & Events** | `app/schemas.py`, `app/routers/companies.py` | ✅ **Resolved** — `TimelineEventResponse` enriched with `company_name`, `drive_type`, `status`; `GET /companies/{id}/events` implemented. |
-| — | **Pre-Interview State Engine** | `app/ai/dispatcher.py`, `app/crud.py` | ⚠ **Delivered with verified defects (H3, H4, M1, M2)** — Canonical time normalization (live events +2h, deadlines same timestamp), non-existent event fallbacks (`EXTEND_DEADLINE`/`RESCHEDULE_EVENT`/`REPLACE_FORM` → `CREATE_EVENT`), form replacement versioning with PENDING reset, soft-delete filtering, and criteria relaxation re-triage via `crud.flag_for_retriage()`. |
+| — | **Pre-Interview State Engine** | `app/ai/dispatcher.py`, `app/crud.py` | ✅ **Reworked in 0.5** — updates by event id, edits update the events they created, duplicates suppressed, superseded forms hidden, review flags and source ids, note kinds, per-action rollback (gaps H3, H4, M1, M2). Open: INDIVIDUAL messages addressed to the user (H6), CANCELLED/TBA. |
 | — | **Zero-Dependency IST Timezone** | `app/ai/prompts.py`, `app/ai/schemas.py` | ✅ **Resolved** — Native UTC+05:30 `timezone` representation eliminating Windows `tzdata` crashes. |
-| — | **Dual-Tier AI Extraction & Fallbacks**| `app/ai/extractor.py`, `app/ai/rule_extractor.py` | ⚠ **Partly** — `max_tokens=4096` and the in-flight JSON fallback stay; the regex tier was verified harmful (C5) and is removed in 0.5. |
+| — | **AI Extraction & Fallbacks** | `app/ai/extractor.py` | ✅ **Reworked in 0.5** — strict structured output with JSON-object and no-format fallbacks; the regex tier was deleted (C5) and failures are retried via the ledger. |
 | — | **Database Isolation & Sanitization** | `verify_*.py`, `scripts/clean_test_data.py` | ✅ **Resolved (Phase 0.2)** — every database-touching suite binds `:memory:` (`verify_phase3.py` patched). `dev.db` was never committed (git history verified 2026-10-21). |
 
 ### P1 — Schema Conformance
@@ -664,7 +662,7 @@ e850a9c feat(pre-interview): implement master spec time normalization, ist ancho
 e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
 
-> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), then 0.4.
+> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), then 0.5.
 
 ---
 
