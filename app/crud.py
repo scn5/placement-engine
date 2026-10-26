@@ -471,6 +471,20 @@ async def annotate_event(
     await db.commit()
 
 
+async def resolve_event_review(
+    db: AsyncSession, event_id: int
+) -> Optional[models.TimelineEvent]:
+    """The user has checked a flagged event: clear needs_review and its reasons.
+    A later uncertain update can flag it again. Returns None if not found."""
+    event = await db.get(models.TimelineEvent, event_id)
+    if event is None:
+        return None
+    event.needs_review = False
+    event.review_reason = None
+    await db.commit()
+    return await _load_event(db, event_id)
+
+
 # ---------------------------------------------------------------------------
 # Triage Operations
 # ---------------------------------------------------------------------------

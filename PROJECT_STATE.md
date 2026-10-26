@@ -271,7 +271,7 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 | `is_custom` | Boolean | **Currently always `True`** — `crud.create_custom_event` hardcodes it, including for LLM-created events; not a reliable provenance flag |
 | `is_deleted` | Boolean | Soft-delete flag (`default=False`) |
 | `version` | Integer | Form replacement counter |
-| `needs_review` / `review_reason` | Boolean / Text | Uncertain extractions are kept but flagged for the user (recall-first) — written since 0.5: low confidence, a date before its announcement or over a year away, an extension that moves earlier, an unknown target id, an ambiguous match, an edit whose earlier event can't be identified. Never cleared automatically |
+| `needs_review` / `review_reason` | Boolean / Text | Uncertain extractions are kept but flagged for the user (recall-first) — written since 0.5: low confidence, a date before its announcement or over a year away, an extension that moves earlier, an unknown target id, an ambiguous match, an edit whose earlier event can't be identified. Never cleared automatically — the user clears it with `POST /events/{id}/resolve-review` (0.7) |
 | `source_chat_id` / `source_message_id` | BigInteger | Telegram message that last created or updated the event (provenance, deep links, edit matching); composite index `ix_timeline_events_source` — written since 0.5 (never guessed in a multi-message batch) |
 | `created_at` | UTCDateTime | |
 
@@ -336,6 +336,7 @@ Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker an
 | `POST` | `/events/{id}/uncomplete` | — (alias `/reopen`) | `TimelineEventResponse` (resets `user_status=PENDING`, `completed_at=None`) |
 | `PATCH` | `/events/{id}/extend` | `ExtendDeadlinePayload` | `TimelineEventResponse` |
 | `POST` | `/events/companies/{id}/replace-form` | `ReplaceFormPayload`, `?role_track_id=` | `TimelineEventResponse` (201); hides the superseded form (0.5); **404** for an unknown company, **422** for a role of another company |
+| `POST` | `/events/{id}/resolve-review` | — | `TimelineEventResponse`; clears `needs_review` and `review_reason` after the user checked the event (0.7); **404** for an unknown event. A later uncertain update can flag it again |
 | `DELETE` | `/events/{id}` | — | `{"status": "deleted", "id": id}` (soft-deletes event `is_deleted=True`) |
 
 #### Triage Hub — `/triage`
@@ -565,7 +566,7 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_schema.py` | Alembic upgrade → downgrade → upgrade + drift check, startup revision check, UTC round-trip, IST deadline flips to MISSED on time, naive-datetime policy, per-environment name uniqueness, foreign keys, ledger/status constraints | In-memory SQLite |
 | `verify_worker.py` | `TELEGRAM_API_ID=0` builds no client; `app.main` imports no Telegram code; monitored set vs invariants 2–4; un-ignore/new-chat 24 h catch-up; ledger outcomes and backoff; retry loop; catch-up skipping; heartbeat + dead-man ping; exit codes; error propagation. The real `TelegramClient` class is replaced by one that fails if constructed | In-memory SQLite (migrated) |
 | `verify_ingestion.py` | Join-policy link and chat tables; short messages reach the LLM; reactions never subscribed to or read, unchanged-text edit updates ignored; invite posts joined, linked and extracted with their company, re-posts and replies attributed, IGNORED companies skipped; refused links (bot, person, basic group, approval, expired, phone, permalink, root feed) never joined; flood-wait retry and join pacing; supergroup admin filter; root feeds must be broadcast channels; debouncer max-wait and per-chat order; ≤ 40 messages per LLM call; offline edits caught up; dispatcher source company, naming and IGNORED gate; no cross-environment attribution. Every chat, person and bot is a mocked entity | In-memory SQLite (migrated) |
-| `verify_extraction.py` | Strict JSON-schema requests (schema closed and in step with the model); `ExtractionFailed` for invalid/empty/truncated answers, timeouts, network and rate limits (no regex fallback); output-mode fallbacks; failed extraction → ledger FAILED → retried to DONE; message headers and prompt rules; updates by `target_event_id`; edits update instead of duplicating; same-time duplicates suppressed; `needs_review` flags; source message ids; superseded forms hidden; note kinds; env-scoped root-feed names; per-action rollback; invariants 1–9 through the API (409s, last-discard sync, timeline filters, PATCH triages every role, no profile data to the LLM) | In-memory SQLite (migrated) |
+| `verify_extraction.py` | Strict JSON-schema requests (schema closed and in step with the model); `ExtractionFailed` for invalid/empty/truncated answers, timeouts, network and rate limits (no regex fallback); output-mode fallbacks; failed extraction → ledger FAILED → retried to DONE; message headers and prompt rules; updates by `target_event_id`; edits update instead of duplicating; same-time duplicates suppressed; `needs_review` flags; source message ids; superseded forms hidden; note kinds; env-scoped root-feed names; per-action rollback; invariants 1–9 through the API (409s, last-discard sync, timeline filters, PATCH triages every role, no profile data to the LLM); `resolve-review` clears the flag (0.7) | In-memory SQLite (migrated) |
 | `verify_security.py` | Every operation but `/health` requires `X-API-Key` (OpenAPI schema and live calls: missing, wrong, truncated → 401); constant-time compare; `/health` minimal, `/status` ok/degraded/unknown; no CORS headers; docs off in production; APP_ENV fail-closed; production startup refused without a strong key; 404/409/422 instead of 500; login script prints no session string (static check — never run); `clean_test_data.py` dry-run and TEST-only; `.dockerignore` coverage | In-memory SQLite (migrated) |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
@@ -602,8 +603,8 @@ python scripts/test_live_ingestion.py
 | 0.3 | API / worker process split; ledger outcomes; monitored-set refresh, catch-up, retry and heartbeat loops | ✅ Done — reviewed 2026-10-23 |
 | 0.4 | Ingestion: empty-only pre-filter, join policy, invite-post extraction and attribution, reactions ignored and edit detection, supergroup admin filter, debouncer max-wait and order, ≤ 40 messages per LLM call | ✅ Done — reviewed 2026-10-26 |
 | 0.5 | Extraction & dispatch: message headers and post-time dates, event ids and `target_event_id`, regex fallback removed and `ExtractionFailed` retried, strict structured output, note kinds, review flags and source ids, invariants 1–9 | ✅ Done — reviewed 2026-10-26 |
-| 0.6 | API security: `X-API-Key` on every route but `/health`, authenticated `/status`, CORS removed, docs off in production, production refuses to start without a key, 404/409/422 instead of 500, safe login and cleanup scripts, `.dockerignore` | ✅ Done — pending owner review |
-| 0.7 | Frontend: API-key pairing, needs-review pill, Telegram deep links | Planned |
+| 0.6 | API security: `X-API-Key` on every route but `/health`, authenticated `/status`, CORS removed, docs off in production, production refuses to start without a key, 404/409/422 instead of 500, safe login and cleanup scripts, `.dockerignore` | ✅ Done — reviewed 2026-10-26 |
+| 0.7 | Frontend: secure pairing (URL + key), 401 → re-pair, status dot from `/status`, needs-review pill + `POST /events/{id}/resolve-review` (backend), Telegram deep links, https-only links, Add Stage validation, note-kind Triage banner | ✅ Done — pending owner review; new APK build is the owner's step |
 
 Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN feed) follows Phase 0.
 
@@ -664,7 +665,7 @@ e850a9c feat(pre-interview): implement master spec time normalization, ist ancho
 e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
 
-> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), `76a0fd8` (0.5), then 0.6.
+> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), `76a0fd8` (0.5), `6bf21d1` (0.6), then 0.7.
 
 ---
 

@@ -678,6 +678,52 @@ async def test_failed_action_is_rolled_back_alone() -> None:
     print("  [12] ✓ A failed action is rolled back without affecting the rest of the batch")
 
 
+async def test_resolve_review() -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from app.database import get_db
+    from app.main import app
+    from app.security import require_api_key
+
+    async def override_get_db():
+        async with _TestSession() as session:
+            yield session
+
+    chat = -1003950000001
+    company_id = await _company("Resolve Co", chat_id=chat)
+    await _dispatch(
+        _result(_action(title="Guess", end_time=_now() + timedelta(days=1), confidence="LOW")),
+        chat_id=chat, messages=[_message(150)],
+    )
+    [flagged] = await _events(company_id)
+    assert flagged.needs_review and flagged.review_reason == "low confidence"
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[require_api_key] = lambda: None  # authentication: verify_security.py
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/events/{flagged.id}/resolve-review")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["needs_review"] is False and body["review_reason"] is None
+            assert body["source_message_id"] == 150 and body["company_name"] == "Resolve Co"
+            assert (await client.post("/events/999999/resolve-review")).status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+    stored = await _get(TimelineEvent, flagged.id)
+    assert stored.needs_review is False and stored.review_reason is None
+
+    # A later uncertain update flags it again, with only the new reason.
+    await _dispatch(
+        _result(_action("RESCHEDULE_EVENT", target_event_id=flagged.id, end_time=_now() + timedelta(days=2), confidence="LOW")),
+        chat_id=chat, messages=[_message(151)],
+    )
+    stored = await _get(TimelineEvent, flagged.id)
+    assert stored.needs_review and stored.review_reason == "low confidence"
+
+    print("  [14] ✓ POST /events/{id}/resolve-review clears the review flag (404 for unknown events); a later uncertain update flags it again")
+
+
 # ---------------------------------------------------------------------------
 # Invariants 1–9 through the API
 # ---------------------------------------------------------------------------
@@ -786,6 +832,7 @@ async def main() -> None:
     await test_root_feed_company_names()
     await test_failed_action_is_rolled_back_alone()
     await test_tracking_invariants()
+    await test_resolve_review()
 
     await _test_engine.dispose()
     print("\n✅ Phase 0.5 Extraction & Dispatch Verified Successfully!")

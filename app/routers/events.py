@@ -155,6 +155,25 @@ async def replace_form(
     return schemas.TimelineEventResponse.model_validate(new_event)
 
 
+@router.post(
+    "/{event_id}/resolve-review",
+    response_model=schemas.TimelineEventResponse,
+    summary="Mark a flagged event as reviewed",
+)
+async def resolve_review(
+    event_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> schemas.TimelineEventResponse:
+    """Clear needs_review (and review_reason) after the user has checked the event."""
+    event = await crud.resolve_event_review(db, event_id)
+    if event is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Event {event_id} not found.",
+        )
+    return schemas.TimelineEventResponse.model_validate(event)
+
+
 @router.delete(
     "/{event_id}",
     summary="Soft-delete a timeline event",
