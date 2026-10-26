@@ -35,7 +35,7 @@ The **Placement Engine** is a single-tenant backend service that monitors offici
                       │  • CREATE_EVENT / EXTEND_DEADLINE      │
                       │  • RESCHEDULE_EVENT / REPLACE_FORM     │
                       │  • Criteria Relaxation Re-Triage       │
-                      │  • PostgreSQL / SQLite (AsyncSession)  │
+                      │  • SQLite, WAL mode (AsyncSession)     │
                       └──────────────────┬─────────────────────┘
                                          │ REST API
                                          ▼
@@ -103,7 +103,12 @@ placement-engine/
 │   ├── login_telegram.py       # CLI interactive MTProto session authenticator (prints no session string)
 │   └── test_live_ingestion.py  # Live sandbox integration harness
 ├── alembic/                    # Schema migrations (config in alembic.ini; target = DATABASE_URL)
-├── requirements.txt            # Production Python dependencies
+├── requirements.txt            # Dependency lower bounds (development)
+├── requirements.lock           # Hashed pins for the production image (Python 3.12, Linux)
+├── requirements-build.lock     # Hash-pinned setuptools to build pyaes in the image
+├── Dockerfile                  # One image: builder → app → test (on demand) → runtime
+├── docker-compose.yml          # migrate, api, worker, cloudflared (production VM)
+├── deploy/templates/           # Per-service env templates (api, worker, cloudflared)
 ├── .env.example                # Environment variable reference
 └── verify_*.py                 # Phase verification and test suites
 ```
@@ -115,7 +120,7 @@ placement-engine/
 ### 1. Prerequisites
 
 - **Python 3.12+** — production targets 3.12; the local dev venv currently runs 3.14, so keep code 3.12-compatible
-- **PostgreSQL** (Dockerized or managed) OR **SQLite** (local development)
+- **SQLite** — production (WAL mode, in Docker on the VM) and local development. The schema stays PostgreSQL-portable (`asyncpg`), but PostgreSQL is not deployed
 - **Telegram API Credentials** (`api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org/apps))
 - **Groq API Key** (from [console.groq.com](https://console.groq.com))
 
@@ -148,7 +153,7 @@ cp .env.example .env
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `DATABASE_URL` | SQLAlchemy async connection string | `postgresql+asyncpg://...` or `sqlite+aiosqlite:///./dev.db` |
+| `DATABASE_URL` | SQLAlchemy async connection string | `sqlite+aiosqlite:///./dev.db` (production: set by `docker-compose.yml`) |
 | `APP_ENV` | Runtime environment (`development` / `production`) | `development` |
 | `TELEGRAM_API_ID` | Telegram API ID from my.telegram.org | `0` |
 | `TELEGRAM_API_HASH` | Telegram API Hash from my.telegram.org | `""` |
@@ -235,26 +240,35 @@ python scripts/clean_test_data.py --name acme --apply
 
 ## Production Deployment
 
-### Docker Deployment
+### Docker Deployment (Phase 1)
 
-> [!CAUTION]
-> **Superseded — do not build this.** A `.dockerignore` now keeps `.env*`, sessions, databases, `venv/` and `.git/` out of the build context (Phase 0.6), but this Dockerfile is still not the production image. It also uses Python 3.11 while production targets 3.12, and it runs Telethon inside the API process. The hardened multi-stage image (API and worker containers, secrets on mounted volumes) is part of Phase 1.
+Production runs on the OCI VM (Ampere A1 arm64, or E2.1.Micro amd64 as a fallback) from one image and `docker-compose.yml`:
 
-```dockerfile
-FROM python:3.11-slim
+| Service | Role |
+|---|---|
+| `migrate` | One-shot `alembic upgrade head`; `api` and `worker` start only after it succeeds |
+| `api` | FastAPI, no Telegram code; on an internal network, reachable only through the tunnel; no published port |
+| `worker` | The only process that talks to Telegram — exactly one per session (fixed container name) |
+| `cloudflared` | Named tunnel in token mode: `https://<your hostname>` → `http://api:8000` |
 
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+- **Image** (`Dockerfile`): digest-pinned `python:3.12-slim`; dependencies from `requirements.lock` (hashed, the exact versions the suites passed on) installed from wheels only (except `pyaes`, published as source and built with a hash-pinned setuptools); only `app/`, `alembic/`, `alembic.ini` and `scripts/login_telegram.py` are copied; runs as user `10001`. `docker build --target test .` runs every `verify_*.py` suite on Python 3.12.
+- **State on the host** (`/srv/placement` by default, `PLACEMENT_ROOT` to change): `data/` (SQLite in WAL mode), `telegram/` (session, mounted in the worker only) and `secrets/` (`api.env`, `worker.env`, `cloudflared.env` — templates in `deploy/templates/`). Nothing secret is baked into the image.
+- **Containers** run with a read-only root filesystem, no Linux capabilities, `no-new-privileges`, an init process and rotated logs. `verify_deploy.py` checks all of this statically.
+- **Dependencies:** after changing `requirements.txt`, regenerate `requirements.lock` (instructions in its header).
 
-COPY . .
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```bash
+docker compose up -d --build                                          # build, migrate, start
+docker compose run --rm -it worker python scripts/login_telegram.py   # one-time Telegram login on the VM
+docker compose logs -f worker
 ```
 
+VM hardening, first boot and verification are in `deploy/RUNBOOK.md` (Phase 1.3).
+
 ### Cloudflare Tunnel (HTTPS Ingress)
+Production: the `cloudflared` service runs a named tunnel on an owned domain; its token goes in `secrets/cloudflared.env`, and the tunnel's public hostname points at `http://api:8000`.
+
+Local development only — a quick tunnel:
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
-Use the assigned Cloudflare HTTPS URL as the backend URL in the mobile **Command Center**. Quick-tunnel URLs change on every restart. Set `API_KEY` before exposing the API through any tunnel; production uses a named tunnel on an owned domain (Phase 1).
+Use the assigned Cloudflare HTTPS URL as the backend URL in the mobile **Command Center**. Quick-tunnel URLs change on every restart. Set `API_KEY` before exposing the API through any tunnel.

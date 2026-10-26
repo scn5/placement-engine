@@ -1,5 +1,5 @@
 # PROJECT_STATE.md — Placement Engine Backend
-**Last Updated:** 2026-10-26 | **Version:** 1.0.0 — **Status: pre-production** (verified gaps in §0.2; remediation "Phase 0 — stop silent losses" in progress) | **Branch:** `feature/phase-0-stop-losses`
+**Last Updated:** 2026-10-27 | **Version:** 1.0.0 — **Status: pre-production** (Phase 0 "stop silent losses" done; Phase 1 infrastructure in progress — §12) | **Branch:** `feature/phase-1-infra` (from `feature/phase-0-stop-losses`)
 
 > Single source of truth for the backend's operational status, architecture, and immediate backlog. Cross-referenced against `MASTER_SPEC.md` and `PRODUCT REQUIREMENTS DOCUMENT.md`.
 > **The code is the source of truth.** Every status claim in this file was re-verified against the code on 2026-10-22; intended-but-unbuilt behaviour belongs in `MASTER_SPEC.md`, not here.
@@ -70,9 +70,9 @@ Verified by reading the code; items marked † were also reproduced by executing
 | H4 | Weak update targeting: match = latest event of the same type; EXTEND moves only `end_time`; REPLACE_FORM leaves the old form visible; deleted events are fed to the LLM and resurrect; no CANCELLED/TBA. | `dispatcher.py:57-62,108-128`, `crud.py:347-400` | ✅ 0.5 except CANCELLED/TBA (updates by id, ambiguous matches flagged, point deadlines move whole, superseded forms hidden, deleted events never shown to the LLM) |
 | H5 | Entity/env isolation: exact-name match; name lookups ignore `environment_type`; `normalized_name` globally unique; `link_or_create_subchannel_company` overwrites `environment_type`; per-action names override the subchannel's company; main-feed calls get no schedule context. | `dispatcher.py:35-42,420-428,505-514`, `crud.py:511-525` | ✅ 0.2–0.5 (per-env uniqueness; env-scoped linking 0.4; source company authoritative, env-scoped name lookups, deleted names never re-created, mentioned companies' schedules for main-feed posts 0.5) |
 | H6 | Profile unused: INDIVIDUAL messages dropped even when addressed to the user; defaulter, slot and shortlist logic unimplemented. | `dispatcher.py:497-503` | Next phase |
-| H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | ✅ 0.2 (Alembic; live-PG run is the first Phase 1 step) |
+| H7 | On PostgreSQL the suppressed `ALTER`s abort the `create_all` transaction, whose COMMIT then rolls back (schema never created); `BOOLEAN DEFAULT 0` is invalid on PG. | `app/main.py:31-40` | ✅ 0.2 (Alembic). Moot for production since 2026-10-27: the VM runs SQLite (Phase 1) |
 | H8 | Telethon runs inside the API process: >1 worker or two hosts on one session → `AUTH_KEY_DUPLICATED`; the listener task is unsupervised; `/health` always reports healthy. | `app/main.py:48-113,159-161` | ✅ 0.3 (separate worker process; liveness in `worker_status`; status endpoint 0.6) |
-| H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | ✅ 0.6 (`.dockerignore`; no session string printed); hardened image Phase 1 |
+| H9 | The README Dockerfile copies `.env`, the session file and `dev.db` into the image (no `.dockerignore`); `login_telegram.py` prints the session string. | `README.md` (Docker), `scripts/login_telegram.py:66-69` | ✅ 0.6 (`.dockerignore`; no session string printed); ✅ 1.1 hardened image (allowlisted COPYs, secrets and session on host mounts) |
 | M1–M7 | No per-action rollback (✅ 0.5); every STATUS_NOTE re-triages (✅ 0.5, note kinds); the company toggle leaves `is_triaged=false` (✅ 0.5); the debouncer has no max-wait (✅ 0.4); Add Stage silently defaults to now+24 h; substring hard-delete script (✅ 0.6); documentation drift (this revision). | review 2026-10-21 | 0.2–0.7 |
 
 ---
@@ -83,12 +83,12 @@ Verified by reading the code; items marked † were also reproduced by executing
 |---|---|
 | **Project Name** | Placement Command Center — Backend Engine |
 | **Repo** | `scn5/placement-engine` |
-| **Runtime** | Local venv: Python 3.14.3, FastAPI 0.141, Uvicorn 0.54 (unpinned — see §3). Production image: **Python 3.12** — code must stay 3.12-compatible |
+| **Runtime** | Local venv: Python 3.14.3, FastAPI 0.141, Uvicorn 0.54 (unpinned — see §3). Production image (Phase 1.1): **Python 3.12** (`python:3.12.15-slim-trixie`, digest-pinned) with the hashed `requirements.lock` — code must stay 3.12-compatible |
 | **Local Bind** | `0.0.0.0:8000` (README / CLAUDE.md commands; earlier sessions used `8080`) |
-| **Processes** | Since Phase 0.3: the **API** (`uvicorn app.main:app`, no Telegram code) and the **ingestion worker** (`python -m app.worker`) — exactly **one** worker per Telegram session |
-| **Public Exposure** | Today: Cloudflare Quick Tunnel (URL changes on every restart). Planned: named tunnel on an owned domain + shared API key |
+| **Processes** | Since Phase 0.3: the **API** (`uvicorn app.main:app`, no Telegram code) and the **ingestion worker** (`python -m app.worker`) — exactly **one** worker per Telegram session. Production (1.1): Docker Compose services `migrate` (one-shot `alembic upgrade head`), `api`, `worker`, `cloudflared` |
+| **Public Exposure** | Local development: Cloudflare Quick Tunnel (URL changes on every restart). Production (1.1): `cloudflared` service running a named tunnel in token mode on an owned domain → `http://api:8000`; no published ports; shared API key |
 | **DB (dev)** | SQLite via `aiosqlite` (`./dev.db`, git-ignored, never committed). Recreated empty on 2026-10-23 by `alembic upgrade head` (Phase 0.2 cold start). The previous file — TEST data only (4 companies, 4 "Default Role" tracks, 9 events) — is kept as `dev.db.pre-phase0.bak` (git-ignored) |
-| **DB (target)** | Chosen at VM provisioning: PostgreSQL (OCI A1 ARM) or SQLite (1 GB micro); schema kept portable |
+| **DB (production)** | **SQLite in WAL mode** (decided 2026-10-27) at `/srv/placement/data/placement.db` on the VM's boot volume, bind-mounted into `migrate`, `api` and `worker`. VM: OCI Ampere A1 Flex (arm64, Ubuntu 24.04); fallback E2.1.Micro (amd64) with a 2 GB swapfile. Schema stays PostgreSQL-portable, but PostgreSQL is not deployed |
 | **LLM Endpoint** | `openai/gpt-oss-20b` via OpenAI-compatible base URL (Groq LPU), `json_object` response mode (not JSON-schema) |
 | **Tenancy** | Strictly single-tenant, no multi-user scope. **No auth layer today** (gap C7); a single shared API key is planned (Phase 0.6) |
 
@@ -101,7 +101,12 @@ placement-engine/
 ├── .env                          # Local dev secrets (git-ignored)
 ├── .env.example                  # Safe credential template (committed)
 ├── .gitignore                    # Excludes venv/, *.env, __pycache__, *.log
-├── requirements.txt              # Dependency lower bounds (no lock file yet)
+├── requirements.txt              # Dependency lower bounds (development)
+├── requirements.lock             # Hashed pins for the production image: Python 3.12, Linux arm64/amd64 (1.1)
+├── requirements-build.lock       # Hash-pinned setuptools that builds pyaes (sdist only) in the image (1.1)
+├── Dockerfile                    # builder → app → test (on demand) → runtime; user 10001 (1.1)
+├── docker-compose.yml            # migrate, api, worker, cloudflared; hardened, no published ports (1.1)
+├── deploy/templates/             # api.env / worker.env / cloudflared.env templates, no values (1.1)
 ├── alembic.ini, alembic/         # Schema migrations (env.py reads DATABASE_URL; versions/0001_baseline_schema.py, 0002_ledger_content_hash.py)
 ├── AGENTS.md, README.md          # Agent rules / setup guide (MASTER_SPEC.md and the PRD live at the workspace root, outside this repo)
 ├── placement_session.session     # Live Telethon file session (git-ignored; used when TELEGRAM_SESSION_STRING is empty)
@@ -116,6 +121,7 @@ placement-engine/
 ├── verify_ingestion.py           # Join policy, invite posts, edits/reactions, supergroups, debouncer suite (Phase 0.4)
 ├── verify_extraction.py          # Extractor, prompt, dispatcher and invariants 1–9 suite (Phase 0.5)
 ├── verify_security.py            # API key, /status, CORS/docs, startup policy, integrity errors, scripts, .dockerignore (Phase 0.6)
+├── verify_deploy.py              # Lock files, Dockerfile and compose invariants — static, no Docker needed (Phase 1.1)
 ├── .dockerignore                 # Keeps .env*, sessions, databases, venv/ and .git/ out of images (0.6)
 ├── scripts/
 │   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
@@ -182,7 +188,7 @@ placement-engine/
 | `python-dateutil`, `tzdata`, `httpx`, `greenlet` | see `requirements.txt` | Date parsing, tz data, ASGI test client, SQLAlchemy async |
 
 > [!NOTE]
-> These are lower bounds — **nothing is pinned**. Installed in the local venv on 2026-10-22: fastapi 0.141.1, starlette 1.7.0, sqlalchemy 2.1.1, pydantic 2.13.5, openai 3.20.0, telethon 1.45.0, uvicorn 0.54.0, asyncpg 0.31.0, aiosqlite 0.22.1. A hashed lock file (compiled for Python 3.12) is planned for Phase 1.
+> These are lower bounds — **nothing is pinned**. Installed in the local venv on 2026-10-22: fastapi 0.141.1, starlette 1.7.0, sqlalchemy 2.1.1, pydantic 2.13.5, openai 3.20.0, telethon 1.45.0, uvicorn 0.54.0, asyncpg 0.31.0, aiosqlite 0.22.1. **Production pins (1.1):** `requirements.lock` pins exactly these tested versions for Python 3.12 / Linux, with hashes, plus the Linux-only `uvloop` 0.23.0; the image installs it with `--require-hashes`, wheels only except `pyaes` (source only, built with the hash-pinned setuptools in `requirements-build.lock`). Regeneration steps are in the lock's header.
 
 ---
 
@@ -192,12 +198,12 @@ All settings are loaded from `.env` via `pydantic-settings`. Defaults allow the 
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `sqlite+aiosqlite:///./dev.db` (since 0.3; the old default carried a placeholder credential) | Production must set it explicitly |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./dev.db` (since 0.3; the old default carried a placeholder credential) | Production: set by `docker-compose.yml` to `sqlite+aiosqlite:////var/lib/placement/data/placement.db` |
 | `APP_ENV` | `development` | `development`, `testing` or `production`. Any other value counts as production (fail-closed): API docs off and `API_KEY` required |
 | `API_KEY` | unset | Shared key every request sends as `X-API-Key` (0.6). Production refuses to start without one of ≥ 32 characters; unset in development leaves the API open (warning at startup). Generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `TELEGRAM_API_ID` | `0` | MTProto App ID (0 = listener disabled) |
 | `TELEGRAM_API_HASH` | `""` | MTProto App Hash |
-| `TELEGRAM_SESSION_NAME` | `placement_session` | File session used when `TELEGRAM_SESSION_STRING` is empty |
+| `TELEGRAM_SESSION_NAME` | `placement_session` | File session used when `TELEGRAM_SESSION_STRING` is empty; relative to `placement-engine/`, or an absolute path — production sets `/var/lib/placement/telegram/placement_session` (worker only) |
 | `TELEGRAM_SESSION_STRING` | `""` | Telethon `StringSession` token; takes precedence over the file session |
 | `TELEGRAM_PHONE` | `None` | Used for interactive first-auth only |
 | `MAIN_FEED_CHANNEL_ID` / `TEST_FEED_CHANNEL_ID` | `None` | Root feeds (merged with `system_config` values). Since 0.4 a feed must be a broadcast channel (`-100…` ID); anything else is refused and reported in `worker_status.last_error` |
@@ -568,6 +574,7 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_ingestion.py` | Join-policy link and chat tables; short messages reach the LLM; reactions never subscribed to or read, unchanged-text edit updates ignored; invite posts joined, linked and extracted with their company, re-posts and replies attributed, IGNORED companies skipped; refused links (bot, person, basic group, approval, expired, phone, permalink, root feed) never joined; flood-wait retry and join pacing; supergroup admin filter; root feeds must be broadcast channels; debouncer max-wait and per-chat order; ≤ 40 messages per LLM call; offline edits caught up; dispatcher source company, naming and IGNORED gate; no cross-environment attribution. Every chat, person and bot is a mocked entity | In-memory SQLite (migrated) |
 | `verify_extraction.py` | Strict JSON-schema requests (schema closed and in step with the model); `ExtractionFailed` for invalid/empty/truncated answers, timeouts, network and rate limits (no regex fallback); output-mode fallbacks; failed extraction → ledger FAILED → retried to DONE; message headers and prompt rules; updates by `target_event_id`; edits update instead of duplicating; same-time duplicates suppressed; `needs_review` flags; source message ids; superseded forms hidden; note kinds; env-scoped root-feed names; per-action rollback; invariants 1–9 through the API (409s, last-discard sync, timeline filters, PATCH triages every role, no profile data to the LLM); `resolve-review` clears the flag (0.7) | In-memory SQLite (migrated) |
 | `verify_security.py` | Every operation but `/health` requires `X-API-Key` (OpenAPI schema and live calls: missing, wrong, truncated → 401); constant-time compare; `/health` minimal, `/status` ok/degraded/unknown; no CORS headers; docs off in production; APP_ENV fail-closed; production startup refused without a strong key; 404/409/422 instead of 500; login script prints no session string (static check — never run); `clean_test_data.py` dry-run and TEST-only; `.dockerignore` coverage | In-memory SQLite (migrated) |
+| `verify_deploy.py` | `requirements.lock` hashes and covers every requirement; Dockerfile digest-pinned base, hash-checked wheels-only install (pyaes excepted), allowlisted COPYs, user 10001, runtime default target; compose: exactly migrate/api/worker/cloudflared, all read-only with no capabilities, no-new-privileges, init and log rotation, no ports/host network/privileges; one SQLite URL in the data mount; bind mounts never create host paths; migrate gates api/worker; session mounted in the worker only; one worker (fixed name, restart on-failure, grace > flush); api internal-only; one env file per service; templates hold no values; `.dockerignore` keeps build inputs | None (reads files) |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
 > ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
@@ -586,6 +593,7 @@ python verify_worker.py
 python verify_ingestion.py
 python verify_extraction.py
 python verify_security.py
+python verify_deploy.py
 # Owner-run only (uses the live session, read-only):
 python scripts/test_live_ingestion.py
 ```
@@ -606,7 +614,15 @@ python scripts/test_live_ingestion.py
 | 0.6 | API security: `X-API-Key` on every route but `/health`, authenticated `/status`, CORS removed, docs off in production, production refuses to start without a key, 404/409/422 instead of 500, safe login and cleanup scripts, `.dockerignore` | ✅ Done — reviewed 2026-10-26 |
 | 0.7 | Frontend: secure pairing (URL + key), 401 → re-pair, status dot from `/status`, needs-review pill + `POST /events/{id}/resolve-review` (backend), Telegram deep links, https-only links, Add Stage validation, note-kind Triage banner | ✅ Done — pending owner review; new APK build is the owner's step |
 
-Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN feed) follows Phase 0.
+### Phase 1 — Infrastructure, OCI VM hardening & production deployment (plan approved 2026-10-27, branch `feature/phase-1-infra`)
+
+Decisions (owner, 2026-10-27): SQLite in WAL mode; Cloudflare named tunnel in token mode on an owned domain; OCI Ampere A1 Flex (arm64, Ubuntu 24.04), fallback E2.1.Micro (amd64) with a 2 GB swapfile; fresh Telegram session created on the VM (`docker compose run --rm -it worker python scripts/login_telegram.py`), never a copy of the local one; automatic one-shot `migrate` service; first boot `INGEST_ENVIRONMENTS=TEST`, then `MAIN,TEST` starts the 1–2 week shadow run.
+
+| Item | Scope | Status |
+|---|---|---|
+| 1.1 | `requirements.lock` / `requirements-build.lock`, multi-stage `Dockerfile`, `docker-compose.yml` (migrate, api, worker, cloudflared), env templates in `deploy/templates/`, `verify_deploy.py` | ✅ Done — pending owner review. Image not yet built (no Docker on the dev machine): first `docker build --target test .` runs on the VM |
+| 1.2 | `deploy/backup.sh` (`VACUUM INTO` → integrity check → compress → rotate), systemd timer, restore procedure | Pending |
+| 1.3 | `deploy/RUNBOOK.md`: Ubuntu 24.04 hardening, non-root deploy user, UFW (after removing the OCI image's iptables rules), Docker, session login, tunnel, first boot and verification, shadow-run switch, upgrade/rollback | Pending |
 
 ### P0 — Core Pre-Interview State Machine & Mobile Contract (delivered; verified defects listed in §0.2)
 
@@ -647,10 +663,10 @@ Phase 1 (Oracle VM foundation, then a 1–2 week shadow run on the real MAIN fee
 
 | # | Item | File(s) | Detail |
 |---|---|---|---|
-| 15 | **`Dockerfile`** | `Dockerfile` | Multi-stage build; Uvicorn entry on port 8080 |
-| 16 | **`docker-compose.yml`** | `docker-compose.yml` | Services: `api` + `postgres:16`; named volume for DB persistence |
+| 15 | **`Dockerfile`** | `Dockerfile` | ✅ **Resolved (Phase 1.1)** — multi-stage (builder → app → test → runtime), Python 3.12, user 10001, Uvicorn on port 8000 |
+| 16 | **`docker-compose.yml`** | `docker-compose.yml` | ✅ **Resolved (Phase 1.1)** — `migrate`, `api`, `worker`, `cloudflared`; SQLite WAL on a host bind mount (no PostgreSQL service) |
 | 17 | **Alembic migrations** | `alembic/` | ✅ **Resolved (Phase 0.2)** — baseline revision `0001`; the app only verifies the revision at startup |
-| 18 | **Switch `DATABASE_URL` to PostgreSQL** | `.env` (prod) | `asyncpg` driver; `BIGINT[]` array types only available in PostgreSQL |
+| 18 | ~~Switch `DATABASE_URL` to PostgreSQL~~ | — | **Not planned** — production runs SQLite in WAL mode (owner decision 2026-10-27). Items 5 and 8 must therefore not rely on PostgreSQL-only types |
 
 ---
 
@@ -665,7 +681,7 @@ e850a9c feat(pre-interview): implement master spec time normalization, ist ancho
 e9a894e feat(ecosystem): fallback extend to create, normalize event times, add ist regex fallback, and wire iris deadline frontend tag
 ```
 
-> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), `76a0fd8` (0.5), `6bf21d1` (0.6), then 0.7.
+> Commits `09cbaa5` and `3533cb9` only added ignore rules — no secret, session or database file was ever committed (full history verified 2026-10-21). Phase 0 work happens on `feature/phase-0-stop-losses`: `a0b9b3b` (0.1), `3b1ccbe` (0.2), `dfee428` (0.3), `f3a241e` + `7d13962` (0.4), `76a0fd8` (0.5), `6bf21d1` (0.6), `39b2ed3` (0.7 backend). Phase 1 continues on `feature/phase-1-infra`.
 
 ---
 
@@ -689,6 +705,8 @@ cloudflared tunnel --url http://localhost:8000
 ```
 
 > Swagger UI available at `http://localhost:8000/docs` in development only (use **Authorize** with the API key when `API_KEY` is set).
+
+> **Production (VM):** `docker compose up -d --build` from the repo checkout — see the README's Docker section and `deploy/RUNBOOK.md` (Phase 1.3).
 
 > [!WARNING]
 > With `TELEGRAM_API_ID` set, **the worker** connects the **live personal session**, processes the feeds in `INGEST_ENVIRONMENTS` (default `TEST` only) and auto-joins the channel invite links posted there, under the join policy (§7.8). Never run two workers on the same session (Telegram revokes it). To keep a worker from connecting, set `TELEGRAM_API_ID=0` for that process only (PowerShell: `$env:TELEGRAM_API_ID="0"`) — never by editing `.env`. The API never connects to Telegram.

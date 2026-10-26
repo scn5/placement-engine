@@ -1,0 +1,140 @@
+# Placement Engine — production stack on the OCI VM (Phase 1).
+#
+#   migrate      one-shot `alembic upgrade head`; api and worker start only after it succeeds
+#   api          FastAPI (no Telegram code); reachable only through the tunnel
+#   worker       the ONLY process that talks to Telegram — exactly one per session
+#   cloudflared  named tunnel (token mode): https://<your hostname> → http://api:8000
+#
+# Host layout (deploy/RUNBOOK.md), PLACEMENT_ROOT defaults to /srv/placement:
+#   data/      SQLite database + its -wal/-shm files    owner 10001:10001, mode 0700
+#   telegram/  Telethon session (mounted in the worker only)   10001:10001, 0700
+#   secrets/   api.env, worker.env, cloudflared.env           templates: deploy/templates/, mode 0600
+# Bind mounts never create a missing host directory (Docker would make it
+# root-owned and unwritable for the app user); compose fails instead.
+#
+# No service publishes a port: the API is reached only through cloudflared on the
+# internal `edge` network, so nothing on the VM listens publicly.
+#
+#   docker compose up -d --build            # build, migrate, start
+#   docker compose logs -f worker
+#   docker compose run --rm -it worker python scripts/login_telegram.py   # one-time, interactive
+
+name: placement
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  cap_drop: [ALL]
+  security_opt:
+    - "no-new-privileges:true"
+  init: true                      # PID 1 forwards SIGTERM to python and reaps children
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# The same SQLite file for migrate, api and worker. WAL needs every process on the
+# same host filesystem (the boot volume) — never a network filesystem.
+x-database-url: &database_url sqlite+aiosqlite:////var/lib/placement/data/placement.db
+
+x-data-mount: &data_mount
+  type: bind
+  source: ${PLACEMENT_ROOT:-/srv/placement}/data
+  target: /var/lib/placement/data
+  bind:
+    create_host_path: false
+
+services:
+  migrate:
+    <<: *hardened
+    build:
+      context: .
+      target: runtime
+    image: placement-engine:local
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: *database_url
+    volumes:
+      - *data_mount
+    network_mode: none
+    restart: "no"
+
+  api:
+    <<: *hardened
+    image: placement-engine:local
+    pull_policy: never            # built by the migrate service above
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - ${PLACEMENT_ROOT:-/srv/placement}/secrets/api.env
+    environment:
+      APP_ENV: production         # refuses to start without an API_KEY of >= 32 characters
+      DATABASE_URL: *database_url
+    volumes:
+      - *data_mount
+    networks: [edge]              # internal network: no internet access, no published port
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 15s
+    mem_limit: 256m
+    pids_limit: 128
+
+  worker:
+    <<: *hardened
+    image: placement-engine:local
+    pull_policy: never
+    # A fixed name makes `--scale worker=2` fail: Telegram revokes a session used
+    # from two places at once.
+    container_name: placement-worker
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - ${PLACEMENT_ROOT:-/srv/placement}/secrets/worker.env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: *database_url
+      TELEGRAM_SESSION_NAME: /var/lib/placement/telegram/placement_session
+    volumes:
+      - *data_mount
+      - type: bind
+        source: ${PLACEMENT_ROOT:-/srv/placement}/telegram
+        target: /var/lib/placement/telegram
+        bind:
+          create_host_path: false
+    networks: [egress]            # Telegram and the LLM endpoint; not on the API's network
+    # Exit codes (app/worker.py): 0 = Telegram disabled or clean stop → stay stopped;
+    # 1 = listener stopped → restart; 2 = session revoked → restart after its 10-minute wait.
+    restart: on-failure
+    stop_grace_period: 45s        # the worker flushes buffered messages for up to 30 s
+    mem_limit: 384m
+    pids_limit: 128
+
+  cloudflared:
+    <<: *hardened
+    # cloudflared 2026.10.0 (multi-arch index: amd64 + arm64)
+    image: cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+    command: ["tunnel", "--no-autoupdate", "run"]
+    env_file:
+      - ${PLACEMENT_ROOT:-/srv/placement}/secrets/cloudflared.env   # TUNNEL_TOKEN
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [edge, egress]
+    restart: unless-stopped
+    mem_limit: 128m
+    pids_limit: 64
+
+networks:
+  edge:
+    internal: true                # cloudflared ↔ api only
+  egress: {}                      # outbound: worker → Telegram/LLM, cloudflared → Cloudflare
