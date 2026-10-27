@@ -284,3 +284,29 @@ Verification:
 - That run found a real bug: the helper's success line contained a non-ASCII arrow, which crashed printing on a cp1252 console after the database had already been replaced, so `restore.sh` reported a failure. The helper is now ASCII, enforced by the suite.
 - 18 mutants were all caught by the suite, after adding tests for the three it first missed: the integrity-check branch, the gzip round-trip check, and temp cleanup on a late failure. The mutants were: plain VACUUM, no integrity check, side files not moved, tagged archives rotated, off-by-one rotation, no round-trip, temp file left, path accepted as archive, no schema check, read-write live open, no space check, missing lock, session mounted, non-strict bash, unit as root, inline systemd comment, timer not persistent, CRLF script.
 - Not yet verified: the real `docker compose run` stdin pipe, `flock`, and the systemd units. These are first exercised on the VM (Phase 1.3).
+
+[October 2026]: Phase 1.3 — VM Runbook & Boot Unit (2026-10-27)
+The Problem: There was no written path from an empty OCI account to a verified production stack, and the compose stack alone would not have survived a reboot.
+The Context/Why it failed: At shutdown Docker sends SIGTERM. The worker flushes, then exits 0 (`app/worker.py`: "Stop requested" → `EXIT_OK`), and `restart: on-failure` never restarts a container that exited 0. After any reboot, including the automatic security-update reboots the runbook enables, the worker would have stayed down while the API kept answering. 1.1 had flagged this as an open caveat.
+The Decision/Fix:
+1. `deploy/systemd/placement-stack.service` (oneshot, `RemainAfterExit`, run as `deploy`):
+   - `docker compose up -d --no-build` at boot, so `migrate` runs first and every service returns whatever its exit code.
+   - `docker compose stop` at shutdown, so the worker gets its full 45 s grace.
+   - `PartOf=docker.service`, so a docker-ce upgrade stops the stack before dockerd and starts it again afterwards.
+   - The compose restart policies stay as they are, for crashes between boots.
+2. `deploy/RUNBOOK.md` has 19 sections:
+   - The OCI instance and security list (22/tcp only; a note on idle reclamation of free-tier instances).
+   - The `deploy` user (sudo with a password, which the OCI serial console also needs), then SSH hardening through a `00-` drop-in that wins over the cloud image's (keys only, `AllowUsers deploy`), and locking `ubuntu`.
+   - Firewall: Oracle's `netfilter-persistent` rules are replaced with UFW (deny in, allow out, `limit OpenSSH`), with policies set to ACCEPT before flushing so SSH is never cut, and *before* Docker is installed so its chains survive.
+   - unattended-upgrades, rebooting at 22:30 UTC (after the 21:30 UTC backup); a swapfile on E2 only; Docker from Docker's repository, with the key fingerprint check.
+   - The `/srv/placement` layout; a read-only deploy-key checkout; `docker build --target test .` on the VM; secrets (API key from `secrets.token_urlsafe(36)`; `DEADMAN_URL` recommended, since nothing else alerts).
+   - The Cloudflare named tunnel in token mode (`http://api:8000`, no Access); the Telegram login; first boot on TEST.
+   - The verification checklist: `/health`, a 401 from `/status` without the key, `ok` with it, a 404 from `/docs`, port 8000 closed, `ss` and UFW state, pairing and a TEST post, the backup timer, and a reboot test.
+   - The TEST soak; the MAIN,TEST switch, after a `pre-shadow` backup, stating plainly that joining linked channels under the join policy is the one account change; daily shadow-run checks and exit criteria.
+   - Operations (deploy, Docker upgrades, key/token rotation, a revoked session, lost SSH access) and a troubleshooting table.
+3. `BACKUP.md`'s off-VM pull now reads the archive through a one-off container rather than `sudo`, which a non-interactive ssh can't answer for. It warns that PowerShell's `>` corrupts binary output.
+4. `verify_deploy.py` [8] checks the boot unit (start and stop commands, docker ordering, user, stop timeout ≥ the sum of grace periods). [9] checks that every script, unit, template and `§` reference in RUNBOOK.md and BACKUP.md resolves.
+Verification:
+- All 13 suites are green. 11 mutants of the unit and the docs were all caught, each for the intended reason.
+- All 33 bash blocks in RUNBOOK.md and BACKUP.md pass `bash -n`, with placeholders substituted.
+- Not verified: every runbook command is unexecuted, since no OCI VM was available. The first walk-through on the VM is the real test, and the §15 checklist is how it is judged.

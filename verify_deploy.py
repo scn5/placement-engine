@@ -20,6 +20,9 @@ Covers:
   • networks: the API is only on the internal network; secrets split per service
     and the env templates hold no values
   • .dockerignore keeps the files the build and the test stage need
+  • (1.3) placement-stack.service brings the stack up at every boot and stops it
+    within the services' grace periods; RUNBOOK.md / BACKUP.md refer only to files
+    and sections that exist
 
 Reads files only; nothing touches a database or the network.
 Run: python verify_deploy.py
@@ -295,6 +298,54 @@ def test_build_context_keeps_needed_files() -> None:
     print("  [7] ✓ .dockerignore keeps the lock files, Dockerfile, compose file, deploy/ and the suites; secrets, sessions and databases stay out")
 
 
+def _unit(path: Path) -> dict[str, str]:
+    raw = path.read_bytes()
+    assert b"\r" not in raw, f"{path.name} has CRLF line endings"
+    values = {}
+    for line in raw.decode("utf-8").splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            assert "#" not in line, f"{path.name}: inline comment becomes part of the value: {line}"
+            key, _, value = line.partition("=")
+            values[key] = value
+    return values
+
+
+def test_boot_unit() -> None:
+    """The worker exits 0 on SIGTERM, so `restart: on-failure` alone leaves it down after
+    a reboot: placement-stack.service must bring the stack up at every boot."""
+    unit = _unit(ROOT / "deploy" / "systemd" / "placement-stack.service")
+    assert unit["Type"] == "oneshot" and unit["RemainAfterExit"] == "yes", unit
+    assert unit["User"] not in ("root", "0") and unit["WorkingDirectory"] == "/srv/placement/app", unit
+    assert unit["ExecStart"] == "/usr/bin/docker compose up -d --no-build", unit["ExecStart"]
+    assert unit["ExecStop"] == "/usr/bin/docker compose stop", unit["ExecStop"]
+    for key in ("Requires", "After", "PartOf"):
+        assert unit[key] == "docker.service", (key, unit.get(key))
+    assert unit["WantedBy"] == "multi-user.target", unit
+
+    services = _compose()["services"]
+    graces = [int(s.get("stop_grace_period", "10s").rstrip("s")) for s in services.values()]
+    stop_timeout = int(unit["TimeoutStopSec"].rstrip("s"))
+    assert stop_timeout >= sum(graces), f"TimeoutStopSec={stop_timeout}s < {sum(graces)}s of stop grace periods"
+    print(f"  [8] ✓ placement-stack.service: compose up -d at boot (no build), compose stop at shutdown within {stop_timeout}s, follows docker.service, as the deploy user")
+
+
+def test_runbook_references() -> None:
+    docs = {name: (ROOT / "deploy" / name).read_text(encoding="utf-8") for name in ("RUNBOOK.md", "BACKUP.md")}
+    sections = {name: set(re.findall(r"^## (\d+)\.", text, re.M)) for name, text in docs.items()}
+    for name, text in docs.items():
+        # Repository paths the procedures rely on must exist.
+        for path in set(re.findall(r"(?<![\w/.])((?:deploy|scripts|app)/[\w./-]+\.(?:sh|py|md|service|timer|example))", text)):
+            assert (ROOT / path).is_file(), f"{name} refers to missing {path}"
+        # Section references: "BACKUP.md §6", "RUNBOOK.md §14" or a bare "§3" (same file).
+        text = re.sub(r"PROJECT_STATE\.md`?\s*§\d+(?:–§\d+)?", "", text)
+        for doc, number in re.findall(r"(?:(BACKUP|RUNBOOK)\.md`?\s+)?§(\d+)", text):
+            target = f"{doc}.md" if doc else name
+            assert number in sections[target], f"{name}: §{number} does not exist in {target}"
+    for unit in re.findall(r"deploy/systemd/([\w-]+\.(?:service|timer))\b", docs["RUNBOOK.md"] + docs["BACKUP.md"]):
+        assert (ROOT / "deploy" / "systemd" / unit).is_file(), unit
+    print("  [9] ✓ RUNBOOK.md and BACKUP.md: every referenced script, unit and template exists; every § reference resolves")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -309,8 +360,10 @@ def main() -> None:
     test_single_worker_owns_the_session()
     test_networks_and_secrets()
     test_build_context_keeps_needed_files()
+    test_boot_unit()
+    test_runbook_references()
 
-    print("\n✅ Phase 1.1 Container Build & Compose Verified Successfully!")
+    print("\n✅ Phase 1.1/1.3 Container Build, Compose & Boot Verified Successfully!")
 
 
 if __name__ == "__main__":

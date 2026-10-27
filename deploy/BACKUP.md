@@ -75,10 +75,15 @@ systemctl list-timers placement-backup.timer        # next run
 Nothing alerts you when a backup fails yet; these checks are how you find out.
 
 **Off-VM copies.** Archives on the VM do not survive losing the VM or its boot volume.
-Pull one to your own machine now and then (it holds placement data, not the session):
+Pull one to your own machine now and then (it holds placement data, not the session). The
+`backups/` directory belongs to the app user, so read it through a one-off container, not sudo
+(sudo asks for a password, which a non-interactive `ssh` cannot answer). Run it from bash or
+Git Bash: Windows PowerShell's `>` re-encodes binary output and corrupts the archive.
 
 ```bash
-ssh <vm> 'sudo cat /srv/placement/backups/placement-<UTC>.db.gz' > placement-<UTC>.db.gz
+ssh deploy@<public-ip> 'docker compose -f /srv/placement/app/docker-compose.yml run --rm --no-deps -T \
+  -v /srv/placement/backups:/b:ro migrate cat /b/placement-<UTC>.db.gz' > placement-<UTC>.db.gz
+gzip -t placement-<UTC>.db.gz && echo ok        # laptop: the archive arrived intact
 ```
 
 ## 4. Restore the database from a backup

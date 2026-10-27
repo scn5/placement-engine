@@ -112,7 +112,8 @@ placement-engine/
 │   ├── templates/              # Per-service env templates (api, worker, cloudflared)
 │   ├── backup.sh / restore.sh  # Verified SQLite backup; restore and rollback (BACKUP.md)
 │   ├── sqlite_backup.py        # Logic both scripts run in a one-off migrate container
-│   └── systemd/                # placement-backup.service + .timer (daily)
+│   ├── RUNBOOK.md              # VM setup → first boot → verification → shadow run → operations
+│   └── systemd/                # placement-stack.service (boot), placement-backup.service + .timer (daily)
 ├── .env.example                # Environment variable reference
 └── verify_*.py                 # Phase verification and test suites
 ```
@@ -268,7 +269,7 @@ docker compose logs -f worker
 
 **Backups** (`deploy/BACKUP.md`): a daily systemd timer runs `deploy/backup.sh`. It copies the live database with a read-only `VACUUM INTO` while the stack keeps running, checks the copy with `PRAGMA integrity_check`, gzips it to `/srv/placement/backups/` and keeps the newest 14. `deploy/restore.sh` lists, verifies, restores and rolls back a restore. Take `deploy/backup.sh --tag pre-deploy` before every deploy.
 
-VM hardening, first boot and verification are in `deploy/RUNBOOK.md` (Phase 1.3).
+**On the VM** (`deploy/RUNBOOK.md`): Ubuntu 24.04 hardening (deploy user, SSH keys only, UFW in place of Oracle's iptables rules, automatic security updates), Docker from Docker's repository, `/srv/placement` layout and secrets, the Cloudflare tunnel, the Telegram login, first boot on TEST, the verification checklist (including a reboot test) and the switch to the MAIN shadow run. `placement-stack.service` brings the stack up at every boot: restart policies alone would leave the worker down after a reboot, because it exits 0 when stopped.
 
 ### Cloudflare Tunnel (HTTPS Ingress)
 Production: the `cloudflared` service runs a named tunnel on an owned domain; its token goes in `secrets/cloudflared.env`, and the tunnel's public hostname points at `http://api:8000`.

@@ -1,0 +1,41 @@
+# Placement Engine — brings the compose stack up at boot and stops it cleanly at
+# shutdown (Phase 1.3). Installed by deploy/RUNBOOK.md §14.
+#
+# Why a unit and not only restart policies: at shutdown Docker sends SIGTERM, the
+# worker stops cleanly and exits 0, and `restart: on-failure` then leaves it down
+# after the reboot. This unit runs `docker compose up -d` at every boot, so every
+# service comes back (migrate first), and `docker compose stop` at shutdown, so the
+# worker gets its full grace period to flush buffered messages.
+# PartOf=docker.service: a Docker restart (e.g. a docker-ce upgrade) restarts this
+# unit too, stopping the stack before dockerd goes down and starting it afterwards.
+#
+#   systemctl status placement-stack       journalctl -u placement-stack
+#   sudo systemctl disable placement-stack # keep the stack down across reboots
+
+[Unit]
+Description=Placement Engine stack (docker compose)
+Documentation=file:///srv/placement/app/deploy/RUNBOOK.md
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The deploy user owns the checkout and is in the docker group; never root.
+User=deploy
+WorkingDirectory=/srv/placement/app
+Environment=PLACEMENT_ROOT=/srv/placement
+# --no-build: boot never builds; a missing image fails here, visibly.
+ExecStart=/usr/bin/docker compose up -d --no-build
+ExecStop=/usr/bin/docker compose stop
+# migrate, then the api healthcheck, then cloudflared.
+TimeoutStartSec=5min
+# The worker's 45 s grace, plus the api and cloudflared.
+TimeoutStopSec=150s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
