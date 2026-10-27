@@ -1,0 +1,5 @@
+# Files executed or parsed on the Linux VM keep LF endings even when checked out
+# on Windows (core.autocrlf=true): bash rejects CR characters, systemd keeps them.
+*.sh       text eol=lf
+*.service  text eol=lf
+*.timer    text eol=lf

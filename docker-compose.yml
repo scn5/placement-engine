@@ -6,7 +6,9 @@
 #   cloudflared  named tunnel (token mode): https://<your hostname> → http://api:8000
 #
 # Host layout (deploy/RUNBOOK.md), PLACEMENT_ROOT defaults to /srv/placement:
+#   app/       this checkout (deploy user)
 #   data/      SQLite database + its -wal/-shm files    owner 10001:10001, mode 0700
+#   backups/   deploy/backup.sh archives (deploy/BACKUP.md)        10001:10001, 0700
 #   telegram/  Telethon session (mounted in the worker only)   10001:10001, 0700
 #   secrets/   api.env, worker.env, cloudflared.env           templates: deploy/templates/, mode 0600
 # Bind mounts never create a missing host directory (Docker would make it

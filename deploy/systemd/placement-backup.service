@@ -1,0 +1,28 @@
+# Placement Engine — one verified SQLite backup (Phase 1.2). Started by
+# placement-backup.timer; run by hand with: sudo systemctl start placement-backup
+#
+# Install (deploy/BACKUP.md): copy this file and placement-backup.timer to
+# /etc/systemd/system/, adjust User= and the paths if the layout differs, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now placement-backup.timer
+# Output and failures: journalctl -u placement-backup
+
+[Unit]
+Description=Placement Engine SQLite backup (VACUUM INTO, integrity check, rotation)
+Documentation=file:///srv/placement/app/deploy/BACKUP.md
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# The deploy user owns the checkout and is in the docker group; never root.
+User=deploy
+WorkingDirectory=/srv/placement/app
+Environment=PLACEMENT_ROOT=/srv/placement
+Environment=BACKUP_KEEP=14
+ExecStart=/usr/bin/bash /srv/placement/app/deploy/backup.sh
+TimeoutStartSec=30min
+# Applies to the docker CLI only; the backup itself runs in a container.
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full

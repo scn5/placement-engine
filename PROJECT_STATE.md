@@ -107,6 +107,11 @@ placement-engine/
 ├── Dockerfile                    # builder → app → test (on demand) → runtime; user 10001 (1.1)
 ├── docker-compose.yml            # migrate, api, worker, cloudflared; hardened, no published ports (1.1)
 ├── deploy/templates/             # api.env / worker.env / cloudflared.env templates, no values (1.1)
+├── deploy/backup.sh, restore.sh  # Verified SQLite backup; list / verify / restore / rollback (1.2)
+├── deploy/sqlite_backup.py       # Backup logic, stdlib only; piped to `python -` in a one-off migrate container (1.2)
+├── deploy/systemd/               # placement-backup.service + .timer: daily at 03:00 IST (1.2)
+├── deploy/BACKUP.md              # Backup, restore, undo-restore, deploy rollback and new-VM procedures (1.2)
+├── .gitattributes                # LF endings for *.sh and systemd units (1.2)
 ├── alembic.ini, alembic/         # Schema migrations (env.py reads DATABASE_URL; versions/0001_baseline_schema.py, 0002_ledger_content_hash.py)
 ├── AGENTS.md, README.md          # Agent rules / setup guide (MASTER_SPEC.md and the PRD live at the workspace root, outside this repo)
 ├── placement_session.session     # Live Telethon file session (git-ignored; used when TELEGRAM_SESSION_STRING is empty)
@@ -122,6 +127,7 @@ placement-engine/
 ├── verify_extraction.py          # Extractor, prompt, dispatcher and invariants 1–9 suite (Phase 0.5)
 ├── verify_security.py            # API key, /status, CORS/docs, startup policy, integrity errors, scripts, .dockerignore (Phase 0.6)
 ├── verify_deploy.py              # Lock files, Dockerfile and compose invariants — static, no Docker needed (Phase 1.1)
+├── verify_backup.py              # Backup, rotation, restore/rollback, scripts and systemd units (Phase 1.2)
 ├── .dockerignore                 # Keeps .env*, sessions, databases, venv/ and .git/ out of images (0.6)
 ├── scripts/
 │   ├── test_live_ingestion.py    # Live preflight against the real session (read-only; owner-run only)
@@ -575,6 +581,7 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_extraction.py` | Strict JSON-schema requests (schema closed and in step with the model); `ExtractionFailed` for invalid/empty/truncated answers, timeouts, network and rate limits (no regex fallback); output-mode fallbacks; failed extraction → ledger FAILED → retried to DONE; message headers and prompt rules; updates by `target_event_id`; edits update instead of duplicating; same-time duplicates suppressed; `needs_review` flags; source message ids; superseded forms hidden; note kinds; env-scoped root-feed names; per-action rollback; invariants 1–9 through the API (409s, last-discard sync, timeline filters, PATCH triages every role, no profile data to the LLM); `resolve-review` clears the flag (0.7) | In-memory SQLite (migrated) |
 | `verify_security.py` | Every operation but `/health` requires `X-API-Key` (OpenAPI schema and live calls: missing, wrong, truncated → 401); constant-time compare; `/health` minimal, `/status` ok/degraded/unknown; no CORS headers; docs off in production; APP_ENV fail-closed; production startup refused without a strong key; 404/409/422 instead of 500; login script prints no session string (static check — never run); `clean_test_data.py` dry-run and TEST-only; `.dockerignore` coverage | In-memory SQLite (migrated) |
 | `verify_deploy.py` | `requirements.lock` hashes and covers every requirement; Dockerfile digest-pinned base, hash-checked wheels-only install (pyaes excepted), allowlisted COPYs, user 10001, runtime default target; compose: exactly migrate/api/worker/cloudflared, all read-only with no capabilities, no-new-privileges, init and log rotation, no ports/host network/privileges; one SQLite URL in the data mount; bind mounts never create host paths; migrate gates api/worker; session mounted in the worker only; one worker (fixed name, restart on-failure, grace > flush); api internal-only; one env file per service; templates hold no values; `.dockerignore` keeps build inputs | None (reads files) |
+| `verify_backup.py` | Read-only `VACUUM INTO` snapshot passes `integrity_check`, is gzip-compressed and round-trip checked, matches the source, mode 0600, no temporary files; a writer mid-transaction is neither blocked nor leaked into the copy; rotation keeps the newest N scheduled archives and never tagged ones; failed integrity check, damaged database or archive, or low disk space keeps nothing and rotates nothing; restore moves db + `-wal`/`-shm` aside together, refuses non-Placement databases, rollback undoes it; archive names and rollback dirs are bare names; DATABASE_URL from compose; scripts strict-bash, LF, one lock, migrate container with only data + backups mounted, only `VACUUM INTO`, helper stdlib-only and ASCII; units oneshot as `deploy`, persistent timer | `:memory:` sources; throwaway files in a temp dir (never `dev.db`) |
 | `scripts/test_live_ingestion.py` | Safe live preflight: Telethon auth session, Telegram entity resolution, Groq LLM check, read-only safety audit | Live API (Read-only) |
 
 > ⚠ Every suite mocks the LLM, and none contains realistic multi-sentence announcements — which is how gaps C2 and C5 passed as green.
@@ -594,6 +601,7 @@ python verify_ingestion.py
 python verify_extraction.py
 python verify_security.py
 python verify_deploy.py
+python verify_backup.py
 # Owner-run only (uses the live session, read-only):
 python scripts/test_live_ingestion.py
 ```
@@ -620,8 +628,8 @@ Decisions (owner, 2026-10-27): SQLite in WAL mode; Cloudflare named tunnel in to
 
 | Item | Scope | Status |
 |---|---|---|
-| 1.1 | `requirements.lock` / `requirements-build.lock`, multi-stage `Dockerfile`, `docker-compose.yml` (migrate, api, worker, cloudflared), env templates in `deploy/templates/`, `verify_deploy.py` | ✅ Done — pending owner review. Image not yet built (no Docker on the dev machine): first `docker build --target test .` runs on the VM |
-| 1.2 | `deploy/backup.sh` (`VACUUM INTO` → integrity check → compress → rotate), systemd timer, restore procedure | Pending |
+| 1.1 | `requirements.lock` / `requirements-build.lock`, multi-stage `Dockerfile`, `docker-compose.yml` (migrate, api, worker, cloudflared), env templates in `deploy/templates/`, `verify_deploy.py` | ✅ Done — approved 2026-10-27 (with the MASTER_SPEC §1/§5/§6.3 SQLite wording). Image not yet built (no Docker on the dev machine): first `docker build --target test .` runs on the VM |
+| 1.2 | `deploy/backup.sh` + `deploy/sqlite_backup.py` (read-only `VACUUM INTO` → `integrity_check` → gzip + round-trip check → rotate, keep 14; tagged archives never rotated), `deploy/restore.sh` (list / verify / restore / rollback), `deploy/systemd/placement-backup.{service,timer}`, `deploy/BACKUP.md`, `verify_backup.py` | ✅ Done — pending owner review. Scripts were driven end to end through a stand-in `docker`; the real compose run, `flock` and systemd units are first exercised on the VM. No alerting on a failed backup yet and no off-VM copy (manual pull, BACKUP.md §3) |
 | 1.3 | `deploy/RUNBOOK.md`: Ubuntu 24.04 hardening, non-root deploy user, UFW (after removing the OCI image's iptables rules), Docker, session login, tunnel, first boot and verification, shadow-run switch, upgrade/rollback | Pending |
 
 ### P0 — Core Pre-Interview State Machine & Mobile Contract (delivered; verified defects listed in §0.2)

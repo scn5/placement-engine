@@ -108,7 +108,11 @@ placement-engine/
 ├── requirements-build.lock     # Hash-pinned setuptools to build pyaes in the image
 ├── Dockerfile                  # One image: builder → app → test (on demand) → runtime
 ├── docker-compose.yml          # migrate, api, worker, cloudflared (production VM)
-├── deploy/templates/           # Per-service env templates (api, worker, cloudflared)
+├── deploy/
+│   ├── templates/              # Per-service env templates (api, worker, cloudflared)
+│   ├── backup.sh / restore.sh  # Verified SQLite backup; restore and rollback (BACKUP.md)
+│   ├── sqlite_backup.py        # Logic both scripts run in a one-off migrate container
+│   └── systemd/                # placement-backup.service + .timer (daily)
 ├── .env.example                # Environment variable reference
 └── verify_*.py                 # Phase verification and test suites
 ```
@@ -252,7 +256,7 @@ Production runs on the OCI VM (Ampere A1 arm64, or E2.1.Micro amd64 as a fallbac
 | `cloudflared` | Named tunnel in token mode: `https://<your hostname>` → `http://api:8000` |
 
 - **Image** (`Dockerfile`): digest-pinned `python:3.12-slim`; dependencies from `requirements.lock` (hashed, the exact versions the suites passed on) installed from wheels only (except `pyaes`, published as source and built with a hash-pinned setuptools); only `app/`, `alembic/`, `alembic.ini` and `scripts/login_telegram.py` are copied; runs as user `10001`. `docker build --target test .` runs every `verify_*.py` suite on Python 3.12.
-- **State on the host** (`/srv/placement` by default, `PLACEMENT_ROOT` to change): `data/` (SQLite in WAL mode), `telegram/` (session, mounted in the worker only) and `secrets/` (`api.env`, `worker.env`, `cloudflared.env` — templates in `deploy/templates/`). Nothing secret is baked into the image.
+- **State on the host** (`/srv/placement` by default, `PLACEMENT_ROOT` to change): `data/` (SQLite in WAL mode), `backups/` (compressed daily copies), `telegram/` (session, mounted in the worker only) and `secrets/` (`api.env`, `worker.env`, `cloudflared.env` — templates in `deploy/templates/`). Nothing secret is baked into the image.
 - **Containers** run with a read-only root filesystem, no Linux capabilities, `no-new-privileges`, an init process and rotated logs. `verify_deploy.py` checks all of this statically.
 - **Dependencies:** after changing `requirements.txt`, regenerate `requirements.lock` (instructions in its header).
 
@@ -261,6 +265,8 @@ docker compose up -d --build                                          # build, m
 docker compose run --rm -it worker python scripts/login_telegram.py   # one-time Telegram login on the VM
 docker compose logs -f worker
 ```
+
+**Backups** (`deploy/BACKUP.md`): a daily systemd timer runs `deploy/backup.sh`. It copies the live database with a read-only `VACUUM INTO` while the stack keeps running, checks the copy with `PRAGMA integrity_check`, gzips it to `/srv/placement/backups/` and keeps the newest 14. `deploy/restore.sh` lists, verifies, restores and rolls back a restore. Take `deploy/backup.sh --tag pre-deploy` before every deploy.
 
 VM hardening, first boot and verification are in `deploy/RUNBOOK.md` (Phase 1.3).
 

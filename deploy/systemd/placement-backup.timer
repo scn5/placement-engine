@@ -1,0 +1,15 @@
+# Placement Engine — daily SQLite backup (Phase 1.2). Install: see
+# placement-backup.service. Next run: systemctl list-timers placement-backup.timer
+
+[Unit]
+Description=Daily Placement Engine SQLite backup
+
+[Timer]
+# 03:00 IST, when placement channels are quiet.
+OnCalendar=*-*-* 21:30:00 UTC
+RandomizedDelaySec=15min
+# Runs at the next boot if the VM was off at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
