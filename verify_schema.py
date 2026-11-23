@@ -69,6 +69,7 @@ _ALEMBIC_INI = Path(__file__).resolve().parent / "alembic.ini"
 _EXPECTED_TABLES = {
     "alembic_version",
     "companies",
+    "device_tokens",
     "message_ledger",
     "role_tracks",
     "system_config",

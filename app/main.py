@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import assert_schema_current, engine
-from app.routers import companies, events, triage
+from app.routers import companies, devices, events, triage
 from app.routers import settings as settings_router
 from app.routers import status as status_router
 from app.security import check_api_key_configuration, require_api_key
@@ -101,7 +101,10 @@ def create_app() -> FastAPI:
     )
 
     protected = [Depends(require_api_key)]
-    for router in (companies.router, events.router, triage.router, settings_router.router, status_router.router):
+    for router in (
+        companies.router, events.router, triage.router, devices.router,
+        settings_router.router, status_router.router,
+    ):
         app.include_router(router, dependencies=protected)
     app.add_exception_handler(IntegrityError, _integrity_error)
 

@@ -260,6 +260,26 @@ class SystemConfig(Base):
         super().__init__(**kwargs)
 
 
+class DeviceToken(Base):
+    """An Expo push token of the owner's phone (single-tenant: no user column).
+    Registered by the app, removed when Expo reports the device as gone."""
+
+    __tablename__ = "device_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    expo_push_token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+    last_registered_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    def __init__(self, **kwargs):
+        now = datetime.now(timezone.utc)
+        kwargs.setdefault("created_at", now)
+        kwargs.setdefault("last_registered_at", now)
+        super().__init__(**kwargs)
+
+
 class MessageLedger(Base):
     """One row per processed Telegram message: idempotency, catch-up cursor
     (max message_id per chat) and retry scheduling for failed extractions."""

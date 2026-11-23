@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -228,3 +228,32 @@ class SystemConfigUpdate(BaseModel):
     college_email: Optional[str] = None
     main_feed_id: Optional[int] = None
     test_feed_id: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Push notification Schemas
+# ---------------------------------------------------------------------------
+class DeviceRegister(BaseModel):
+    """POST /devices/register: the Expo push token of the app's device."""
+
+    expo_push_token: str = Field(
+        pattern=r"^Expo(nent)?PushToken\[[^\]\s]+\]$", max_length=255
+    )
+
+
+class DeviceResponse(BaseModel):
+    id: int
+    expo_push_token: str
+    created_at: datetime
+    last_registered_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NotifyTestResponse(BaseModel):
+    """POST /notify/test: how the test push went, per registered device."""
+
+    devices: int
+    sent: int
+    failed: int
+    removed: int

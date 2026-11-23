@@ -1,5 +1,5 @@
 # PROJECT_STATE.md — Placement Engine Backend
-**Last Updated:** 2026-10-27 | **Version:** 1.0.0 — **Status: pre-production** (Phase 0 "stop silent losses" done; Phase 1 infrastructure in progress — §12) | **Branch:** `feature/phase-1-infra` (from `feature/phase-0-stop-losses`)
+**Last Updated:** 2026-11-18 | **Version:** 1.0.0 — **Status: pre-production** (Phase 0 "stop silent losses" done; Phase 1 infrastructure in progress — §12) | **Branch:** `feature/phase-1-infra` (from `feature/phase-0-stop-losses`)
 
 > Single source of truth for the backend's operational status, architecture, and immediate backlog. Cross-referenced against `MASTER_SPEC.md` and `PRODUCT REQUIREMENTS DOCUMENT.md`.
 > **The code is the source of truth.** Every status claim in this file was re-verified against the code on 2026-10-22; intended-but-unbuilt behaviour belongs in `MASTER_SPEC.md`, not here.
@@ -57,7 +57,7 @@ Verified by reading the code; items marked † were also reproduced by executing
 
 | ID | Gap | Evidence | Fix |
 |---|---|---|---|
-| C1 | No reminder path end-to-end: no backend scheduler or push code; the app never schedules local alarms and never sends its push token. | `command-center/src/services/notifications.ts` (`scheduleEventReminders` unused) | Next phase |
+| C1 | No reminder path end-to-end: no backend scheduler or push code; the app never schedules local alarms and never sends its push token. | `command-center/src/services/notifications.ts` (`scheduleEventReminders` unused) | Phase 1.4 (in progress): step 1 done — `POST /devices/register`, `POST /notify/test`, `device_tokens`; the 60 s scheduler, the Triage push and the app wiring are pending |
 | C2 † | Pre-filter drops real announcements: "ok/okay/noted/thanks" *anywhere* → drop; plurals, "tomorrow/tonight", "GD", "venue" aren't signals. 8 of 9 realistic samples dropped. | `app/telegram/pre_filter.py:53-102` | ✅ 0.4 (only messages with no visible text are skipped) |
 | C3 | A root-feed post containing an invite link is only joined — its own text (roles, CTC, deadlines) never reaches the LLM; the company gets the channel title, "Default Role", FTE. | `app/telegram/listener.py:285-294`, `app/crud.py:530-551` | ✅ 0.4 (the post is extracted with its company, named by the LLM, else the channel title) |
 | C4 | Downtime or LLM failure = permanent loss: no catch-up on reconnect, in-memory debounce buffers, no retry queue. | `app/telegram/client.py:41-47`, `app/ai/extractor.py:152-159` | ✅ Downtime 0.3 (ledger catch-up + retries); offline edits and failed joins 0.4; LLM failures raise `ExtractionFailed` and are retried 0.5 |
@@ -122,6 +122,7 @@ placement-engine/
 ├── verify_phase4.py              # LLM extraction & dispatch mock suite
 ├── verify_triage.py              # Triage Hub & role tracking regression suite
 ├── verify_settings.py            # Settings API & SystemConfig regression suite
+├── verify_push.py                # Push registration, /notify/test, Expo client and token cleanup (Expo mocked, in-memory DB) (1.4)
 ├── verify_schema.py              # Alembic baseline, UTC storage & constraint suite (Phase 0.2)
 ├── verify_worker.py              # Ingestion worker, ledger, catch-up & retry suite (Phase 0.3)
 ├── verify_ingestion.py           # Join policy, invite posts, edits/reactions, supergroups, debouncer suite (Phase 0.4)
@@ -146,6 +147,7 @@ placement-engine/
     ├── main.py                   # FastAPI app factory (API only): key policy, schema check, routers, integrity errors
     ├── security.py               # X-API-Key dependency and the production key policy (0.6)
     ├── worker.py                 # Ingestion worker process: Telethon, dispatcher bridge, loops, heartbeat
+    ├── push.py                   # Expo Push API client; push_to_all fans out to every device_tokens row and deletes dead tokens (1.4)
     ├── sources.py                # MessageSource / SubchannelLink: where a batch came from (listener → dispatcher)
     │
     ├── routers/
@@ -153,7 +155,8 @@ placement-engine/
     │   ├── companies.py          # /companies endpoints
     │   ├── events.py             # /events endpoints
     │   ├── triage.py             # /triage staging queue & action endpoints
-    │   ├── settings.py           # /settings user profile & feed configuration
+    │   ├── devices.py            # POST /devices/register, POST /notify/test — push token registration & test push (1.4)
+│   ├── settings.py           # /settings user profile & feed configuration
     │   └── status.py             # GET /status — ingestion worker heartbeat (0.6)
     │
     ├── telegram/
@@ -312,6 +315,9 @@ One row per processed Telegram message: idempotency, the catch-up cursor (max `m
 ### 5.5 `WorkerStatus` (`worker_status`, added in 0.2 — used from 0.3)
 Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker and read by the API's status endpoint: `telegram_state`, `last_update_at`, `last_llm_ok_at`, `last_error`, `catchup_at`, `heartbeat_at`.
 
+### 5.6 `DeviceToken` (`device_tokens`, added in 1.4 — migration `0003`)
+The owner's Expo push tokens (single-tenant: no user column): `id`, `expo_push_token` (String 255, unique), `created_at`, `last_registered_at`. Written by `POST /devices/register`; a token Expo reports as `DeviceNotRegistered` is deleted by `push.push_to_all`.
+
 > **⚠ Schema Gap vs MASTER_SPEC:** `event_type` currently uses Phase 2 naming (`OA_WINDOW`, `IRIS_DEADLINE`) while spec/LLM schema uses `event_category` with values `OA`, `IRIS`, `FORM`, `GD`, etc. Needs a unified enum before the extractor can write to DB.
 > **⚠ Schema Gap:** `round_number` (INTEGER) is absent — required for state-aware OA/Interview round counting.
 > **⚠ Schema Gap:** `has_attachments` (Boolean) is absent — required for paperclip indicator (PRD FR-2).
@@ -367,12 +373,17 @@ Single-row liveness record (`CHECK (id = 1)`) written by the ingestion worker an
 | `GET` | `/settings` | — | `SystemConfigResponse` (404 if uninitialized) |
 | `PUT` | `/settings` | `SystemConfigUpdate` | `SystemConfigResponse` (partial upsert) |
 
+#### Push Notifications — added in 1.4 (step 1)
+| Method | Path | Request Body | Response |
+|---|---|---|---|
+| `POST` | `/devices/register` | `DeviceRegister` (`expo_push_token`, matching `Expo(nent)PushToken[...]`) | `DeviceResponse` (idempotent upsert; a repeat only refreshes `last_registered_at`) |
+| `POST` | `/notify/test` | — | `NotifyTestResponse` (`devices`, `sent`, `failed`, `removed`); 409 when no device is registered |
+
 ### 6.2 Missing Routes (Remaining Backlog)
 
 | Method | Path | Status | Priority |
 |---|---|---|---|
 | `GET` | `/companies/{id}` | ❌ Not implemented | P1 |
-| `POST` | `/notify/test` | ❌ Not implemented | P2 |
 
 ---
 
@@ -576,6 +587,7 @@ All scripts are self-contained and require no live credentials or running server
 | `verify_phase4.py` | LLM schema validation, INDIVIDUAL guard, REPLACE_FORM, EXTEND_DEADLINE, prompt context injection, dirty subchannel payloads (missing company/drive), e2e CREATE_EVENT, e2e STATUS_NOTE, RESCHEDULE_EVENT start/end updates | In-memory SQLite |
 | `verify_triage.py` | RoleTrack defaults, pending triage items, note kinds (only CRITERIA_RELAXATION re-opens SILENT_TRACK; IGNORED roles untouched), isolated fixtures, Company tracking mode cascade assertion, `/triage/pending`, `/accept`, `/ignore`, 404 endpoints | In-memory SQLite |
 | `verify_settings.py` | SystemConfig ORM, GET/PUT `/settings` endpoints, partial update upsert | In-memory SQLite |
+| `verify_push.py` | `POST /devices/register` (idempotent, token format validated), `POST /notify/test` (409 without devices; dead token deleted, transient failure kept), Expo client ticket mapping and failure handling, batches of 100 | In-memory SQLite; the Expo Push API is stubbed, nothing is sent |
 | `verify_schema.py` | Alembic upgrade → downgrade → upgrade + drift check, startup revision check, UTC round-trip, IST deadline flips to MISSED on time, naive-datetime policy, per-environment name uniqueness, foreign keys, ledger/status constraints | In-memory SQLite |
 | `verify_worker.py` | `TELEGRAM_API_ID=0` builds no client; `app.main` imports no Telegram code; monitored set vs invariants 2–4; un-ignore/new-chat 24 h catch-up; ledger outcomes and backoff; retry loop; catch-up skipping; heartbeat + dead-man ping; exit codes; error propagation. The real `TelegramClient` class is replaced by one that fails if constructed | In-memory SQLite (migrated) |
 | `verify_ingestion.py` | Join-policy link and chat tables; short messages reach the LLM; reactions never subscribed to or read, unchanged-text edit updates ignored; invite posts joined, linked and extracted with their company, re-posts and replies attributed, IGNORED companies skipped; refused links (bot, person, basic group, approval, expired, phone, permalink, root feed) never joined; flood-wait retry and join pacing; supergroup admin filter; root feeds must be broadcast channels; debouncer max-wait and per-chat order; ≤ 40 messages per LLM call; offline edits caught up; dispatcher source company, naming and IGNORED gate; no cross-environment attribution. Every chat, person and bot is a mocked entity | In-memory SQLite (migrated) |
@@ -596,6 +608,7 @@ python verify_phase3.py
 python verify_phase4.py
 python verify_triage.py
 python verify_settings.py
+python verify_push.py
 python verify_schema.py
 python verify_worker.py
 python verify_ingestion.py
@@ -632,6 +645,7 @@ Decisions (owner, 2026-10-27): SQLite in WAL mode; Cloudflare named tunnel in to
 | 1.1 | `requirements.lock` / `requirements-build.lock`, multi-stage `Dockerfile`, `docker-compose.yml` (migrate, api, worker, cloudflared), env templates in `deploy/templates/`, `verify_deploy.py` | ✅ Done — approved 2026-10-27 (with the MASTER_SPEC §1/§5/§6.3 SQLite wording). Image not yet built (no Docker on the dev machine): first `docker build --target test .` runs on the VM |
 | 1.2 | `deploy/backup.sh` + `deploy/sqlite_backup.py` (read-only `VACUUM INTO` → `integrity_check` → gzip + round-trip check → rotate, keep 14; tagged archives never rotated), `deploy/restore.sh` (list / verify / restore / rollback), `deploy/systemd/placement-backup.{service,timer}`, `deploy/BACKUP.md`, `verify_backup.py` | ✅ Done — approved 2026-10-27 (scratch-file tests and the `/srv/placement` layout confirmed). Scripts were driven end to end through a stand-in `docker`; the real compose run, `flock` and systemd units are first exercised on the VM. No alerting on a failed backup yet and no off-VM copy (manual pull, BACKUP.md §3) |
 | 1.3 | `deploy/RUNBOOK.md` (19 sections: OCI instance and security list, deploy user, SSH hardening, UFW in place of Oracle's iptables rules, unattended-upgrades with a 04:00 IST reboot, E2 swap, Docker from Docker's repository, `/srv/placement` layout, deploy-key checkout and in-image test run, secrets, Cloudflare named tunnel, Telegram login, first boot on TEST, verification incl. reboot test, TEST soak, the MAIN,TEST shadow-run switch, operations, troubleshooting); `deploy/systemd/placement-stack.service` (fixes the worker staying down after a reboot: it exits 0 on SIGTERM, which `restart: on-failure` never restarts); `verify_deploy.py` [8]–[9] | ✅ Done — pending owner review. Written without access to an OCI VM: every command is unexecuted until the first run of the runbook, which is the real test |
+| 1.4 | Push notifications. Step 1: `device_tokens` (migration `0003`), `POST /devices/register`, `POST /notify/test`, `app/push.py` (Expo client), `verify_push.py`. Step 2: the 60 s notifier (MASTER_SPEC §6.3), the Triage push. Step 3: app wiring. Step 4: scheduler tests | Step 1 done — pending owner review. Step 2–4 not started. Spec updated 2026-11-18 (MASTER_SPEC §1, §6.4, §8; owner-approved) |
 
 ### P0 — Core Pre-Interview State Machine & Mobile Contract (delivered; verified defects listed in §0.2)
 

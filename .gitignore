@@ -11,6 +11,7 @@ ENV/
 !.env.example
 *.session
 *.session-journal
+*.pem
 
 # SQLite databases & local dev stores
 *.db

@@ -224,6 +224,7 @@ python verify_phase3.py   # Two-tier Telegram ingestion & debouncer
 python verify_phase4.py   # LLM structured extraction & state-machine actions
 python verify_triage.py   # Triage hub, criteria relaxation, and role tracking
 python verify_settings.py # Student profile settings API
+python verify_push.py     # Push device registration, test push and Expo client (Expo mocked)
 python verify_schema.py   # Alembic migrations, UTC storage and database constraints
 python verify_worker.py   # Ingestion worker, ledger, catch-up and retries (Telegram fully mocked)
 python verify_ingestion.py # Join policy, invite posts, edits/reactions, supergroups, debouncer limits

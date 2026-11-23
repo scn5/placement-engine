@@ -310,3 +310,18 @@ Verification:
 - All 13 suites are green. 11 mutants of the unit and the docs were all caught, each for the intended reason.
 - All 33 bash blocks in RUNBOOK.md and BACKUP.md pass `bash -n`, with placeholders substituted.
 - Not verified: every runbook command is unexecuted, since no OCI VM was available. The first walk-through on the VM is the real test, and the §15 checklist is how it is judged.
+
+
+[November 2026]: Phase 1.4, step 1 — Push Device Registration & Test Push (2026-11-18)
+The Problem: The app obtained an Expo push token but had nowhere to send it, and the backend had no way to push at all (gap C1). Nothing could wake the phone, in production or in a test.
+The Context/Why it failed: Push delivery was specified (MASTER_SPEC §1, §6.3) but never built. The production deployment turned out to be on Azure, not OCI, and the app is a standalone EAS APK, so remote push is testable on the real device. MASTER_SPEC was updated first (owner-approved): Expo Push as the transport, §6.4 the delivery contract, §8 the production deployment.
+The Decision/Fix:
+1. `device_tokens` table (migration `0003`): the owner's Expo tokens, unique, with created/last-registered times. No user column (single-tenant).
+2. `POST /devices/register`: idempotent upsert; a repeat only refreshes `last_registered_at`. The token must look like `ExponentPushToken[...]` (or the older `ExpoPushToken[...]`), at most 255 characters, no whitespace.
+3. `POST /notify/test`: sends a test push to every device; 409 when none is registered.
+4. `app/push.py`: `send_expo_push` is the only network call (httpx to the Expo Push API, 100 messages per request). `push_to_all` deletes only tokens Expo reports as `DeviceNotRegistered`; a network error, an HTTP error or a malformed reply fails the messages without deleting anything, so a network blip never unregisters the phone. The scheduler in step 2 will reuse it.
+5. Both routes sit behind `X-API-Key` like every other router. Nothing here touches Telegram.
+Verification:
+- `verify_push.py` is green (6 checks). The database is `:memory:` and the Expo API is stubbed, so nothing is sent. `verify_schema.py` (migration round trip and no model drift), `verify_security.py`, `verify_deploy.py`, `verify_settings.py` and `verify_phase2.py` are still green. Both routes return 401 without the key.
+- Not verified: delivery to a real device. That needs the VM deploy, then `POST /notify/test` against the EAS build.
+- Not yet done: the 60 s scheduler and the Triage push (step 2), the app sending its token (step 3).
