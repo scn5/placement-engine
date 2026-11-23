@@ -24,6 +24,9 @@ def _to_triage_item(track: models.RoleTrack) -> schemas.TriageItemResponse:
         ctc_stipend_info=track.ctc_stipend_info,
         latest_status_note=track.latest_status_note,
         latest_note_kind=track.latest_note_kind,
+        subchannel_id=track.company.subchannel_id if track.company else None,
+        main_feed_msg_id=track.company.main_feed_msg_id if track.company else None,
+        company_id=track.company_id,
         created_at=track.created_at,
     )
 

@@ -182,6 +182,9 @@ class TriageItemResponse(BaseModel):
     latest_status_note: Optional[str] = None
     # CRITERIA_RELAXATION marks a proposal to re-triage a SILENT_TRACK role.
     latest_note_kind: Optional[str] = None
+    subchannel_id: Optional[int] = None
+    main_feed_msg_id: Optional[int] = None
+    company_id: Optional[int] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
