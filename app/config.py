@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # and faster but may resolve dates less carefully — tune with shadow-run data.
     LLM_REASONING_EFFORT: Optional[str] = None
 
+    # Push notification scheduler (Phase 1.4)
+    NOTIFIER_ENABLED: bool = True
+    NOTIFIER_POLL_SECONDS: float = 60.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @field_validator("INGEST_ENVIRONMENTS")

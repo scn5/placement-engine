@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Tuple
 
-from sqlalchemy import and_, false, func, or_, select, true, update
+from sqlalchemy import and_, delete, false, func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -839,6 +839,9 @@ async def reschedule_event(
         .returning(models.TimelineEvent)
     )
     result = await db.execute(stmt)
+    await db.execute(
+        delete(models.SentNotification).where(models.SentNotification.event_id == event_id)
+    )
     await db.commit()
     row = result.scalars().first()
     return await _load_event(db, row.id) if row is not None else None

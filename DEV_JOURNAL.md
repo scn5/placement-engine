@@ -325,3 +325,20 @@ Verification:
 - `verify_push.py` is green (6 checks). The database is `:memory:` and the Expo API is stubbed, so nothing is sent. `verify_schema.py` (migration round trip and no model drift), `verify_security.py`, `verify_deploy.py`, `verify_settings.py` and `verify_phase2.py` are still green. Both routes return 401 without the key.
 - Not verified: delivery to a real device. That needs the VM deploy, then `POST /notify/test` against the EAS build.
 - Not yet done: the 60 s scheduler and the Triage push (step 2), the app sending its token (step 3).
+
+
+[November 2026]: Phase 1.4, step 2 — Push Notification Scheduler & Triage Push (2026-11-24)
+The Problem: While tokens could be registered, there was no background poller to monitor upcoming event deadlines or newly ingested drives, leaving devices unnotified.
+The Context/Why it failed: MASTER_SPEC §6.3 specifies a 60-second polling query for PENDING ELIGIBLE events at 2 hours and 30 minutes before start_time. Additionally, newly joined subchannels and criteria-relaxation proposals needed to wake the mobile app via Triage pushes.
+The Decision/Fix:
+1. `sent_notifications` table (migration `0004`): records sent alerts with unique constraints on `(event_id, window)` and `(role_track_id, notification_type)` to guarantee no duplicate alarms across API restarts.
+2. `app/notifier.py`:
+   - `check_deadline_reminders`: scans PENDING ELIGIBLE events on active companies; uses `start_time` (or falls back to `end_time` if `start_time` is null) to dispatch 2h or 30m reminders via `app.push.push_to_all`. Completing an event or deleting it drops it out automatically.
+   - `check_triage_proposals`: scans untriaged `RoleTrack`s (`is_triaged = False`) on active companies and dispatches "🎯 New Drive in Triage", formatting the body with role name or falling back if null/Default Role.
+   - `start_notifier`: 60-second loop started in `app/main.py` lifespan and cleanly cancelled on shutdown.
+3. `app/crud.py:reschedule_event`: clearing `sent_notifications` for an event when rescheduled to allow new alarms at extended deadlines.
+4. `docker-compose.yml`: added `egress` network to `api` service (`networks: [edge, egress]`) so the container can reach `https://exp.host`.
+Verification:
+- `verify_notifier.py` passes all 9 checks (2h, 30m, deduplication, end_time fallback, completion filtering, triage proposals, role formatting, reschedule reset).
+- `verify_schema.py` passes migration round-trip with zero drift across all 9 tables.
+- `verify_security.py` and `verify_push.py` remain fully green.

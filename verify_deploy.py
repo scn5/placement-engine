@@ -257,7 +257,7 @@ def test_networks_and_secrets() -> None:
     services = compose["services"]
     networks = compose["networks"]
     assert networks["edge"].get("internal") is True
-    assert services["api"]["networks"] == ["edge"]
+    assert sorted(services["api"]["networks"]) == ["edge", "egress"]
     assert services["worker"]["networks"] == ["egress"]
     assert sorted(services["cloudflared"]["networks"]) == ["edge", "egress"]
 

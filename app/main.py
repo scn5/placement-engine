@@ -17,6 +17,7 @@ Lifespan sequence:
      created and migrated only by `alembic upgrade head`).
   3. On shutdown: dispose the database engine.
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -44,12 +45,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await assert_schema_current()
     logger.info("Database schema is at the Alembic head revision.")
 
-    # ── Hand control back to FastAPI ──────────────────────────────────────
-    yield
+    # ── 3. Background push notification scheduler (Phase 1.4) ────────────
+    notifier_task = None
+    if getattr(settings, "NOTIFIER_ENABLED", True):
+        from app.notifier import start_notifier
 
-    # ── 3. Shutdown ───────────────────────────────────────────────────────
-    await engine.dispose()
-    logger.info("Database engine disposed.")
+        notifier_task = asyncio.create_task(start_notifier(), name="push-notifier-loop")
+        logger.info("Push notification scheduler started.")
+
+    # ── Hand control back to FastAPI ──────────────────────────────────────
+    try:
+        yield
+    finally:
+        # ── 4. Cancel notifier loop on shutdown ───────────────────────────
+        if notifier_task is not None:
+            notifier_task.cancel()
+            try:
+                await notifier_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            logger.info("Push notification scheduler stopped.")
+
+        # ── 5. Shutdown database engine ───────────────────────────────────
+        await engine.dispose()
+        logger.info("Database engine disposed.")
 
 
 def _constraint_kind(exc: IntegrityError) -> str:

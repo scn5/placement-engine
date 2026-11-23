@@ -72,6 +72,7 @@ _EXPECTED_TABLES = {
     "device_tokens",
     "message_ledger",
     "role_tracks",
+    "sent_notifications",
     "system_config",
     "timeline_events",
     "worker_status",

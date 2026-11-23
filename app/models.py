@@ -280,6 +280,31 @@ class DeviceToken(Base):
         super().__init__(**kwargs)
 
 
+class SentNotification(Base):
+    """Records each push notification sent to prevent duplicate alarms across restarts (Phase 1.4)."""
+
+    __tablename__ = "sent_notifications"
+    __table_args__ = (
+        UniqueConstraint("event_id", "window", name="uq_sent_notifications_event_id_window"),
+        UniqueConstraint("role_track_id", "notification_type", name="uq_sent_notifications_role_track_id_notification_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    notification_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("timeline_events.id", ondelete="CASCADE"), nullable=True
+    )
+    role_track_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("role_tracks.id", ondelete="CASCADE"), nullable=True
+    )
+    window: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    sent_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("sent_at", datetime.now(timezone.utc))
+        super().__init__(**kwargs)
+
+
 class MessageLedger(Base):
     """One row per processed Telegram message: idempotency, catch-up cursor
     (max message_id per chat) and retry scheduling for failed extractions."""
