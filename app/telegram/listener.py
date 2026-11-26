@@ -738,12 +738,22 @@ class TelegramIngestionService:
         if isinstance(invite, types.ChatInviteAlready):
             return invite.chat
         try:
-            updates = await self._client(functions.messages.ImportChatInviteRequest(link.token))
-            chats = getattr(updates, "chats", None) or []
+            result = await self._client(functions.messages.ImportChatInviteRequest(link.token))
+            # Telethon >= 1.45 wraps Updates inside messages.ChatInviteJoinResultOk(updates=...).
+            inner = getattr(result, "updates", None)
+            chats = getattr(result, "chats", None) or getattr(inner, "chats", None) or []
         except errors.UserAlreadyParticipantError:
             invite = await self._client(functions.messages.CheckChatInviteRequest(link.token))
             chats = [getattr(invite, "chat", None)]
         chat = next((c for c in chats if isinstance(c, types.Channel)), None)
+        if chat is None:
+            # Fallback: re-check the invite in case the server returned an envelope without chats.
+            try:
+                recheck = await self._client(functions.messages.CheckChatInviteRequest(link.token))
+                if isinstance(recheck, types.ChatInviteAlready):
+                    chat = recheck.chat
+            except Exception:
+                pass
         refusal = join_policy.check_chat(chat, self.root_feed_ids)
         if refusal:
             logger.warning("Joined %s, but it is not a usable channel (%s); not reading it.", link.masked(), refusal)

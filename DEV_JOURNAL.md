@@ -342,3 +342,13 @@ Verification:
 - `verify_notifier.py` passes all 9 checks (2h, 30m, deduplication, end_time fallback, completion filtering, triage proposals, role formatting, reschedule reset).
 - `verify_schema.py` passes migration round-trip with zero drift across all 9 tables.
 - `verify_security.py` and `verify_push.py` remain fully green.
+
+
+[November 2026]: Bugfix — Private Invite Joins Returning ChatInviteJoinResultOk (2026-11-26)
+The Problem: Invite-link posts in the main feed were auto-joined in Telegram, marked `DONE` in `message_ledger`, and yet failed to create companies or appear in Triage / Companies (while text-only announcements and links the user had already opened in Telegram worked).
+The Root Cause: Telethon 1.45.0 wraps `ImportChatInviteRequest` responses in `types.messages.ChatInviteJoinResultOk(updates=Updates(...))` rather than returning `Updates` directly. `listener._join_private()` read `getattr(updates, "chats", None)`, which returned `None`, causing `check_chat(None)` to return `NOT_A_CHANNEL` and `_resolve_invite_links()` to drop the target. `_extract_invite_post()` then fell through to plain-announcement extraction without a `subchannel`, extracting 0 actions from the bare URL and marking the ledger row `DONE`. (Links already opened by the user hit `ChatInviteAlready` and bypassed `ImportChatInviteRequest`, masking the bug in `verify_ingestion.py` whose fake client returned bare `Updates`.)
+The Decision/Fix:
+1. `app/telegram/listener.py:_join_private`: extract `chats` from either `result.chats` (legacy `Updates`) or `result.updates.chats` (`ChatInviteJoinResultOk`), with a `CheckChatInviteRequest` `ChatInviteAlready` fallback if `chat` is still `None`.
+2. `verify_ingestion.py`: updated `FakeTelegram.ImportChatInviteRequest` to return `types.messages.ChatInviteJoinResultOk(updates=...)` matching real Telethon 1.45.0 behavior.
+Verification:
+- `verify_ingestion.py` (all 15 checks) and `verify_worker.py` (all 10 checks) pass.

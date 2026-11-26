@@ -225,7 +225,8 @@ class FakeTelegram:
             channel = self.invite_channels[request.hash]
             self.joined.add(request.hash)
             self.entities[_peer(channel)] = channel
-            return types.Updates(updates=[], users=[], chats=[channel], date=_now(), seq=0)
+            updates = types.Updates(updates=[], users=[], chats=[channel], date=_now(), seq=0)
+            return types.messages.ChatInviteJoinResultOk(updates=updates)
         if isinstance(request, functions.contacts.ResolveUsernameRequest):
             entity = self.usernames[request.username]
             if isinstance(entity, types.User):
